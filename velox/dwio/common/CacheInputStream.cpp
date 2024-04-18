@@ -21,6 +21,8 @@
 #include "velox/dwio/common/CacheInputStream.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 
+using ::facebook::velox::common::Region;
+
 namespace facebook::velox::dwio::common {
 
 using velox::cache::ScanTracker;
@@ -103,7 +105,7 @@ void CacheInputStream::BackUp(int32_t count) {
   position_ -= unsignedCount;
 }
 
-bool CacheInputStream::Skip(int32_t count) {
+bool CacheInputStream::SkipInt64(int64_t count) {
   if (count < 0) {
     return false;
   }
@@ -160,15 +162,24 @@ std::vector<folly::Range<char*>> makeRanges(
   return buffers;
 }
 } // namespace
-
 void CacheInputStream::loadSync(Region region) {
+  process::TraceContext trace("loadSync");
+  int64_t hitSize = region.length;
+  if (window_.has_value()) {
+    int64_t regionEnd = region.offset + region.length;
+    int64_t windowStart = region_.offset + window_.value().offset;
+    int64_t windowEnd =
+        region_.offset + window_.value().offset + window_.value().length;
+    hitSize = std::min(windowEnd, regionEnd) -
+        std::max<int64_t>(windowStart, region.offset);
+  }
+
   // rawBytesRead is the number of bytes touched. Whether they come
   // from disk, ssd or memory is itemized in different counters. A
-  process::TraceContext trace("loadSync");
   // coalesced read from InputStream removes itself from this count
   // so as not to double count when the individual parts are
   // hit.
-  ioStats_->incRawBytesRead(region.length);
+  ioStats_->incRawBytesRead(hitSize);
   prefetchStarted_ = false;
   do {
     folly::SemiFuture<bool> wait(false);
@@ -206,11 +217,12 @@ void CacheInputStream::loadSync(Region region) {
       }
       ioStats_->read().increment(region.length);
       ioStats_->queryThreadIoLatency().increment(usec);
+      ioStats_->incTotalScanTime(usec * 1'000);
       entry->setExclusiveToShared();
     } else {
       // Hit memory cache.
       if (!entry->getAndClearFirstUseFlag()) {
-        ioStats_->ramHit().increment(entry->size());
+        ioStats_->ramHit().increment(hitSize);
       }
       return;
     }
@@ -267,7 +279,7 @@ bool CacheInputStream::loadFromSsd(
     throw;
   }
   pin_ = std::move(pins[0]);
-  ioStats_->ssdRead().increment(entry.size());
+  ioStats_->ssdRead().increment(region.length);
   ioStats_->queryThreadIoLatency().increment(usec);
   entry.setExclusiveToShared();
   return true;

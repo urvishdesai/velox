@@ -16,7 +16,7 @@ add_library(velox_dwrf_test_utils E2EWriterTestUtil.cpp)
 
 target_link_libraries(
   velox_dwrf_test_utils
-  ${FOLLY_WITH_DEPENDENCIES}
+  Folly::folly
   velox_dwio_common
   velox_dwio_common_exception
   velox_dwio_dwrf_reader
@@ -24,7 +24,9 @@ target_link_libraries(
   velox_exception
   velox_memory
   velox_type
-  velox_vector)
+  velox_vector
+  gtest
+  gtest_main)
 
 # older versions of GCC need it to allow std::filesystem
 if(CMAKE_COMPILER_IS_GNUCC AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)

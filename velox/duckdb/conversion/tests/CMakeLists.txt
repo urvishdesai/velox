@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(velox_duckdb_conversion_test
-               DuckConversionTest.cpp DuckParserTest.cpp DuckWrapperTest.cpp)
+add_executable(velox_duckdb_conversion_test DuckConversionTest.cpp
+                                            DuckParserTest.cpp)
 
 add_test(velox_duckdb_conversion_test velox_duckdb_conversion_test)
 
 target_link_libraries(
   velox_duckdb_conversion_test
-  velox_duckdb_functions
   velox_duckdb_parser
   velox_parse_expression
   velox_functions_prestosql

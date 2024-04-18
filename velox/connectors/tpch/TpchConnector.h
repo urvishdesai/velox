@@ -75,7 +75,7 @@ class TpchDataSource : public DataSource {
       const std::unordered_map<
           std::string,
           std::shared_ptr<connector::ColumnHandle>>& columnHandles,
-      velox::memory::MemoryPool* FOLLY_NONNULL pool);
+      velox::memory::MemoryPool* pool);
 
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
@@ -123,32 +123,32 @@ class TpchDataSource : public DataSource {
   size_t completedRows_{0};
   size_t completedBytes_{0};
 
-  memory::MemoryPool* FOLLY_NONNULL pool_;
+  memory::MemoryPool* pool_;
 };
 
 class TpchConnector final : public Connector {
  public:
   TpchConnector(
       const std::string& id,
-      std::shared_ptr<const Config> properties,
-      folly::Executor* FOLLY_NULLABLE /*executor*/)
-      : Connector(id, properties) {}
+      std::shared_ptr<const Config> config,
+      folly::Executor* /*executor*/)
+      : Connector(id) {}
 
-  std::shared_ptr<DataSource> createDataSource(
+  std::unique_ptr<DataSource> createDataSource(
       const std::shared_ptr<const RowType>& outputType,
-      const std::shared_ptr<connector::ConnectorTableHandle>& tableHandle,
+      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
       const std::unordered_map<
           std::string,
           std::shared_ptr<connector::ColumnHandle>>& columnHandles,
-      ConnectorQueryCtx* FOLLY_NONNULL connectorQueryCtx) override final {
-    return std::make_shared<TpchDataSource>(
+      ConnectorQueryCtx* connectorQueryCtx) override final {
+    return std::make_unique<TpchDataSource>(
         outputType,
         tableHandle,
         columnHandles,
         connectorQueryCtx->memoryPool());
   }
 
-  std::shared_ptr<DataSink> createDataSink(
+  std::unique_ptr<DataSink> createDataSink(
       RowTypePtr /*inputType*/,
       std::shared_ptr<
           ConnectorInsertTableHandle> /*connectorInsertTableHandle*/,
@@ -160,18 +160,18 @@ class TpchConnector final : public Connector {
 
 class TpchConnectorFactory : public ConnectorFactory {
  public:
-  static constexpr const char* FOLLY_NONNULL kTpchConnectorName{"tpch"};
+  static constexpr const char* kTpchConnectorName{"tpch"};
 
   TpchConnectorFactory() : ConnectorFactory(kTpchConnectorName) {}
 
-  explicit TpchConnectorFactory(const char* FOLLY_NONNULL connectorName)
+  explicit TpchConnectorFactory(const char* connectorName)
       : ConnectorFactory(connectorName) {}
 
   std::shared_ptr<Connector> newConnector(
       const std::string& id,
-      std::shared_ptr<const Config> properties,
-      folly::Executor* FOLLY_NULLABLE executor = nullptr) override {
-    return std::make_shared<TpchConnector>(id, properties, executor);
+      std::shared_ptr<const Config> config,
+      folly::Executor* executor = nullptr) override {
+    return std::make_shared<TpchConnector>(id, config, executor);
   }
 };
 

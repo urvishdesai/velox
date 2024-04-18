@@ -20,7 +20,9 @@ set(velox_benchmark_deps
     velox_parse_utils
     velox_parse_expression
     velox_serialization
-    ${FOLLY}
+    velox_benchmark_builder
+    velox_vector_test_lib
+    Folly::folly
     ${FOLLY_BENCHMARK}
     ${DOUBLE_CONVERSION}
     gflags::gflags
@@ -33,6 +35,9 @@ target_link_libraries(velox_benchmark_basic_simple_arithmetic
 add_executable(velox_benchmark_basic_comparison_conjunct ComparisonConjunct.cpp)
 target_link_libraries(velox_benchmark_basic_comparison_conjunct
                       ${velox_benchmark_deps})
+
+add_executable(velox_benchmark_basic_simple_cast SimpleCastExpr.cpp)
+target_link_libraries(velox_benchmark_basic_simple_cast ${velox_benchmark_deps})
 
 add_executable(velox_benchmark_basic_decoded_vector DecodedVector.cpp)
 target_link_libraries(velox_benchmark_basic_decoded_vector
@@ -58,10 +63,24 @@ add_executable(velox_benchmark_basic_preproc Preproc.cpp)
 target_link_libraries(velox_benchmark_basic_preproc ${velox_benchmark_deps}
                       velox_functions_prestosql velox_vector_test_lib)
 
-add_executable(velox_like_functions_benchmark LikeFunctionsBenchmark.cpp)
-target_link_libraries(velox_like_functions_benchmark ${velox_benchmark_deps}
+add_executable(velox_like_tpch_benchmark LikeTpchBenchmark.cpp)
+target_link_libraries(velox_like_tpch_benchmark ${velox_benchmark_deps}
                       velox_functions_lib velox_tpch_gen velox_vector_test_lib)
+
+add_executable(velox_like_benchmark LikeBenchmark.cpp)
+target_link_libraries(
+  velox_like_benchmark ${velox_benchmark_deps} velox_functions_lib
+  velox_functions_prestosql velox_vector_test_lib)
 
 add_executable(velox_benchmark_basic_vector_fuzzer VectorFuzzer.cpp)
 target_link_libraries(velox_benchmark_basic_vector_fuzzer
                       ${velox_benchmark_deps} velox_vector_test_lib)
+
+add_executable(velox_cast_benchmark CastBenchmark.cpp)
+target_link_libraries(velox_cast_benchmark ${velox_benchmark_deps}
+                      velox_vector_test_lib)
+
+add_executable(velox_format_datetime_benchmark FormatDateTimeBenchmark.cpp)
+target_link_libraries(
+  velox_format_datetime_benchmark ${velox_benchmark_deps} velox_vector_test_lib
+  velox_functions_spark velox_functions_prestosql)

@@ -37,32 +37,54 @@
 #include <folly/futures/Future.h>
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/file/Region.h"
 
 namespace facebook::velox {
 
-// A read-only file.
+// A read-only file.  All methods in this object should be thread safe.
 class ReadFile {
  public:
   virtual ~ReadFile() = default;
 
   // Reads the data at [offset, offset + length) into the provided pre-allocated
   // buffer 'buf'. The bytes are returned as a string_view pointing to 'buf'.
-  virtual std::string_view
-  pread(uint64_t offset, uint64_t length, void* FOLLY_NONNULL buf) const = 0;
+  //
+  // This method should be thread safe.
+  virtual std::string_view pread(uint64_t offset, uint64_t length, void* buf)
+      const = 0;
 
   // Same as above, but returns owned data directly.
+  //
+  // This method should be thread safe.
   virtual std::string pread(uint64_t offset, uint64_t length) const;
 
   // Reads starting at 'offset' into the memory referenced by the
   // Ranges in 'buffers'. The buffers are filled left to right. A
   // buffer with nullptr data will cause its size worth of bytes to be skipped.
+  //
+  // This method should be thread safe.
   virtual uint64_t preadv(
       uint64_t /*offset*/,
       const std::vector<folly::Range<char*>>& /*buffers*/) const;
 
+  // Vectorized read API. Implementations can coalesce and parallelize.
+  // The offsets don't need to be sorted.
+  // `iobufs` is a range of IOBufs to store the read data. They
+  // will be stored in the same order as the input `regions` vector. So the
+  // array must be pre-allocated by the caller, with the same size as `regions`,
+  // but don't need to be initialized, since each iobuf will be copy-constructed
+  // by the preadv.
+  //
+  // This method should be thread safe.
+  virtual void preadv(
+      folly::Range<const common::Region*> regions,
+      folly::Range<folly::IOBuf*> iobufs) const;
+
   // Like preadv but may execute asynchronously and returns the read
   // size or exception via SemiFuture. Use hasPreadvAsync() to check
   // if the implementation is in fact asynchronous.
+  //
+  // This method should be thread safe.
   virtual folly::SemiFuture<uint64_t> preadvAsync(
       uint64_t offset,
       const std::vector<folly::Range<char*>>& buffers) const {
@@ -121,6 +143,11 @@ class WriteFile {
   // Appends data to the end of the file.
   virtual void append(std::string_view data) = 0;
 
+  // Appends data to the end of the file.
+  virtual void append(std::unique_ptr<folly::IOBuf> /* data */) {
+    VELOX_NYI("IOBuf appending is not implemented");
+  }
+
   // Flushes any local buffers, i.e. ensures the backing medium received
   // all data that has been appended.
   virtual void flush() = 0;
@@ -128,7 +155,9 @@ class WriteFile {
   // Close the file. Any cleanup (disk flush, etc.) will be done here.
   virtual void close() = 0;
 
-  // Current file size, i.e. the sum of all previous Appends.
+  /// Current file size, i.e. the sum of all previous Appends.  No flush should
+  /// be needed to get the exact size written, and this should be able to be
+  /// called after the file close.
   virtual uint64_t size() const = 0;
 };
 
@@ -147,10 +176,8 @@ class InMemoryReadFile : public ReadFile {
   explicit InMemoryReadFile(std::string file)
       : ownedFile_(std::move(file)), file_(ownedFile_) {}
 
-  std::string_view pread(
-      uint64_t offset,
-      uint64_t length,
-      void* FOLLY_NONNULL buf) const override;
+  std::string_view pread(uint64_t offset, uint64_t length, void* buf)
+      const override;
 
   std::string pread(uint64_t offset, uint64_t length) const override;
 
@@ -186,31 +213,33 @@ class InMemoryReadFile : public ReadFile {
 
 class InMemoryWriteFile final : public WriteFile {
  public:
-  explicit InMemoryWriteFile(std::string* FOLLY_NONNULL file) : file_(file) {}
+  explicit InMemoryWriteFile(std::string* file) : file_(file) {}
 
   void append(std::string_view data) final;
+  void append(std::unique_ptr<folly::IOBuf> data) final;
   void flush() final {}
   void close() final {}
   uint64_t size() const final;
 
  private:
-  std::string* FOLLY_NONNULL file_;
+  std::string* file_;
 };
 
-// Current implementation for the local version is quite simple (e.g. no
-// internal arenaing), as local disk writes are expected to be cheap. Local
-// files match against any filepath starting with '/'.
-
+/// Current implementation for the local version is quite simple (e.g. no
+/// internal arenaing), as local disk writes are expected to be cheap. Local
+/// files match against any filepath starting with '/'.
 class LocalReadFile final : public ReadFile {
  public:
   explicit LocalReadFile(std::string_view path);
 
+  /// TODO: deprecate this after creating local file all through velox fs
+  /// interface.
   explicit LocalReadFile(int32_t fd);
 
   ~LocalReadFile();
 
-  std::string_view
-  pread(uint64_t offset, uint64_t length, void* FOLLY_NONNULL buf) const final;
+  std::string_view pread(uint64_t offset, uint64_t length, void* buf)
+      const final;
 
   uint64_t size() const final;
 
@@ -236,8 +265,7 @@ class LocalReadFile final : public ReadFile {
   }
 
  private:
-  void preadInternal(uint64_t offset, uint64_t length, char* FOLLY_NONNULL pos)
-      const;
+  void preadInternal(uint64_t offset, uint64_t length, char* pos) const;
 
   std::string path_;
   int32_t fd_;
@@ -246,18 +274,26 @@ class LocalReadFile final : public ReadFile {
 
 class LocalWriteFile final : public WriteFile {
  public:
-  // An error is thrown is a file already exists at |path|.
-  explicit LocalWriteFile(std::string_view path);
+  // An error is thrown is a file already exists at |path|,
+  // unless flag shouldThrowOnFileAlreadyExists is false
+  explicit LocalWriteFile(
+      std::string_view path,
+      bool shouldCreateParentDirectories = false,
+      bool shouldThrowOnFileAlreadyExists = true);
   ~LocalWriteFile();
 
   void append(std::string_view data) final;
+  void append(std::unique_ptr<folly::IOBuf> data) final;
   void flush() final;
   void close() final;
-  uint64_t size() const final;
+
+  uint64_t size() const final {
+    return size_;
+  }
 
  private:
-  FILE* FOLLY_NONNULL file_;
-  mutable long size_;
+  FILE* file_;
+  uint64_t size_{0};
   bool closed_{false};
 };
 

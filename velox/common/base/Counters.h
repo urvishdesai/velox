@@ -20,9 +20,109 @@
 
 namespace facebook::velox {
 
-// Velox Counter Registration
-void registerVeloxCounters();
+/// Velox metrics Registration.
+void registerVeloxMetrics();
 
-constexpr folly::StringPiece kCounterHiveFileHandleGenerateLatencyMs{
+constexpr folly::StringPiece kMetricHiveFileHandleGenerateLatencyMs{
     "velox.hive_file_handle_generate_latency_ms"};
+
+constexpr folly::StringPiece kMetricCacheShrinkCount{
+    "velox.cache_shrink_count"};
+
+constexpr folly::StringPiece kMetricCacheShrinkTimeMs{"velox.cache_shrink_ms"};
+
+constexpr folly::StringPiece kMetricMaxSpillLevelExceededCount{
+    "velox.spill_max_level_exceeded_count"};
+
+constexpr folly::StringPiece kMetricMemoryReclaimExecTimeMs{
+    "velox.memory_reclaim_exec_ms"};
+
+constexpr folly::StringPiece kMetricMemoryReclaimedBytes{
+    "velox.memory_reclaim_bytes"};
+
+constexpr folly::StringPiece kMetricMemoryReclaimCount{
+    "velox.memory_reclaim_count"};
+
+constexpr folly::StringPiece kMetricTaskMemoryReclaimCount{
+    "velox.task_memory_reclaim_count"};
+
+constexpr folly::StringPiece kMetricTaskMemoryReclaimWaitTimeMs{
+    "velox.task_memory_reclaim_wait_ms"};
+
+constexpr folly::StringPiece kMetricTaskMemoryReclaimWaitTimeoutCount{
+    "velox.task_memory_reclaim_wait_timeout_count"};
+
+constexpr folly::StringPiece kMetricMemoryNonReclaimableCount{
+    "velox.memory_non_reclaimable_count"};
+
+constexpr folly::StringPiece kMetricMemoryPoolInitialCapacityBytes{
+    "velox.memory_pool_initial_capacity_bytes"};
+
+constexpr folly::StringPiece kMetricMemoryPoolCapacityGrowCount{
+    "velox.memory_pool_capacity_growth_count"};
+
+constexpr folly::StringPiece kMetricMemoryPoolUsageLeakBytes{
+    "velox.memory_pool_usage_leak_bytes"};
+
+constexpr folly::StringPiece kMetricMemoryPoolReservationLeakBytes{
+    "velox.memory_pool_reservation_leak_bytes"};
+
+constexpr folly::StringPiece kMetricMemoryAllocatorDoubleFreeCount{
+    "velox.memory_allocator_double_free_count"};
+
+constexpr folly::StringPiece kMetricArbitratorRequestsCount{
+    "velox.arbitrator_requests_count"};
+
+constexpr folly::StringPiece kMetricArbitratorLocalArbitrationCount{
+    "velox.arbitrator_local_arbitration_count"};
+
+constexpr folly::StringPiece kMetricArbitratorGlobalArbitrationCount{
+    "velox.arbitrator_global_arbitration_count"};
+
+constexpr folly::StringPiece kMetricArbitratorAbortedCount{
+    "velox.arbitrator_aborted_count"};
+
+constexpr folly::StringPiece kMetricArbitratorFailuresCount{
+    "velox.arbitrator_failures_count"};
+
+constexpr folly::StringPiece kMetricArbitratorQueueTimeMs{
+    "velox.arbitrator_queue_time_ms"};
+
+constexpr folly::StringPiece kMetricArbitratorArbitrationTimeMs{
+    "velox.arbitrator_arbitration_time_ms"};
+
+constexpr folly::StringPiece kMetricArbitratorFreeCapacityBytes{
+    "velox.arbitrator_free_capacity_bytes"};
+
+constexpr folly::StringPiece kMetricDriverYieldCount{
+    "velox.driver_yield_count"};
+
+constexpr folly::StringPiece kMetricSpilledInputBytes{
+    "velox.spill_input_bytes"};
+
+constexpr folly::StringPiece kMetricSpilledBytes{"velox.spill_bytes"};
+
+constexpr folly::StringPiece kMetricSpilledRowsCount{"velox.spill_rows_count"};
+
+constexpr folly::StringPiece kMetricSpilledFilesCount{
+    "velox.spill_files_count"};
+
+constexpr folly::StringPiece kMetricSpillFillTimeMs{"velox.spill_fill_time_ms"};
+
+constexpr folly::StringPiece kMetricSpillSortTimeMs{"velox.spill_sort_time_ms"};
+
+constexpr folly::StringPiece kMetricSpillSerializationTimeMs{
+    "velox.spill_serialization_time_ms"};
+
+constexpr folly::StringPiece kMetricSpillWritesCount{
+    "velox.spill_writes_count"};
+
+constexpr folly::StringPiece kMetricSpillFlushTimeMs{
+    "velox.spill_flush_time_ms"};
+
+constexpr folly::StringPiece kMetricSpillWriteTimeMs{
+    "velox.spill_write_time_ms"};
+
+constexpr folly::StringPiece kMetricFileWriterEarlyFlushedRawBytes{
+    "velox.file_writer_early_flushed_raw_bytes"};
 } // namespace facebook::velox

@@ -23,18 +23,23 @@ target_link_libraries(velox_functions_util velox_vector velox_common_base)
 add_library(
   velox_functions_lib
   CheckDuplicateKeys.cpp
+  CheckNestedNulls.cpp
   DateTimeFormatter.cpp
   DateTimeFormatterBuilder.cpp
   KllSketch.cpp
-  LambdaFunctionUtil.cpp
   MapConcat.cpp
   Re2Functions.cpp
-  StringEncodingUtils.cpp)
+  Repeat.cpp
+  StringEncodingUtils.cpp
+  SubscriptUtil.cpp
+  TimeUtils.cpp)
 
-target_link_libraries(velox_functions_lib velox_vector re2::re2
-                      ${FOLLY_WITH_DEPENDENCIES})
+target_link_libraries(velox_functions_lib velox_functions_util velox_vector
+                      re2::re2 Folly::folly)
 
+add_subdirectory(aggregates)
 add_subdirectory(string)
+add_subdirectory(window)
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()

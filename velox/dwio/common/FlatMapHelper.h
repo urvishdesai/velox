@@ -37,15 +37,14 @@ void resetIfNotWritable(VectorPtr& vector, const T&... buffer) {
   FOLLY_POP_WARNING
 }
 
-// Initialize string vector.
-void initializeStringVector(
-    VectorPtr& vector,
-    memory::MemoryPool& pool,
-    vector_size_t size,
-    bool hasNulls,
-    std::vector<BufferPtr>&& stringBuffers);
-
 } // namespace detail
+
+// Struct for keeping track flatmap key stream metrics.
+// Used by keySelectionCallback_ in FlatMapColumnReader
+struct FlatMapKeySelectionStats {
+  uint64_t totalKeys = 0;
+  uint64_t selectedKeys = 0;
+};
 
 // Initialize flat vector
 template <typename T>

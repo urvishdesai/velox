@@ -17,13 +17,20 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "velox/dwio/dwrf/writer/DictionaryEncodingUtils.h"
-#include "velox/dwio/type/fbhive/HiveTypeParser.h"
+#include "velox/type/fbhive/HiveTypeParser.h"
 
 using namespace testing;
 using namespace facebook::velox::memory;
 
 namespace facebook::velox::dwrf {
-TEST(TestDictionaryEncodingUtils, StringGetSortedIndexLookupTable) {
+class DictionaryEncodingUtilsTest : public testing::Test {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+};
+
+TEST_F(DictionaryEncodingUtilsTest, StringGetSortedIndexLookupTable) {
   struct TestCase {
     explicit TestCase(
         bool sort,
@@ -91,7 +98,7 @@ TEST(TestDictionaryEncodingUtils, StringGetSortedIndexLookupTable) {
           {0, 1, 2, 3}}};
 
   for (const auto& testCase : testCases) {
-    auto pool = getDefaultMemoryPool();
+    auto pool = memoryManager()->addLeafPool();
     StringDictionaryEncoder stringDictEncoder{*pool, *pool};
     for (const auto& key : testCase.addKeySequence) {
       stringDictEncoder.addKey(key, 0);
@@ -137,7 +144,7 @@ TEST(TestDictionaryEncodingUtils, StringGetSortedIndexLookupTable) {
   }
 }
 
-TEST(TestDictionaryEncodingUtils, StringStrideDictOptimization) {
+TEST_F(DictionaryEncodingUtilsTest, StringStrideDictOptimization) {
   constexpr size_t kStrideSize{10};
   struct TestCase {
     explicit TestCase(
@@ -296,7 +303,7 @@ TEST(TestDictionaryEncodingUtils, StringStrideDictOptimization) {
   };
 
   for (const auto& testCase : testCases) {
-    auto pool = getDefaultMemoryPool();
+    auto pool = memoryManager()->addLeafPool();
     StringDictionaryEncoder stringDictEncoder{*pool, *pool};
     size_t rowCount = 0;
     for (const auto& key : testCase.addKeySequence) {

@@ -42,10 +42,11 @@ using exec::test::HiveConnectorTestBase;
 int main(int argc, char** argv) {
   // Velox Tasks/Operators are based on folly's async framework, so we need to
   // make sure we initialize it first.
-  folly::init(&argc, &argv);
+  folly::Init init{&argc, &argv};
 
   // Default memory allocator used throughout this example.
-  auto pool = memory::getDefaultMemoryPool();
+  memory::MemoryManager::initialize({});
+  auto pool = memory::memoryManager()->addLeafPool();
 
   // For this example, the input dataset will be comprised of a single BIGINT
   // column ("my_col"), containing 10 rows.
@@ -88,7 +89,7 @@ int main(int argc, char** argv) {
   auto hiveConnector =
       connector::getConnectorFactory(
           connector::hive::HiveConnectorFactory::kHiveConnectorName)
-          ->newConnector(kHiveConnectorId, nullptr);
+          ->newConnector(kHiveConnectorId, std::make_shared<core::MemConfig>());
   connector::registerConnector(hiveConnector);
 
   // To be able to read local files, we need to register the local file
@@ -115,17 +116,7 @@ int main(int argc, char** argv) {
   auto writerPlanFragment =
       exec::test::PlanBuilder()
           .values({rowVector})
-          .tableWrite(
-              inputRowType->names(),
-              std::make_shared<core::InsertTableHandle>(
-                  kHiveConnectorId,
-                  HiveConnectorTestBase::makeHiveInsertTableHandle(
-                      inputRowType->names(),
-                      inputRowType->children(),
-                      {},
-                      HiveConnectorTestBase::makeLocationHandle(
-                          tempDir->path))),
-              connector::CommitStrategy::kNoCommit)
+          .tableWrite("targetDirectory", dwio::common::FileFormat::DWRF)
           .planFragment();
 
   std::shared_ptr<folly::Executor> executor(
@@ -135,7 +126,7 @@ int main(int argc, char** argv) {
   // Task is the top-level execution concept. A task needs a taskId (as a
   // string), the plan fragment to execute, a destination (only used for
   // shuffles), and a QueryCtx containing metadata and configs for a query.
-  auto writeTask = std::make_shared<exec::Task>(
+  auto writeTask = exec::Task::create(
       "my_write_task",
       writerPlanFragment,
       /*destination=*/0,
@@ -164,7 +155,7 @@ int main(int argc, char** argv) {
                               .planFragment();
 
   // Create the reader task.
-  auto readTask = std::make_shared<exec::Task>(
+  auto readTask = exec::Task::create(
       "my_read_task",
       readPlanFragment,
       /*destination=*/0,
@@ -177,7 +168,7 @@ int main(int argc, char** argv) {
   // HiveConnectorSplit for each file, using the same HiveConnector id defined
   // above, the local file path (the "file:" prefix specifies which FileSystem
   // to use; local, in this case), and the file format (DWRF/ORC).
-  for (auto& filePath : fs::directory_iterator(tempDir->path)) {
+  for (auto& filePath : fs::directory_iterator(tempDir->getPath())) {
     auto connectorSplit = std::make_shared<connector::hive::HiveConnectorSplit>(
         kHiveConnectorId,
         "file:" + filePath.path().string(),

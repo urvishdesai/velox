@@ -55,19 +55,18 @@ class MemoryPoolAllocationBenchMark {
     switch (type_) {
       case Type::kMmap:
         manager_ = std::make_shared<MemoryManager>(
-            IMemoryManager::Options{.alignment = alignment});
+            MemoryManagerOptions{.alignment = alignment});
         break;
       case Type::kStd:
         manager_ = std::make_shared<MemoryManager>(
-            IMemoryManager::Options{.alignment = alignment});
+            MemoryManagerOptions{.alignment = alignment});
         break;
       default:
         VELOX_USER_FAIL("Unknown allocator type: {}", static_cast<int>(type_));
         break;
     }
     rng_.seed(FLAGS_allocation_size_seed);
-    pool_ = manager_->getPool(
-        "MemoryPoolAllocationBenchMark", memory::MemoryPool::Kind::kLeaf);
+    pool_ = manager_->addLeafPool("MemoryPoolAllocationBenchMark");
   }
 
   ~MemoryPoolAllocationBenchMark() {
@@ -140,7 +139,7 @@ class MemoryPoolAllocationBenchMark {
   const size_t minSize_;
   const size_t maxSize_;
   folly::Random::DefaultGenerator rng_;
-  std::shared_ptr<IMemoryManager> manager_;
+  std::shared_ptr<MemoryManager> manager_;
   std::shared_ptr<MemoryPool> pool_;
   uint64_t sumAllocBytes_{0};
   uint64_t numAllocs_{0};
@@ -436,7 +435,7 @@ BENCHMARK_RELATIVE_MULTI(MmapReallocateMix64) {
 } // namespace
 
 int main(int argc, char* argv[]) {
-  folly::init(&argc, &argv);
+  folly::Init init{&argc, &argv};
   // TODO: add to run benchmark as a standalone program with multithreading as
   // well as actual memory access to trigger minor page faults in OS which traps
   // into kernel context to setup physical pages for the lazy-mapped virtual

@@ -15,9 +15,7 @@
  */
 
 #include "velox/tpch/gen/TpchGen.h"
-#include "velox/external/duckdb/tpch/dbgen/include/dbgen/dbgen_gunk.hpp"
-#include "velox/external/duckdb/tpch/dbgen/include/dbgen/dss.h"
-#include "velox/external/duckdb/tpch/dbgen/include/dbgen/dsstypes.h"
+#include <velox/tpch/gen/dbgen/include/tpch_constants.hpp>
 #include "velox/tpch/gen/DBGenIterator.h"
 #include "velox/vector/FlatVector.h"
 
@@ -82,11 +80,10 @@ double decimalToDouble(int64_t value) {
   return (double)value * 0.01;
 }
 
-Date toDate(std::string_view stringDate) {
-  Date date;
-  parseTo(stringDate, date);
-  return date;
+int32_t toDate(std::string_view stringDate) {
+  return DATE()->toDays(stringDate);
 }
+
 } // namespace
 
 std::string_view toTableName(Table table) {
@@ -371,7 +368,7 @@ RowVectorPtr genTpchOrders(
   auto custKeyVector = children[1]->asFlatVector<int64_t>();
   auto orderStatusVector = children[2]->asFlatVector<StringView>();
   auto totalPriceVector = children[3]->asFlatVector<double>();
-  auto orderDateVector = children[4]->asFlatVector<Date>();
+  auto orderDateVector = children[4]->asFlatVector<int32_t>();
   auto orderPriorityVector = children[5]->asFlatVector<StringView>();
   auto clerkVector = children[6]->asFlatVector<StringView>();
   auto shipPriorityVector = children[7]->asFlatVector<int32_t>();
@@ -428,9 +425,9 @@ RowVectorPtr genTpchLineItem(
 
   auto returnFlagVector = children[8]->asFlatVector<StringView>();
   auto lineStatusVector = children[9]->asFlatVector<StringView>();
-  auto shipDateVector = children[10]->asFlatVector<Date>();
-  auto commitDateVector = children[11]->asFlatVector<Date>();
-  auto receiptDateVector = children[12]->asFlatVector<Date>();
+  auto shipDateVector = children[10]->asFlatVector<int32_t>();
+  auto commitDateVector = children[11]->asFlatVector<int32_t>();
+  auto receiptDateVector = children[12]->asFlatVector<int32_t>();
   auto shipInstructVector = children[13]->asFlatVector<StringView>();
   auto shipModeVector = children[14]->asFlatVector<StringView>();
   auto commentVector = children[15]->asFlatVector<StringView>();
@@ -750,6 +747,19 @@ RowVectorPtr genTpchRegion(
   }
   return std::make_shared<RowVector>(
       pool, regionRowType, BufferPtr(nullptr), vectorSize, std::move(children));
+}
+
+std::string getQuery(int query) {
+  if (query <= 0 || query > TPCH_QUERIES_COUNT) {
+    VELOX_FAIL("Out of range TPC-H query number {}", query);
+  }
+
+  auto queryString = std::string(TPCH_QUERIES[query - 1]);
+  // Output of GetQuery() has a new line and a semi-colon. These need to be
+  // removed in order to use the query string in a subquery
+  queryString.pop_back(); // remove new line
+  queryString.pop_back(); // remove semi-colon
+  return queryString;
 }
 
 } // namespace facebook::velox::tpch

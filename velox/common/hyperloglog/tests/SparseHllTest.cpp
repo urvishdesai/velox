@@ -30,6 +30,10 @@ uint64_t hashOne(T value) {
 
 class SparseHllTest : public ::testing::Test {
  protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   template <typename T>
   void testMergeWith(const std::vector<T>& left, const std::vector<T>& right) {
     testMergeWith(left, right, false);
@@ -98,7 +102,8 @@ class SparseHllTest : public ::testing::Test {
     return serialized;
   }
 
-  std::shared_ptr<memory::MemoryPool> pool_{memory::getDefaultMemoryPool()};
+  std::shared_ptr<memory::MemoryPool> pool_{
+      memory::memoryManager()->addLeafPool()};
   HashStringAllocator allocator_{pool_.get()};
 };
 
@@ -162,10 +167,18 @@ TEST_F(SparseHllTest, mergeWith) {
 
   // idempotent
   testMergeWith(sequence(0, 100), sequence(0, 100));
+
+  // empty sequence
+  testMergeWith(sequence(0, 100), {});
+  testMergeWith({}, sequence(100, 300));
 }
 
 class SparseHllToDenseTest : public ::testing::TestWithParam<int8_t> {
  protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   std::string serialize(DenseHll& denseHll) {
     auto size = denseHll.serializedSize();
     std::string serialized;
@@ -174,7 +187,8 @@ class SparseHllToDenseTest : public ::testing::TestWithParam<int8_t> {
     return serialized;
   }
 
-  std::shared_ptr<memory::MemoryPool> pool_{memory::getDefaultMemoryPool()};
+  std::shared_ptr<memory::MemoryPool> pool_{
+      memory::memoryManager()->addLeafPool()};
   HashStringAllocator allocator_{pool_.get()};
 };
 
@@ -193,6 +207,20 @@ TEST_P(SparseHllToDenseTest, toDense) {
   sparseHll.toDense(denseHll);
   ASSERT_EQ(denseHll.cardinality(), expectedHll.cardinality());
   ASSERT_EQ(serialize(denseHll), serialize(expectedHll));
+}
+
+TEST_P(SparseHllToDenseTest, testNumberOfZeros) {
+  auto indexBitLength = GetParam();
+  for (int i = 0; i < 64 - indexBitLength; ++i) {
+    auto hash = 1ull << i;
+    SparseHll sparseHll(&allocator_);
+    sparseHll.insertHash(hash);
+    DenseHll expectedHll(indexBitLength, &allocator_);
+    expectedHll.insertHash(hash);
+    DenseHll denseHll(indexBitLength, &allocator_);
+    sparseHll.toDense(denseHll);
+    ASSERT_EQ(serialize(denseHll), serialize(expectedHll));
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(

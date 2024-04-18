@@ -25,6 +25,12 @@ namespace facebook::velox::exec::test {
 
 class ValuesTest : public OperatorTestBase {
  protected:
+  void TearDown() override {
+    input_.reset();
+    input2_.reset();
+    OperatorTestBase::TearDown();
+  }
+
   // Sample row vectors.
   RowVectorPtr input_{makeRowVector({
       makeFlatVector<int32_t>({0, 1, 2, 3, 5}),
@@ -83,7 +89,7 @@ TEST_F(ValuesTest, valuesWithParallelism) {
 TEST_F(ValuesTest, valuesWithRepeat) {
   // Single vectors in with repeat, many vectors out.
   AssertQueryBuilder(PlanBuilder().values({input_}, false, 2).planNode())
-      .assertResults({input_, input_});
+      .assertResults(std::vector<RowVectorPtr>{input_, input_});
 
   AssertQueryBuilder(PlanBuilder().values({input_}, false, 7).planNode())
       .assertResults({input_, input_, input_, input_, input_, input_, input_});

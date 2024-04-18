@@ -25,6 +25,12 @@ HdfsWriteFile::HdfsWriteFile(
     short replication,
     int blockSize)
     : hdfsClient_(hdfsClient), filePath_(path) {
+  auto pos = filePath_.rfind("/");
+  auto parentDir = filePath_.substr(0, pos + 1);
+  if (hdfsExists(hdfsClient_, parentDir.c_str()) == -1) {
+    hdfsCreateDirectory(hdfsClient_, parentDir.c_str());
+  }
+
   hdfsFile_ = hdfsOpenFile(
       hdfsClient_,
       filePath_.c_str(),
@@ -37,6 +43,12 @@ HdfsWriteFile::HdfsWriteFile(
       "Failed to open hdfs file: {}, with error: {}",
       filePath_,
       std::string(hdfsGetLastError()));
+}
+
+HdfsWriteFile::~HdfsWriteFile() {
+  if (hdfsFile_) {
+    close();
+  }
 }
 
 void HdfsWriteFile::close() {
@@ -78,7 +90,10 @@ void HdfsWriteFile::append(std::string_view data) {
 
 uint64_t HdfsWriteFile::size() const {
   auto fileInfo = hdfsGetPathInfo(hdfsClient_, filePath_.c_str());
-  return fileInfo->mSize;
+  uint64_t size = fileInfo->mSize;
+  // should call hdfsFreeFileInfo to avoid memory leak
+  hdfsFreeFileInfo(fileInfo, 1);
+  return size;
 }
 
 } // namespace facebook::velox

@@ -25,14 +25,6 @@ namespace {
 // See documentation at https://prestodb.io/docs/current/functions/map.html
 class TransformValuesFunction : public exec::VectorFunction {
  public:
-  bool isDefaultNullBehavior() const override {
-    // transform_values is null preserving for the map. But
-    // since an expr tree with a lambda depends on all named fields, including
-    // captures, a null in a capture does not automatically make a
-    // null result.
-    return false;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -51,11 +43,8 @@ class TransformValuesFunction : public exec::VectorFunction {
         flatMap->mapKeys(), flatMap->mapValues()};
     auto numValues = flatMap->mapValues()->size();
 
-    SelectivityVector finalSelection;
-    if (!context.isFinalSelection()) {
-      finalSelection = toElementRows<MapVector>(
-          numValues, *context.finalSelection(), flatMap.get());
-    }
+    SelectivityVector validRowsInReusedResult =
+        toElementRows<MapVector>(numValues, rows, flatMap.get());
 
     VectorPtr transformedValues;
 
@@ -73,7 +62,7 @@ class TransformValuesFunction : public exec::VectorFunction {
 
       entry.callable->apply(
           valueRows,
-          finalSelection,
+          &validRowsInReusedResult,
           wrapCapture,
           &context,
           lambdaArgs,
@@ -81,11 +70,14 @@ class TransformValuesFunction : public exec::VectorFunction {
           &transformedValues);
     }
 
+    // Set nulls for rows not present in 'rows'.
+    BufferPtr newNulls = addNullsForUnselectedRows(flatMap, rows);
+
     auto localResult = std::make_shared<MapVector>(
         flatMap->pool(),
         outputType,
-        flatMap->nulls(),
-        flatMap->size(),
+        std::move(newNulls),
+        rows.end(),
         flatMap->offsets(),
         flatMap->sizes(),
         flatMap->mapKeys(),
@@ -96,7 +88,7 @@ class TransformValuesFunction : public exec::VectorFunction {
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
     // map(K, V1), function(K, V1) -> V2 -> map(K, V2)
     return {exec::FunctionSignatureBuilder()
-                .knownTypeVariable("K")
+                .typeVariable("K")
                 .typeVariable("V1")
                 .typeVariable("V2")
                 .returnType("map(K,V2)")
@@ -107,9 +99,15 @@ class TransformValuesFunction : public exec::VectorFunction {
 };
 } // namespace
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+/// transform_values is null preserving for the map. But
+/// since an expr tree with a lambda depends on all named fields, including
+/// captures, a null in a capture does not automatically make a
+/// null result.
+
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_transform_values,
     TransformValuesFunction::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<TransformValuesFunction>());
 
 } // namespace facebook::velox::functions

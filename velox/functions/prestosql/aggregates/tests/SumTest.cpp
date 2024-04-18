@@ -18,167 +18,29 @@
 #include "velox/exec/AggregationHook.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
-#include "velox/functions/prestosql/aggregates/tests/AggregationTestBase.h"
+#include "velox/functions/lib/aggregates/tests/SumTestBase.h"
 
 using facebook::velox::exec::test::PlanBuilder;
 using namespace facebook::velox::exec::test;
+using namespace facebook::velox::functions::aggregate::test;
 
 namespace facebook::velox::aggregate::test {
 
 namespace {
 
-class SumTest : public AggregationTestBase {
- protected:
-  void SetUp() override {
-    AggregationTestBase::SetUp();
-    allowInputShuffle();
-  }
-
+class SumTest : public SumTestBase {
+ public:
   template <
       typename InputType,
       typename ResultType,
       typename IntermediateType = ResultType>
   void testAggregateOverflow(
       bool expectOverflow = false,
-      const TypePtr& type = CppToType<InputType>::create());
-};
-
-template <typename ResultType>
-void verifyAggregates(
-    const std::vector<std::pair<core::PlanNodePtr, ResultType>>& aggsToTest,
-    bool expectOverflow) {
-  for (const auto& [agg, expectedResult] : aggsToTest) {
-    if (expectOverflow) {
-      VELOX_ASSERT_THROW(readSingleValue(agg), "overflow");
-    } else {
-      auto result = readSingleValue(agg);
-      if constexpr (std::is_same_v<ResultType, float>) {
-        ASSERT_FLOAT_EQ(
-            result.template value<TypeKind::REAL>(), expectedResult);
-      } else if constexpr (std::is_same_v<ResultType, double>) {
-        ASSERT_FLOAT_EQ(
-            result.template value<TypeKind::DOUBLE>(), expectedResult);
-      } else if constexpr (std::is_same_v<ResultType, UnscaledShortDecimal>) {
-        auto output = result.template value<TypeKind::SHORT_DECIMAL>();
-        ASSERT_EQ(output.value(), expectedResult);
-      } else if constexpr (std::is_same_v<ResultType, UnscaledLongDecimal>) {
-        auto output = result.template value<TypeKind::LONG_DECIMAL>();
-        ASSERT_EQ(output.value(), expectedResult);
-      } else {
-        ASSERT_EQ(result, expectedResult);
-      }
-    }
+      const TypePtr& type = CppToType<InputType>::create()) {
+    SumTestBase::testAggregateOverflow<InputType, ResultType, IntermediateType>(
+        "sum", expectOverflow, type);
   }
-}
-
-template <typename InputType, typename ResultType, typename IntermediateType>
-#if defined(__has_feature)
-#if __has_feature(__address_sanitizer__)
-__attribute__((no_sanitize("integer")))
-#endif
-#endif
-void SumTest::testAggregateOverflow(
-    bool expectOverflow,
-    const TypePtr& type) {
-  const InputType maxLimit = std::numeric_limits<InputType>::max();
-  const InputType overflow = InputType(1);
-  const InputType zero = InputType(0);
-
-  // Intermediate type size is always >= result type size. Hence, use
-  // intermediate type to calculate the expected output.
-  IntermediateType limitResult = IntermediateType(maxLimit);
-  IntermediateType overflowResult = IntermediateType(overflow);
-
-  // Single max limit value. 0's to induce dummy calculations.
-  auto limitVector =
-      makeRowVector({makeFlatVector<InputType>({maxLimit, zero, zero}, type)});
-
-  // Test code path for single values with possible overflow hit in add.
-  auto overflowFlatVector =
-      makeRowVector({makeFlatVector<InputType>({maxLimit, overflow}, type)});
-  IntermediateType expectedFlatSum = limitResult + overflowResult;
-
-  // Test code path for duplicate values with possible overflow hit in
-  // multiply.
-  auto overflowConstantVector =
-      makeRowVector({makeConstant<InputType>(maxLimit / 3, 4, type)});
-  IntermediateType expectedConstantSum = (limitResult / 3) * 4;
-
-  // Test code path for duplicate values with possible overflow hit in add.
-  auto overflowHybridVector = {limitVector, overflowConstantVector};
-  IntermediateType expectedHybridSum = limitResult + expectedConstantSum;
-
-  // Vector with element pairs of a partial aggregate node, expected result.
-  std::vector<std::pair<core::PlanNodePtr, IntermediateType>> partialAggsToTest;
-  // Partial Aggregation (raw input in - partial result out).
-  partialAggsToTest.push_back(
-      {PlanBuilder()
-           .values({overflowFlatVector})
-           .partialAggregation({}, {"sum(c0)"})
-           .planNode(),
-       expectedFlatSum});
-  partialAggsToTest.push_back(
-      {PlanBuilder()
-           .values({overflowConstantVector})
-           .partialAggregation({}, {"sum(c0)"})
-           .planNode(),
-       expectedConstantSum});
-  partialAggsToTest.push_back(
-      {PlanBuilder()
-           .values(overflowHybridVector)
-           .partialAggregation({}, {"sum(c0)"})
-           .planNode(),
-       expectedHybridSum});
-
-  // Vector with element pairs of a full aggregate node, expected result.
-  std::vector<std::pair<core::PlanNodePtr, ResultType>> aggsToTest;
-  // Single Aggregation (raw input in - final result out).
-  aggsToTest.push_back(
-      {PlanBuilder()
-           .values({overflowFlatVector})
-           .singleAggregation({}, {"sum(c0)"})
-           .planNode(),
-       expectedFlatSum});
-  aggsToTest.push_back(
-      {PlanBuilder()
-           .values({overflowConstantVector})
-           .singleAggregation({}, {"sum(c0)"})
-           .planNode(),
-       expectedConstantSum});
-  aggsToTest.push_back(
-      {PlanBuilder()
-           .values(overflowHybridVector)
-           .singleAggregation({}, {"sum(c0)"})
-           .planNode(),
-       expectedHybridSum});
-  // Final Aggregation (partial result in - final result out):
-  // To make sure that the overflow occurs in the final aggregation step, we
-  // create 2 plan fragments and plugging their partially aggregated
-  // output into a final aggregate plan node. Each of those input fragments
-  // only have a single input value under the max limit which when added in
-  // the final step causes a potential overflow.
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  aggsToTest.push_back(
-      {PlanBuilder(planNodeIdGenerator)
-           .localPartition(
-               {},
-               {PlanBuilder(planNodeIdGenerator)
-                    .values({limitVector})
-                    .partialAggregation({}, {"sum(c0)"})
-                    .planNode(),
-                PlanBuilder(planNodeIdGenerator)
-                    .values({limitVector})
-                    .partialAggregation({}, {"sum(c0)"})
-                    .planNode()})
-           .finalAggregation()
-           .planNode(),
-       limitResult + limitResult});
-
-  // Verify all partial aggregates.
-  verifyAggregates<IntermediateType>(partialAggsToTest, expectOverflow);
-  // Verify all aggregates.
-  verifyAggregates<ResultType>(aggsToTest, expectOverflow);
-}
+};
 
 TEST_F(SumTest, sumTinyint) {
   auto rowType = ROW({"c0", "c1"}, {BIGINT(), TINYINT()});
@@ -249,19 +111,23 @@ TEST_F(SumTest, sumDoubleAndFloat) {
 }
 
 TEST_F(SumTest, sumDecimal) {
+  // Disable incremental aggregation tests because DecimalAggregate doesn't set
+  // StringView::prefix when extracting accumulators, leaving the prefix field
+  // undefined that fails the test.
+  AggregationTestBase::disableTestIncremental();
+
+  // Skip testing with TableScan because decimal is not supported in writers.
   std::vector<std::optional<int64_t>> shortDecimalRawVector;
   std::vector<std::optional<int128_t>> longDecimalRawVector;
   for (int i = 0; i < 1000; ++i) {
     shortDecimalRawVector.push_back(i * 1000);
-    longDecimalRawVector.push_back(buildInt128(i * 10, i * 100));
+    longDecimalRawVector.push_back(HugeInt::build(i * 10, i * 100));
   }
   shortDecimalRawVector.push_back(std::nullopt);
   longDecimalRawVector.push_back(std::nullopt);
   auto input = makeRowVector(
-      {makeNullableShortDecimalFlatVector(
-           shortDecimalRawVector, DECIMAL(10, 1)),
-       makeNullableLongDecimalFlatVector(
-           longDecimalRawVector, DECIMAL(23, 4))});
+      {makeNullableFlatVector<int64_t>(shortDecimalRawVector, DECIMAL(10, 1)),
+       makeNullableFlatVector<int128_t>(longDecimalRawVector, DECIMAL(23, 4))});
   createDuckDbTable({input});
   testAggregations(
       {input}, {}, {"sum(c0)", "sum(c1)"}, "SELECT sum(c0), sum(c1) FROM tmp");
@@ -269,44 +135,51 @@ TEST_F(SumTest, sumDecimal) {
   // Decimal sum aggregation with multiple groups.
   auto inputRows = {
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({1, 1}),
-           makeShortDecimalFlatVector({37220, 53450}, DECIMAL(5, 2))}),
+          {makeFlatVector<int32_t>({1, 1}),
+           makeFlatVector<int64_t>({37220, 53450}, DECIMAL(5, 2))}),
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({2, 2}),
-           makeShortDecimalFlatVector({10410, 9250}, DECIMAL(5, 2))}),
+          {makeFlatVector<int32_t>({2, 2}),
+           makeFlatVector<int64_t>({10410, 9250}, DECIMAL(5, 2))}),
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({3, 3}),
-           makeShortDecimalFlatVector({-12783, 0}, DECIMAL(5, 2))}),
+          {makeFlatVector<int32_t>({3, 3}),
+           makeFlatVector<int64_t>({-12783, 0}, DECIMAL(5, 2))}),
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({1, 2}),
-           makeShortDecimalFlatVector({23178, 41093}, DECIMAL(5, 2))}),
+          {makeFlatVector<int32_t>({1, 2}),
+           makeFlatVector<int64_t>({23178, 41093}, DECIMAL(5, 2))}),
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({2, 3}),
-           makeShortDecimalFlatVector({-10023, 5290}, DECIMAL(5, 2))}),
+          {makeFlatVector<int32_t>({2, 3}),
+           makeFlatVector<int64_t>({-10023, 5290}, DECIMAL(5, 2))}),
   };
 
   auto expectedResult = {
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({1}),
-           makeLongDecimalFlatVector({113848}, DECIMAL(38, 2))}),
+          {makeFlatVector<int32_t>(std::vector<int32_t>{1}),
+           makeFlatVector<int128_t>(
+               std::vector<int128_t>{113848}, DECIMAL(38, 2))}),
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({2}),
-           makeLongDecimalFlatVector({50730}, DECIMAL(38, 2))}),
+          {makeFlatVector<int32_t>(std::vector<int32_t>{2}),
+           makeFlatVector<int128_t>(
+               std::vector<int128_t>{50730}, DECIMAL(38, 2))}),
       makeRowVector(
-          {makeNullableFlatVector<int32_t>({3}),
-           makeLongDecimalFlatVector({-7493}, DECIMAL(38, 2))})};
+          {makeFlatVector<int32_t>(std::vector<int32_t>{3}),
+           makeFlatVector<int128_t>(
+               std::vector<int128_t>{-7493}, DECIMAL(38, 2))})};
 
   testAggregations(inputRows, {"c0"}, {"sum(c1)"}, expectedResult);
+
+  AggregationTestBase::enableTestIncremental();
 }
 
 TEST_F(SumTest, sumDecimalOverflow) {
+  AggregationTestBase::disableTestIncremental();
+
   // Short decimals do not overflow easily.
   std::vector<int64_t> shortDecimalInput;
   for (int i = 0; i < 10'000; ++i) {
-    shortDecimalInput.push_back(UnscaledShortDecimal::max().unscaledValue());
+    shortDecimalInput.push_back(DecimalUtil::kShortDecimalMax);
   }
   auto input = makeRowVector(
-      {makeShortDecimalFlatVector(shortDecimalInput, DECIMAL(17, 5))});
+      {makeFlatVector<int64_t>(shortDecimalInput, DECIMAL(17, 5))});
   createDuckDbTable({input});
   testAggregations({input}, {}, {"sum(c0)"}, "SELECT sum(c0) FROM tmp");
 
@@ -314,8 +187,8 @@ TEST_F(SumTest, sumDecimalOverflow) {
                                 const std::vector<int128_t>& input,
                                 const std::vector<int128_t>& output) {
     const TypePtr type = DECIMAL(38, 0);
-    auto in = makeRowVector({makeLongDecimalFlatVector({input}, type)});
-    auto expected = makeRowVector({makeLongDecimalFlatVector({output}, type)});
+    auto in = makeRowVector({makeFlatVector<int128_t>({input}, type)});
+    auto expected = makeRowVector({makeFlatVector<int128_t>({output}, type)});
     PlanBuilder builder(pool());
     builder.values({in});
     builder.singleAggregation({}, {"sum(c0)"});
@@ -328,8 +201,8 @@ TEST_F(SumTest, sumDecimalOverflow) {
   std::vector<int128_t> longDecimalInput;
   std::vector<int128_t> longDecimalOutput;
   // Create input with 2 UnscaledLongDecimal::max().
-  longDecimalInput.push_back(UnscaledLongDecimal::max().unscaledValue());
-  longDecimalInput.push_back(UnscaledLongDecimal::max().unscaledValue());
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMax);
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMax);
   // The sum must overflow.
   VELOX_ASSERT_THROW(
       decimalSumOverflow(longDecimalInput, longDecimalOutput),
@@ -337,8 +210,8 @@ TEST_F(SumTest, sumDecimalOverflow) {
 
   // Now add UnscaledLongDecimal::min().
   // The sum now must not overflow.
-  longDecimalInput.push_back(UnscaledLongDecimal::min().unscaledValue());
-  longDecimalOutput.push_back(UnscaledLongDecimal::max().unscaledValue());
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMin);
+  longDecimalOutput.push_back(DecimalUtil::kLongDecimalMax);
   decimalSumOverflow(longDecimalInput, longDecimalOutput);
 
   // Test Negative Overflow.
@@ -346,8 +219,8 @@ TEST_F(SumTest, sumDecimalOverflow) {
   longDecimalOutput.clear();
 
   // Create input with 2 UnscaledLongDecimal::min().
-  longDecimalInput.push_back(UnscaledLongDecimal::min().unscaledValue());
-  longDecimalInput.push_back(UnscaledLongDecimal::min().unscaledValue());
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMin);
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMin);
 
   // The sum must overflow.
   VELOX_ASSERT_THROW(
@@ -356,24 +229,26 @@ TEST_F(SumTest, sumDecimalOverflow) {
 
   // Now add UnscaledLongDecimal::max().
   // The sum now must not overflow.
-  longDecimalInput.push_back(UnscaledLongDecimal::max().unscaledValue());
-  longDecimalOutput.push_back(UnscaledLongDecimal::min().unscaledValue());
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMax);
+  longDecimalOutput.push_back(DecimalUtil::kLongDecimalMin);
   decimalSumOverflow(longDecimalInput, longDecimalOutput);
 
   // Check value in range.
   longDecimalInput.clear();
-  longDecimalInput.push_back(UnscaledLongDecimal::max().unscaledValue());
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMax);
   longDecimalInput.push_back(1);
   VELOX_ASSERT_THROW(
       decimalSumOverflow(longDecimalInput, longDecimalOutput),
-      "Decimal overflow");
+      "Value '100000000000000000000000000000000000000' is not in the range of Decimal Type");
 
   longDecimalInput.clear();
-  longDecimalInput.push_back(UnscaledLongDecimal::min().unscaledValue());
+  longDecimalInput.push_back(DecimalUtil::kLongDecimalMin);
   longDecimalInput.push_back(-1);
   VELOX_ASSERT_THROW(
       decimalSumOverflow(longDecimalInput, longDecimalOutput),
-      "Decimal overflow");
+      "Value '-100000000000000000000000000000000000000' is not in the range of Decimal Type");
+
+  AggregationTestBase::enableTestIncremental();
 }
 
 TEST_F(SumTest, sumWithMask) {
@@ -523,12 +398,6 @@ TEST_F(SumTest, nulls) {
       "SELECT c0, sum(c1) as sum_c1 FROM tmp GROUP BY 1");
 }
 
-template <typename Type>
-struct SumRow {
-  char nulls;
-  Type sum;
-};
-
 TEST_F(SumTest, hook) {
   SumRow<int64_t> sumRow;
   sumRow.nulls = 1;
@@ -550,41 +419,6 @@ TEST_F(SumTest, hook) {
   EXPECT_EQ(value, sumRow.sum);
 }
 
-template <typename InputType, typename ResultType>
-void testHookLimits(bool expectOverflow = false) {
-  // Pair of <limit, value to overflow>.
-  std::vector<std::pair<InputType, InputType>> limits = {
-      {std::numeric_limits<InputType>::min(), -1},
-      {std::numeric_limits<InputType>::max(), 1}};
-
-  for (const auto& [limit, overflow] : limits) {
-    SumRow<ResultType> sumRow;
-    sumRow.sum = 0;
-    ResultType expected = 0;
-    char* row = reinterpret_cast<char*>(&sumRow);
-    uint64_t numNulls = 0;
-    aggregate::SumHook<InputType, ResultType> hook(
-        offsetof(SumRow<ResultType>, sum),
-        offsetof(SumRow<ResultType>, nulls),
-        0,
-        &row,
-        &numNulls);
-
-    // Adding limit should not overflow.
-    ASSERT_NO_THROW(hook.addValue(0, &limit));
-    expected += limit;
-    EXPECT_EQ(expected, sumRow.sum);
-    // Adding overflow based on the ResultType should throw.
-    if (expectOverflow) {
-      VELOX_ASSERT_THROW(hook.addValue(0, &overflow), "overflow");
-    } else {
-      ASSERT_NO_THROW(hook.addValue(0, &overflow));
-      expected += overflow;
-      EXPECT_EQ(expected, sumRow.sum);
-    }
-  }
-}
-
 TEST_F(SumTest, hookLimits) {
   testHookLimits<int32_t, int64_t>();
   testHookLimits<int64_t, int64_t>(true);
@@ -603,6 +437,29 @@ TEST_F(SumTest, integerAggregateOverflow) {
 TEST_F(SumTest, floatAggregateOverflow) {
   testAggregateOverflow<float, float, double>();
   testAggregateOverflow<double, double>();
+}
+
+TEST_F(SumTest, distinct) {
+  auto data = makeRowVector({
+      makeFlatVector<int16_t>({1, 2, 1, 2, 1, 1, 2, 2}),
+      makeFlatVector<int32_t>({1, 1, 2, 2, 3, 1, 1, 1}),
+  });
+
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({}, {"sum(distinct c1)"})
+                  .planNode();
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .assertResults("SELECT sum(distinct c1) FROM tmp");
+
+  plan = PlanBuilder()
+             .values({data})
+             .singleAggregation({"c0"}, {"sum(distinct c1)"})
+             .planNode();
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .assertResults("SELECT c0, sum(distinct c1) FROM tmp GROUP BY 1");
 }
 
 } // namespace

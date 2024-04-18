@@ -13,9 +13,9 @@
 # limitations under the License.
 include_guard(GLOBAL)
 
-set(VELOX_FMT_VERSION 8.0.1)
+set(VELOX_FMT_VERSION 10.1.1)
 set(VELOX_FMT_BUILD_SHA256_CHECKSUM
-    b06ca3130158c625848f3fb7418f235155a4d389b2abc3a6245fb01cb0eb1e01)
+    78b8c0a72b1c35e4443a7e308df52498252d1cefc2b08c9a97bc9ee6cfe61f8b)
 set(VELOX_FMT_SOURCE_URL
     "https://github.com/fmtlib/fmt/archive/${VELOX_FMT_VERSION}.tar.gz")
 
@@ -26,9 +26,9 @@ FetchContent_Declare(
   fmt
   URL ${VELOX_FMT_SOURCE_URL}
   URL_HASH ${VELOX_FMT_BUILD_SHA256_CHECKSUM})
-
 # Force fmt to create fmt-config.cmake which can be found by other dependecies
 # (e.g. folly)
 set(FMT_INSTALL ON)
 set(fmt_BUILD_TESTS OFF)
 FetchContent_MakeAvailable(fmt)
+list(APPEND CMAKE_PREFIX_PATH ${fmt_BINARY_DIR})

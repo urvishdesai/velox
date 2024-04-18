@@ -20,6 +20,7 @@
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 #include "velox/dwio/dwrf/common/Common.h"
+#include "velox/dwio/dwrf/reader/StreamLabels.h"
 #include "velox/dwio/dwrf/reader/StripeDictionaryCache.h"
 #include "velox/dwio/dwrf/reader/StripeReaderBase.h"
 
@@ -63,11 +64,11 @@ class StreamInformationImpl : public StreamInformation {
   }
 
   uint32_t getNode() const override {
-    return streamId_.encodingKey().node;
+    return streamId_.encodingKey().node();
   }
 
   uint32_t getSequence() const override {
-    return streamId_.encodingKey().sequence;
+    return streamId_.encodingKey().sequence();
   }
 
   uint64_t getOffset() const override {
@@ -120,6 +121,7 @@ class StripeStreams {
    */
   virtual std::unique_ptr<dwio::common::SeekableInputStream> getStream(
       const DwrfStreamIdentifier& si,
+      std::string_view label,
       bool throwIfNotFound) const = 0;
 
   /// Get the integer dictionary data for the given node and sequence.
@@ -131,6 +133,7 @@ class StripeStreams {
   virtual std::function<BufferPtr()> getIntDictionaryInitializerForNode(
       const EncodingKey& ek,
       uint64_t elementWidth,
+      const StreamLabels& streamLabels,
       uint64_t dictionaryWidth = sizeof(int64_t)) = 0;
 
   virtual std::shared_ptr<StripeDictionaryCache> getStripeDictionaryCache() = 0;
@@ -161,6 +164,8 @@ class StripeStreams {
    */
   virtual const StrideIndexProvider& getStrideIndexProvider() const = 0;
 
+  virtual int64_t stripeRows() const = 0;
+
   // Number of rows per row group. Last row group may have fewer rows.
   virtual uint32_t rowsPerRowGroup() const = 0;
 };
@@ -185,6 +190,7 @@ class StripeStreamsBase : public StripeStreams {
   std::function<BufferPtr()> getIntDictionaryInitializerForNode(
       const EncodingKey& ek,
       uint64_t elementWidth,
+      const StreamLabels& streamLabels,
       uint64_t dictionaryWidth = sizeof(int64_t)) override;
 
   std::shared_ptr<StripeDictionaryCache> getStripeDictionaryCache() override {
@@ -196,15 +202,27 @@ class StripeStreamsBase : public StripeStreams {
   std::shared_ptr<StripeDictionaryCache> stripeDictionaryCache_;
 };
 
+struct StripeReadState {
+  std::shared_ptr<ReaderBase> readerBase;
+  std::unique_ptr<const StripeMetadata> stripeMetadata;
+
+  StripeReadState(
+      std::shared_ptr<ReaderBase> readerBase,
+      std::unique_ptr<const StripeMetadata> stripeMetadata)
+      : readerBase{std::move(readerBase)},
+        stripeMetadata{std::move(stripeMetadata)} {}
+};
+
 /**
  * StripeStream Implementation
  */
 class StripeStreamsImpl : public StripeStreamsBase {
  private:
-  const StripeReaderBase& reader_;
+  std::shared_ptr<StripeReadState> readState_;
   const dwio::common::ColumnSelector& selector_;
   const dwio::common::RowReaderOptions& opts_;
   const uint64_t stripeStart_;
+  const int64_t stripeNumberOfRows_;
   const StrideIndexProvider& provider_;
   const uint32_t stripeIndex_;
   bool readPlanLoaded_;
@@ -222,18 +240,22 @@ class StripeStreamsImpl : public StripeStreamsBase {
       decryptedEncodings_;
 
  public:
+  static constexpr int64_t kUnknownStripeRows = -1;
+
   StripeStreamsImpl(
-      const StripeReaderBase& reader,
+      std::shared_ptr<StripeReadState> readState,
       const dwio::common::ColumnSelector& selector,
       const dwio::common::RowReaderOptions& opts,
       uint64_t stripeStart,
+      int64_t stripeNumberOfRows,
       const StrideIndexProvider& provider,
       uint32_t stripeIndex)
-      : StripeStreamsBase{&reader.getReader().getMemoryPool()},
-        reader_(reader),
+      : StripeStreamsBase{&readState->readerBase->getMemoryPool()},
+        readState_(std::move(readState)),
         selector_{selector},
         opts_{opts},
         stripeStart_{stripeStart},
+        stripeNumberOfRows_{stripeNumberOfRows},
         provider_(provider),
         stripeIndex_{stripeIndex},
         readPlanLoaded_{false} {
@@ -243,7 +265,7 @@ class StripeStreamsImpl : public StripeStreamsBase {
   ~StripeStreamsImpl() override = default;
 
   DwrfFormat format() const override {
-    return reader_.getReader().format();
+    return readState_->readerBase->format();
   }
 
   const dwio::common::ColumnSelector& getColumnSelector() const override {
@@ -258,7 +280,7 @@ class StripeStreamsImpl : public StripeStreamsBase {
       const EncodingKey& ek) const override {
     auto index = encodings_.find(ek);
     if (index != encodings_.end()) {
-      return reader_.getStripeFooter().encoding(index->second);
+      return readState_->stripeMetadata->footer->encoding(index->second);
     }
     auto enc = decryptedEncodings_.find(ek);
     DWIO_ENSURE(
@@ -272,7 +294,8 @@ class StripeStreamsImpl : public StripeStreamsBase {
   void loadReadPlan();
 
   std::unique_ptr<dwio::common::SeekableInputStream> getCompressedStream(
-      const DwrfStreamIdentifier& si) const;
+      const DwrfStreamIdentifier& si,
+      std::string_view label) const;
 
   uint64_t getStreamLength(const DwrfStreamIdentifier& si) const {
     return getStreamInfo(si).getLength();
@@ -285,6 +308,7 @@ class StripeStreamsImpl : public StripeStreamsBase {
 
   std::unique_ptr<dwio::common::SeekableInputStream> getStream(
       const DwrfStreamIdentifier& si,
+      std::string_view label,
       bool throwIfNotFound) const override;
 
   uint32_t visitStreamsOfNode(
@@ -297,8 +321,13 @@ class StripeStreamsImpl : public StripeStreamsBase {
     return provider_;
   }
 
+  int64_t stripeRows() const override {
+    VELOX_CHECK_NE(stripeNumberOfRows_, kUnknownStripeRows);
+    return stripeNumberOfRows_;
+  }
+
   uint32_t rowsPerRowGroup() const override {
-    return reader_.getReader().getFooter().rowIndexStride();
+    return readState_->readerBase->getFooter().rowIndexStride();
   }
 
  private:
@@ -319,7 +348,7 @@ class StripeStreamsImpl : public StripeStreamsBase {
 
   const dwio::common::encryption::Decrypter* getDecrypter(
       uint32_t nodeId) const {
-    auto& handler = reader_.getDecryptionHandler();
+    auto& handler = *readState_->stripeMetadata->handler;
     return handler.isEncrypted(nodeId)
         ? std::addressof(handler.getEncryptionProvider(nodeId))
         : nullptr;

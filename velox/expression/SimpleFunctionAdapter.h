@@ -85,11 +85,26 @@ class SimpleFunctionAdapter : public VectorFunction {
   // boolean.
   template <int32_t POSITION>
   static constexpr bool isArgFlatConstantFastPathEligible =
-      SimpleTypeTrait<arg_at<POSITION>>::isPrimitiveType&&
-          SimpleTypeTrait<arg_at<POSITION>>::typeKind != TypeKind::BOOLEAN;
+      SimpleTypeTrait<arg_at<POSITION>>::isPrimitiveType &&
+      SimpleTypeTrait<arg_at<POSITION>>::typeKind != TypeKind::BOOLEAN;
 
   constexpr int32_t reuseStringsFromArgValue() const {
     return udf_reuse_strings_from_arg<typename FUNC::udf_struct_t>();
+  }
+  template <size_t... Is>
+  bool allArgsPrimitiveImpl(std::index_sequence<Is...>) const {
+    return ([&]() {
+      if constexpr (isVariadicType<arg_at<Is>>::value) {
+        return SimpleTypeTrait<
+            typename arg_at<Is>::underlying_type>::isPrimitiveType;
+      } else {
+        return SimpleTypeTrait<arg_at<Is>>::isPrimitiveType;
+      }
+    }() && ...);
+  }
+
+  bool allArgsPrimitive() const {
+    return allArgsPrimitiveImpl(std::make_index_sequence<FUNC::num_args>());
   }
 
   // Check if all arguments that satisfy
@@ -190,11 +205,12 @@ class SimpleFunctionAdapter : public VectorFunction {
 
   template <int32_t POSITION, typename... Values>
   void unpackInitialize(
+      const std::vector<TypePtr>& inputTypes,
       const core::QueryConfig& config,
       const std::vector<VectorPtr>& packed,
       const Values*... values) const {
     if constexpr (POSITION == FUNC::num_args) {
-      return (*fn_).initialize(config, values...);
+      return (*fn_).initialize(inputTypes, config, values...);
     } else {
       if (packed.at(POSITION) != nullptr) {
         SelectivityVector rows(1);
@@ -202,33 +218,40 @@ class SimpleFunctionAdapter : public VectorFunction {
         auto oneReader = VectorReader<arg_at<POSITION>>(&decodedVector);
         auto oneValue = oneReader[0];
 
-        unpackInitialize<POSITION + 1>(config, packed, values..., &oneValue);
+        unpackInitialize<POSITION + 1>(
+            inputTypes, config, packed, values..., &oneValue);
       } else {
         using temp_type = exec_arg_at<POSITION>;
         unpackInitialize<POSITION + 1>(
-            config, packed, values..., (const temp_type*)nullptr);
+            inputTypes, config, packed, values..., (const temp_type*)nullptr);
       }
     }
   }
 
  public:
-  explicit SimpleFunctionAdapter(
+  SimpleFunctionAdapter(
+      const std::vector<TypePtr>& inputTypes,
       const core::QueryConfig& config,
       const std::vector<VectorPtr>& constantInputs)
       : fn_{std::make_unique<FUNC>()} {
     if constexpr (FUNC::udf_has_initialize) {
       try {
-        unpackInitialize<0>(config, constantInputs);
-      } catch (const std::exception& e) {
+        unpackInitialize<0>(inputTypes, config, constantInputs);
+      } catch (const VeloxRuntimeError&) {
+        throw;
+      } catch (const std::exception&) {
         initializeException_ = std::current_exception();
       }
     }
   }
 
+  explicit SimpleFunctionAdapter() {}
+
   template <
       int32_t POSITION,
-      typename std::enable_if_t<POSITION<FUNC::num_args, int32_t> = 0>
-          VectorPtr* findReusableArg(std::vector<VectorPtr>& args) const {
+      typename std::enable_if_t<
+          POSITION<FUNC::num_args, int32_t> = 0> VectorPtr*
+          findReusableArg(std::vector<VectorPtr>& args) const {
     if constexpr (isVariadicType<arg_at<POSITION>>::value) {
       if constexpr (
           SimpleTypeTrait<
@@ -291,8 +314,10 @@ class SimpleFunctionAdapter : public VectorFunction {
         return_type_traits::isFixedWidth) {
       if (!reusableResult->get()) {
         if (auto* arg = findReusableArg<0>(args)) {
-          reusableResult = arg;
-          isResultReused = true;
+          if ((*arg)->type()->equivalent(*outputType)) {
+            reusableResult = arg;
+            isResultReused = true;
+          }
         }
       }
     }
@@ -359,7 +384,6 @@ class SimpleFunctionAdapter : public VectorFunction {
     auto reuseStringsFromArg = reuseStringsFromArgValue();
     if (reuseStringsFromArg >= 0) {
       VELOX_CHECK_LT(reuseStringsFromArg, args.size());
-      VELOX_CHECK_EQ(args[reuseStringsFromArg]->typeKind(), TypeKind::VARCHAR);
       if (decoded.size() == 0 || !decoded.at(reuseStringsFromArg).has_value()) {
         // If we're here, we're guaranteed the argument is either a Flat
         // or Constant vector so no decoding is necessary.
@@ -376,11 +400,12 @@ class SimpleFunctionAdapter : public VectorFunction {
     }
   }
 
-  // Acquire string buffer from source if vector is a string flat vector.
+  // All string vectors within `vector` will acquire shared ownership of all
+  // string buffers found within source.
   void tryAcquireStringBuffer(BaseVector* vector, const BaseVector* source)
       const {
     if (auto* flatVector = vector->asFlatVector<StringView>()) {
-      flatVector->acquireSharedStringBuffers(source);
+      flatVector->acquireSharedStringBuffersRecursive(source);
     } else if (auto* arrayVector = vector->as<ArrayVector>()) {
       tryAcquireStringBuffer(arrayVector->elements().get(), source);
     } else if (auto* mapVector = vector->as<MapVector>()) {
@@ -393,16 +418,23 @@ class SimpleFunctionAdapter : public VectorFunction {
     }
   }
 
-  bool isDeterministic() const override {
-    return fn_->isDeterministic();
-  }
-
-  bool isDefaultNullBehavior() const override {
-    return fn_->is_default_null_behavior;
+  FunctionCanonicalName getCanonicalName() const final {
+    return fn_->getCanonicalName();
   }
 
   bool supportsFlatNoNullsFastPath() const override {
-    return !FUNC::can_produce_null_output;
+    if (FUNC::can_produce_null_output) {
+      return false;
+    }
+
+    if (FUNC::is_default_contains_nulls_behavior) {
+      // If the function has is_default_contains_nulls_behavior it returns
+      // null if data contain null even if the return type of callNullFree is
+      // void.
+      return allArgsPrimitive();
+    } else {
+      return true;
+    }
   }
 
   bool ensureStringEncodingSetAtAllInputs() const override {
@@ -539,11 +571,7 @@ class SimpleFunctionAdapter : public VectorFunction {
     if constexpr (FUNC::is_default_null_behavior) {
       allNotNull = true;
     } else {
-      if (applyContext.context.nullsPruned()) {
-        allNotNull = true;
-      } else {
-        allNotNull = (!readers.mayHaveNulls() && ...);
-      }
+      allNotNull = (!readers.mayHaveNulls() && ...);
     }
 
     // Iterate the rows.
@@ -604,6 +632,16 @@ class SimpleFunctionAdapter : public VectorFunction {
           });
         }
       } else if (allNotNull) {
+        if constexpr (FUNC::has_ascii) {
+          if (applyContext.allAscii) {
+            applyContext.applyToSelectedNoThrow([&](auto row) INLINE_LAMBDA {
+              typename return_type_traits::NativeType out{};
+              bool notNull = doApplyAsciiNotNull<0>(row, out, readers...);
+              writeResult(row, notNull, out);
+            });
+            return;
+          }
+        }
         applyContext.applyToSelectedNoThrow([&](auto row) INLINE_LAMBDA {
           // Passing a stack variable have shown to be boost the performance
           // of functions that repeatedly update the output. The opposite
@@ -641,15 +679,17 @@ class SimpleFunctionAdapter : public VectorFunction {
           });
         }
       } else if (allNotNull) {
-        if (applyContext.allAscii) {
-          applyUdf(applyContext, [&](auto& out, auto row) INLINE_LAMBDA {
-            return doApplyAsciiNotNull<0>(row, out, readers...);
-          });
-        } else {
-          applyUdf(applyContext, [&](auto& out, auto row) INLINE_LAMBDA {
-            return doApplyNotNull<0>(row, out, readers...);
-          });
+        if constexpr (FUNC::has_ascii) {
+          if (applyContext.allAscii) {
+            applyUdf(applyContext, [&](auto& out, auto row) INLINE_LAMBDA {
+              return doApplyAsciiNotNull<0>(row, out, readers...);
+            });
+            return;
+          }
         }
+        applyUdf(applyContext, [&](auto& out, auto row) INLINE_LAMBDA {
+          return doApplyNotNull<0>(row, out, readers...);
+        });
       } else {
         applyUdf(applyContext, [&](auto& out, auto row) INLINE_LAMBDA {
           return doApply<0>(row, out, readers...);
@@ -858,11 +898,15 @@ class SimpleFunctionAdapterFactoryImpl : public SimpleFunctionAdapterFactory {
 
   explicit SimpleFunctionAdapterFactoryImpl() {}
 
+  static constexpr bool is_default_null_behavior =
+      UDFHolder::is_default_null_behavior;
+
   std::unique_ptr<VectorFunction> createVectorFunction(
-      const core::QueryConfig& config,
-      const std::vector<VectorPtr>& constantInputs) const override {
+      const std::vector<TypePtr>& inputTypes,
+      const std::vector<VectorPtr>& constantInputs,
+      const core::QueryConfig& config) const override {
     return std::make_unique<SimpleFunctionAdapter<UDFHolder>>(
-        config, constantInputs);
+        inputTypes, config, constantInputs);
   }
 };
 

@@ -13,7 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/prestosql/window/tests/WindowTestBase.h"
+#include "velox/functions/lib/window/tests/WindowTestBase.h"
+#include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
 
 using namespace facebook::velox::exec::test;
 
@@ -24,14 +25,20 @@ namespace {
 class NtileTest : public WindowTestBase {
  protected:
   void testNtile(const std::vector<RowVectorPtr>& vectors) {
+    // Tests ntile with a column.
+    WindowTestBase::testWindowFunction(vectors, "ntile(c2)", kOverClauses);
     // Tests ntile with constant value arguments.
     testNtileWithConstants(vectors, kOverClauses);
-    // Tests ntile with a column.
-    WindowTestBase::testWindowFunction(
-        vectors, "ntile(c2)", kOverClauses, kFrameClauses);
+  }
+
+  void SetUp() override {
+    WindowTestBase::SetUp();
+    window::prestosql::registerAllWindowFunctions();
   }
 
  private:
+  // Note: This function assumes that the DuckDB table has been previously
+  // constructed from the data.
   void testNtileWithConstants(
       const std::vector<RowVectorPtr>& vectors,
       const std::vector<std::string>& overClauses) {
@@ -39,33 +46,35 @@ class NtileTest : public WindowTestBase {
     // i) Constant buckets
     // ii) Number of buckets <, =, > number of rows in the partition.
     // iii) Number of buckets evenly divide (value 10) or not (other values).
-    // TODO: Add null value testing also pending issues with DuckDB.
-    for (auto i = 1; i < 20; i += 3) {
+    static const std::vector<std::string> kNtileInvocations = {
+        "ntile(1)",
+        "ntile(7)",
+        "ntile(10)",
+        "ntile(16)",
+    };
+
+    // Note: The DuckDB table has been previously created.
+    for (auto function : kNtileInvocations) {
       WindowTestBase::testWindowFunction(
-          vectors, fmt::format("ntile({})", i), overClauses, kFrameClauses);
+          vectors, function, overClauses, {""}, false);
     }
   }
 };
 
 // Tests ntile with uniformly distributed data.
 TEST_F(NtileTest, basic) {
-  testNtile({makeSimpleVector(50)});
-}
-
-// Tests ntile with a dataset with all rows in a single partition.
-TEST_F(NtileTest, singlePartition) {
-  testNtile({makeSinglePartitionVector(75)});
+  testNtile({makeSimpleVector(30)});
 }
 
 // Test ntile with a dataset with all rows in a single partition but in
 // 2 input vectors.
-TEST_F(NtileTest, multiInput) {
-  testNtile({makeSinglePartitionVector(50), makeSinglePartitionVector(75)});
+TEST_F(NtileTest, singlePartition) {
+  testNtile({makeSinglePartitionVector(25), makeSinglePartitionVector(30)});
 }
 
 // Tests ntile with a dataset in which all partitions have a single row.
 TEST_F(NtileTest, singleRowPartitions) {
-  testNtile({makeSingleRowPartitionsVector(50)});
+  testNtile({makeSingleRowPartitionsVector(25)});
 }
 
 // Tests ntile with a dataset with random values.
@@ -91,5 +100,5 @@ TEST_F(NtileTest, errorCases) {
       {columnVector}, "ntile(c0)", overClause, bucketError);
 }
 
-}; // namespace
-}; // namespace facebook::velox::window::test
+} // namespace
+} // namespace facebook::velox::window::test

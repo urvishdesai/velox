@@ -23,10 +23,35 @@
 using namespace facebook::velox;
 using namespace facebook::velox::test;
 using namespace facebook::velox::exec;
+using namespace facebook::velox::exec::test;
 
-class OperatorUtilsTest
-    : public ::facebook::velox::exec::test::OperatorTestBase {
+class OperatorUtilsTest : public OperatorTestBase {
  protected:
+  void TearDown() override {
+    driverCtx_.reset();
+    driver_.reset();
+    task_.reset();
+    OperatorTestBase::TearDown();
+  }
+
+  OperatorUtilsTest() {
+    VectorMaker vectorMaker{pool_.get()};
+    std::vector<RowVectorPtr> values = {vectorMaker.rowVector(
+        {vectorMaker.flatVector<int32_t>(1, [](auto row) { return row; })})};
+    core::PlanFragment planFragment;
+    const core::PlanNodeId id{"0"};
+    planFragment.planNode = std::make_shared<core::ValuesNode>(id, values);
+
+    task_ = Task::create(
+        "SpillOperatorGroupTest_task",
+        std::move(planFragment),
+        0,
+        std::make_shared<core::QueryCtx>());
+    driver_ = Driver::testingCreate();
+    driverCtx_ = std::make_unique<DriverCtx>(task_, 0, 0, 0, 0);
+    driverCtx_->driver = driver_.get();
+  }
+
   void gatherCopyTest(
       const std::shared_ptr<const RowType>& targetType,
       const std::shared_ptr<const RowType>& sourceType,
@@ -106,7 +131,9 @@ class OperatorUtilsTest
     }
   }
 
-  std::shared_ptr<memory::MemoryPool> pool_{memory::getDefaultMemoryPool()};
+  std::shared_ptr<Task> task_;
+  std::shared_ptr<Driver> driver_;
+  std::unique_ptr<DriverCtx> driverCtx_;
 };
 
 TEST_F(OperatorUtilsTest, wrapChildConstant) {
@@ -276,4 +303,161 @@ TEST_F(OperatorUtilsTest, addOperatorRuntimeStats) {
   ASSERT_EQ(stats[statsName].sum, 500);
   ASSERT_EQ(stats[statsName].max, 200);
   ASSERT_EQ(stats[statsName].min, 100);
+}
+
+TEST_F(OperatorUtilsTest, initializeRowNumberMapping) {
+  BufferPtr mapping;
+  auto rawMapping = initializeRowNumberMapping(mapping, 10, pool());
+  ASSERT_TRUE(mapping != nullptr);
+  ASSERT_GE(mapping->size(), 10);
+
+  rawMapping = initializeRowNumberMapping(mapping, 100, pool());
+  ASSERT_GE(mapping->size(), 100);
+
+  rawMapping = initializeRowNumberMapping(mapping, 60, pool());
+  ASSERT_GE(mapping->size(), 100);
+
+  ASSERT_EQ(mapping->refCount(), 1);
+  auto otherMapping = mapping;
+  ASSERT_EQ(mapping->refCount(), 2);
+  ASSERT_EQ(mapping.get(), otherMapping.get());
+  rawMapping = initializeRowNumberMapping(mapping, 10, pool());
+  ASSERT_NE(mapping.get(), otherMapping.get());
+}
+
+TEST_F(OperatorUtilsTest, projectChildren) {
+  const vector_size_t srcVectorSize{10};
+  const auto srcRowType = ROW({
+      {"bool_val", BOOLEAN()},
+      {"int_val", INTEGER()},
+      {"double_val", DOUBLE()},
+      {"string_val", VARCHAR()},
+  });
+  VectorFuzzer fuzzer({}, pool());
+  auto srcRowVector{fuzzer.fuzzRow(srcRowType, srcVectorSize)};
+
+  {
+    std::vector<IdentityProjection> emptyProjection;
+    std::vector<VectorPtr> projectedChildren(srcRowType->size());
+    projectChildren(
+        projectedChildren,
+        srcRowVector,
+        emptyProjection,
+        srcVectorSize,
+        nullptr);
+    for (vector_size_t i = 0; i < projectedChildren.size(); ++i) {
+      ASSERT_EQ(projectedChildren[i], nullptr);
+    }
+  }
+
+  {
+    std::vector<IdentityProjection> identicalProjections{};
+    for (auto i = 0; i < srcRowType->size(); ++i) {
+      identicalProjections.emplace_back(i, i);
+    }
+    std::vector<VectorPtr> projectedChildren(srcRowType->size());
+    projectChildren(
+        projectedChildren,
+        srcRowVector,
+        identicalProjections,
+        srcVectorSize,
+        nullptr);
+    for (const auto& projection : identicalProjections) {
+      ASSERT_EQ(
+          projectedChildren[projection.outputChannel].get(),
+          srcRowVector->childAt(projection.inputChannel).get());
+    }
+  }
+
+  {
+    const auto destRowType = ROW({
+        {"double_val", DOUBLE()},
+        {"bool_val", BOOLEAN()},
+    });
+    std::vector<IdentityProjection> projections{};
+    projections.emplace_back(2, 0);
+    projections.emplace_back(0, 1);
+    std::vector<VectorPtr> projectedChildren(srcRowType->size());
+    projectChildren(
+        projectedChildren, srcRowVector, projections, srcVectorSize, nullptr);
+    for (const auto& projection : projections) {
+      ASSERT_EQ(
+          projectedChildren[projection.outputChannel].get(),
+          srcRowVector->childAt(projection.inputChannel).get());
+    }
+  }
+}
+
+TEST_F(OperatorUtilsTest, reclaimableSectionGuard) {
+  class MockOperator : public Operator {
+   public:
+    MockOperator(DriverCtx* driverCtx, RowTypePtr rowType)
+        : Operator(
+              driverCtx,
+              std::move(rowType),
+              0,
+              "MockOperator",
+              "MockType") {}
+
+    bool needsInput() const override {
+      return false;
+    }
+
+    void addInput(RowVectorPtr input) override {}
+
+    RowVectorPtr getOutput() override {
+      return nullptr;
+    }
+
+    BlockingReason isBlocked(ContinueFuture* future) override {
+      return BlockingReason::kNotBlocked;
+    }
+
+    bool isFinished() override {
+      return false;
+    }
+  };
+
+  RowTypePtr rowType = ROW({"c0"}, {INTEGER()});
+
+  MockOperator mockOp(driverCtx_.get(), rowType);
+  ASSERT_FALSE(mockOp.testingNonReclaimable());
+  {
+    Operator::NonReclaimableSectionGuard guard(&mockOp);
+    ASSERT_TRUE(mockOp.testingNonReclaimable());
+    {
+      Operator::NonReclaimableSectionGuard guard(&mockOp);
+      ASSERT_TRUE(mockOp.testingNonReclaimable());
+    }
+    ASSERT_TRUE(mockOp.testingNonReclaimable());
+    {
+      Operator::ReclaimableSectionGuard guard(&mockOp);
+      ASSERT_FALSE(mockOp.testingNonReclaimable());
+      {
+        Operator::NonReclaimableSectionGuard guard(&mockOp);
+        ASSERT_TRUE(mockOp.testingNonReclaimable());
+      }
+      ASSERT_FALSE(mockOp.testingNonReclaimable());
+      {
+        Operator::NonReclaimableSectionGuard guard(&mockOp);
+        ASSERT_TRUE(mockOp.testingNonReclaimable());
+      }
+      ASSERT_FALSE(mockOp.testingNonReclaimable());
+    }
+    ASSERT_TRUE(mockOp.testingNonReclaimable());
+  }
+  ASSERT_FALSE(mockOp.testingNonReclaimable());
+}
+
+TEST_F(OperatorUtilsTest, memStatsFromPool) {
+  auto leafPool = rootPool_->addLeafChild("leaf-1.0");
+  void* buffer;
+  buffer = leafPool->allocate(2L << 20);
+  leafPool->free(buffer, 2L << 20);
+  const auto stats = MemoryStats::memStatsFromPool(leafPool.get());
+  ASSERT_EQ(stats.userMemoryReservation, 0);
+  ASSERT_EQ(stats.systemMemoryReservation, 0);
+  ASSERT_EQ(stats.peakUserMemoryReservation, 2L << 20);
+  ASSERT_EQ(stats.peakSystemMemoryReservation, 0);
+  ASSERT_EQ(stats.numMemoryAllocations, 1);
 }

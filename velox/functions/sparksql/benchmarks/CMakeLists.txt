@@ -21,5 +21,9 @@ target_link_libraries(
   velox_exec_test_lib
   velox_vector_test_lib
   velox_vector_fuzzer
-  ${FOLLY_WITH_DEPENDENCIES}
+  Folly::folly
   ${FOLLY_BENCHMARK})
+
+add_executable(velox_sparksql_benchmarks_compare CompareBenchmark.cpp)
+target_link_libraries(velox_sparksql_benchmarks_compare velox_functions_spark
+                      velox_benchmark_builder velox_vector_test_lib)

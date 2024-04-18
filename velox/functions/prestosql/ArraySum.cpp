@@ -20,8 +20,8 @@
 #include "velox/expression/EvalCtx.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/VectorFunction.h"
+#include "velox/functions/lib/CheckedArithmetic.h"
 #include "velox/functions/lib/LambdaFunctionUtil.h"
-#include "velox/functions/prestosql/CheckedArithmetic.h"
 
 namespace facebook::velox::functions {
 namespace {
@@ -203,7 +203,8 @@ class ArraySumFunction : public exec::VectorFunction {
 // Create function.
 std::shared_ptr<exec::VectorFunction> create(
     const std::string& /* name */,
-    const std::vector<exec::VectorFunctionArg>& inputArgs) {
+    const std::vector<exec::VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& /*config*/) {
   auto elementType = inputArgs.front().type->childAt(0);
 
   switch (elementType->kind()) {

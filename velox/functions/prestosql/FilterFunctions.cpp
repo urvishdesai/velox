@@ -24,27 +24,7 @@ namespace facebook::velox::functions {
 namespace {
 
 class FilterFunctionBase : public exec::VectorFunction {
- public:
-  bool isDefaultNullBehavior() const override {
-    // array_filter and map_filter are null preserving for the array and the
-    // map. But since an expr tree with a lambda depends on all named fields,
-    // including captures, a null in a capture does not automatically make a
-    // null result.
-    return false;
-  }
-
  protected:
-  static void appendToIndicesBuffer(
-      BufferPtr* buffer,
-      memory::MemoryPool* pool,
-      vector_size_t data) {
-    if (!*buffer) {
-      *buffer = AlignedBuffer::allocate<decltype(data)>(100, pool);
-      (*buffer)->setSize(0);
-    }
-    AlignedBuffer::appendTo(buffer, &data, 1);
-  }
-
   // Applies filter functions to elements of maps or arrays and returns the
   // number of elements that passed the filters. Stores the number of elements
   // in each array or map that passed the filter in resultSizes. Stores the
@@ -60,24 +40,24 @@ class FilterFunctionBase : public exec::VectorFunction {
       BufferPtr& resultOffsets,
       BufferPtr& resultSizes,
       BufferPtr& selectedIndices) {
-    auto inputOffsets = input->rawOffsets();
-    auto inputSizes = input->rawSizes();
+    const auto* inputOffsets = input->rawOffsets();
+    const auto* inputSizes = input->rawSizes();
 
     auto* pool = context.pool();
-    resultSizes = allocateSizes(rows.size(), pool);
-    resultOffsets = allocateOffsets(rows.size(), pool);
-    auto rawResultSizes = resultSizes->asMutable<vector_size_t>();
-    auto rawResultOffsets = resultOffsets->asMutable<vector_size_t>();
-    auto numElements = lambdaArgs[0]->size();
+    resultSizes = allocateSizes(rows.end(), pool);
+    resultOffsets = allocateOffsets(rows.end(), pool);
+    auto* rawResultSizes = resultSizes->asMutable<vector_size_t>();
+    auto* rawResultOffsets = resultOffsets->asMutable<vector_size_t>();
 
-    SelectivityVector finalSelection;
-    if (!context.isFinalSelection()) {
-      finalSelection =
-          toElementRows<T>(numElements, *context.finalSelection(), input.get());
-    }
+    const auto numElements = lambdaArgs[0]->size();
 
-    auto elementToTopLevelRows = getElementToTopLevelRows(
-        numElements, rows, input.get(), context.pool());
+    selectedIndices = allocateIndices(numElements, pool);
+    auto* rawSelectedIndices = selectedIndices->asMutable<vector_size_t>();
+
+    vector_size_t numSelected = 0;
+
+    auto elementToTopLevelRows =
+        getElementToTopLevelRows(numElements, rows, input.get(), pool);
 
     exec::LocalDecodedVector bitsDecoder(context);
     auto iter = lambdas->asUnchecked<FunctionVector>()->iterator(&rows);
@@ -90,7 +70,7 @@ class FilterFunctionBase : public exec::VectorFunction {
       VectorPtr bits;
       entry.callable->apply(
           elementRows,
-          finalSelection,
+          nullptr,
           wrapCapture,
           &context,
           lambdaArgs,
@@ -103,21 +83,21 @@ class FilterFunctionBase : public exec::VectorFunction {
         }
         auto size = inputSizes[row];
         auto offset = inputOffsets[row];
-        rawResultOffsets[row] = selectedIndices
-            ? selectedIndices->size() / sizeof(vector_size_t)
-            : 0;
+        rawResultOffsets[row] = numSelected;
         for (auto i = 0; i < size; ++i) {
           if (!bitsDecoder.get()->isNullAt(offset + i) &&
               bitsDecoder.get()->valueAt<bool>(offset + i)) {
             ++rawResultSizes[row];
-            appendToIndicesBuffer(&selectedIndices, pool, offset + i);
+            rawSelectedIndices[numSelected] = offset + i;
+            ++numSelected;
           }
         }
       });
     }
 
-    return selectedIndices ? selectedIndices->size() / sizeof(vector_size_t)
-                           : 0;
+    selectedIndices->setSize(numSelected * sizeof(vector_size_t));
+
+    return numSelected;
   }
 };
 
@@ -159,11 +139,13 @@ class ArrayFilterFunction : public FilterFunctionBase {
                                              numSelected,
                                              std::move(elements))
                                        : nullptr;
+    // Set nulls for rows not present in 'rows'.
+    BufferPtr newNulls = addNullsForUnselectedRows(flatArray, rows);
     auto localResult = std::make_shared<ArrayVector>(
         flatArray->pool(),
         flatArray->type(),
-        flatArray->nulls(),
-        rows.size(),
+        std::move(newNulls),
+        rows.end(),
         std::move(resultOffsets),
         std::move(resultSizes),
         wrappedElements);
@@ -224,11 +206,13 @@ class MapFilterFunction : public FilterFunctionBase {
                                            numSelected,
                                            std::move(values))
                                      : nullptr;
+    // Set nulls for rows not present in 'rows'.
+    BufferPtr newNulls = addNullsForUnselectedRows(flatMap, rows);
     auto localResult = std::make_shared<MapVector>(
         flatMap->pool(),
         outputType,
-        flatMap->nulls(),
-        rows.size(),
+        std::move(newNulls),
+        rows.end(),
         std::move(resultOffsets),
         std::move(resultSizes),
         wrappedKeys,
@@ -239,7 +223,7 @@ class MapFilterFunction : public FilterFunctionBase {
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
     // map(K,V), function(K,V,boolean) -> map(K,V)
     return {exec::FunctionSignatureBuilder()
-                .knownTypeVariable("K")
+                .typeVariable("K")
                 .typeVariable("V")
                 .returnType("map(K,V)")
                 .argumentType("map(K,V)")
@@ -249,14 +233,21 @@ class MapFilterFunction : public FilterFunctionBase {
 };
 } // namespace
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+/// array_filter and map_filter are null preserving for the array and the
+/// map. But since an expr tree with a lambda depends on all named fields,
+/// including captures, a null in a capture does not automatically make a
+/// null result.
+
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_array_filter,
     ArrayFilterFunction::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<ArrayFilterFunction>());
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_map_filter,
     MapFilterFunction::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<MapFilterFunction>());
 
 } // namespace facebook::velox::functions

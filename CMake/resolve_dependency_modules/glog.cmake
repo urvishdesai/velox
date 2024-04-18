@@ -37,13 +37,15 @@ set(BUILD_TESTING OFF)
 FetchContent_MakeAvailable(glog)
 unset(BUILD_TESTING)
 unset(BUILD_SHARED_LIBS)
-add_dependencies(glog gflags)
+add_dependencies(glog gflags_static)
 
 list(PREPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/glog)
 set(glog_INCLUDE_DIR ${glog_BINARY_DIR})
 set(glog_LIBRARY ${glog_BINARY_DIR}/libglog$<$<CONFIG:Debug>:d>.a)
 
-# platform.h is missing from the include dir but adding the src dir causes
+# These headers are missing from the include dir but adding the src dir causes
 # issues with folly so we just copy it to the include dir
 file(COPY ${glog_SOURCE_DIR}/src/glog/platform.h
+     DESTINATION ${glog_BINARY_DIR}/glog)
+file(COPY ${glog_SOURCE_DIR}/src/glog/log_severity.h
      DESTINATION ${glog_BINARY_DIR}/glog)

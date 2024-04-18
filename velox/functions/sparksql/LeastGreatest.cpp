@@ -27,10 +27,6 @@ template <typename Cmp, TypeKind kind>
 class LeastGreatestFunction final : public exec::VectorFunction {
   using T = typename TypeTraits<kind>::NativeType;
 
-  bool isDefaultNullBehavior() const override {
-    return false;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -56,7 +52,7 @@ class LeastGreatestFunction final : public exec::VectorFunction {
 
       // Only compare with non-null elements of each argument
       *cmpRows = rows;
-      if (auto* rawNulls = decodedVectorHolder->nulls()) {
+      if (auto* rawNulls = decodedVectorHolder->nulls(&rows)) {
         cmpRows->deselectNulls(rawNulls, 0, nrows);
       }
 
@@ -118,7 +114,6 @@ std::shared_ptr<exec::VectorFunction> makeImpl(
     SCALAR_CASE(VARCHAR)
     SCALAR_CASE(VARBINARY)
     SCALAR_CASE(TIMESTAMP)
-    SCALAR_CASE(DATE)
 #undef SCALAR_CASE
     default:
       VELOX_NYI(
@@ -132,7 +127,8 @@ std::shared_ptr<exec::VectorFunction> makeImpl(
 
 std::shared_ptr<exec::VectorFunction> makeLeast(
     const std::string& functionName,
-    const std::vector<exec::VectorFunctionArg>& args) {
+    const std::vector<exec::VectorFunctionArg>& args,
+    const core::QueryConfig& /*config*/) {
   return makeImpl<Less>(functionName, args);
 }
 
@@ -164,7 +160,8 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> leastSignatures() {
 
 std::shared_ptr<exec::VectorFunction> makeGreatest(
     const std::string& functionName,
-    const std::vector<exec::VectorFunctionArg>& args) {
+    const std::vector<exec::VectorFunctionArg>& args,
+    const core::QueryConfig& /*config*/) {
   return makeImpl<Greater>(functionName, args);
 }
 

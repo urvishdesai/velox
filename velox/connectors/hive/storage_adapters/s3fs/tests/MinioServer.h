@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
-#include "velox/core/Context.h"
+#pragma once
+
+#include "velox/core/Config.h"
+#include "velox/exec/tests/utils/PortUtil.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 
 #include "boost/process.hpp"
@@ -25,26 +28,30 @@ namespace {
 constexpr char const* kMinioExecutableName{"minio"};
 constexpr char const* kMinioAccessKey{"minio"};
 constexpr char const* kMinioSecretKey{"miniopass"};
-constexpr char const* kMinioConnectionString{"127.0.0.1:9000"};
 } // namespace
 
 // A minio server, managed as a child process.
 // Adapted from the Apache Arrow library.
 class MinioServer {
  public:
-  MinioServer() : tempPath_(::exec::test::TempDirectoryPath::create()) {}
+  MinioServer() : tempPath_(::exec::test::TempDirectoryPath::create()) {
+    constexpr auto kHostAddressTemplate = "127.0.0.1:{}";
+    auto ports = facebook::velox::exec::test::getFreePorts(2);
+    connectionString_ = fmt::format(kHostAddressTemplate, ports[0]);
+    consoleAddress_ = fmt::format(kHostAddressTemplate, ports[1]);
+  }
 
   void start();
 
   void stop();
 
   void addBucket(const char* bucket) {
-    const std::string path = tempPath_->path + "/" + bucket;
+    const std::string path = tempPath_->getPath() + "/" + bucket;
     mkdir(path.c_str(), S_IRWXU | S_IRWXG);
   }
 
   std::string path() const {
-    return tempPath_->path;
+    return tempPath_->getPath();
   }
 
   std::shared_ptr<const Config> hiveConfig(
@@ -68,7 +75,8 @@ class MinioServer {
 
  private:
   const std::shared_ptr<exec::test::TempDirectoryPath> tempPath_;
-  const std::string connectionString_ = kMinioConnectionString;
+  std::string connectionString_;
+  std::string consoleAddress_;
   const std::string accessKey_ = kMinioAccessKey;
   const std::string secretKey_ = kMinioSecretKey;
   std::shared_ptr<::boost::process::child> serverProcess_;
@@ -84,6 +92,7 @@ void MinioServer::start() {
     VELOX_FAIL("Failed to find minio executable {}'", kMinioExecutableName);
   }
 
+  const auto path = tempPath_->getPath();
   try {
     serverProcess_ = std::make_shared<boost::process::child>(
         env,
@@ -93,7 +102,9 @@ void MinioServer::start() {
         "--compat",
         "--address",
         connectionString_,
-        tempPath_->path.c_str());
+        "--console-address",
+        consoleAddress_,
+        path.c_str());
   } catch (const std::exception& e) {
     VELOX_FAIL("Failed to launch Minio server: {}", e.what());
   }

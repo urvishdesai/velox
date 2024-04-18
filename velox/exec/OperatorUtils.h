@@ -36,15 +36,13 @@ struct FilterEvalCtx {
 
   // Make sure selectedBits has enough capacity to hold 'size' bits and return
   // raw pointer to the underlying buffer.
-  uint64_t* FOLLY_NONNULL getRawSelectedBits(
-      vector_size_t size,
-      memory::MemoryPool* FOLLY_NONNULL pool);
+  uint64_t* getRawSelectedBits(vector_size_t size, memory::MemoryPool* pool);
 
   // Make sure selectedIndices buffer has enough capacity to hold 'size'
   // indices and return raw pointer to the underlying buffer.
-  vector_size_t* FOLLY_NONNULL getRawSelectedIndices(
+  vector_size_t* getRawSelectedIndices(
       vector_size_t size,
-      memory::MemoryPool* FOLLY_NONNULL pool);
+      memory::MemoryPool* pool);
 };
 
 // Convert the results of filter evaluation as a vector of booleans into indices
@@ -61,7 +59,7 @@ vector_size_t processFilterResults(
     const VectorPtr& filterResult,
     const SelectivityVector& rows,
     FilterEvalCtx& filterEvalCtx,
-    memory::MemoryPool* FOLLY_NONNULL pool);
+    memory::MemoryPool* pool);
 
 // Wraps the specified vector into a dictionary using the specified mapping.
 // Returns vector as-is if mapping is null. An optional nulls buffer can be
@@ -86,7 +84,7 @@ RowVectorPtr wrap(
     BufferPtr mapping,
     const RowTypePtr& rowType,
     const std::vector<VectorPtr>& childVectors,
-    memory::MemoryPool* FOLLY_NONNULL pool);
+    memory::MemoryPool* pool);
 
 // Ensures that all LazyVectors reachable from 'input' are loaded for all rows.
 void loadColumns(const RowVectorPtr& input, core::ExecCtx& execCtx);
@@ -99,7 +97,7 @@ void loadColumns(const RowVectorPtr& input, core::ExecCtx& execCtx);
 ///
 /// NOTE: all the source row vectors must have the same data type.
 void gatherCopy(
-    RowVector* FOLLY_NONNULL target,
+    RowVector* target,
     vector_size_t targetIndex,
     vector_size_t count,
     const std::vector<const RowVector*>& sources,
@@ -126,5 +124,36 @@ void addOperatorRuntimeStats(
 /// event.
 void aggregateOperatorRuntimeStats(
     std::unordered_map<std::string, RuntimeMetric>& stats);
+
+/// Allocates 'mapping' to fit at least 'size' indices and initializes them to
+/// zero if 'mapping' is either: nullptr, not unique or cannot fit 'size'.
+/// Returns 'mapping' as folly::Range<vector_size_t*>. Can be used by operator
+/// to initialize / resize reusable state across batches of processing.
+folly::Range<vector_size_t*> initializeRowNumberMapping(
+    BufferPtr& mapping,
+    vector_size_t size,
+    memory::MemoryPool* pool);
+
+/// Projects children of 'src' row vector according to 'projections'. Optionally
+/// takes a 'mapping' and 'size' that represent the indices and size,
+/// respectively, of a dictionary wrapping that should be applied to the
+/// projections. The output param 'projectedChildren' will contain all the final
+/// projections at the expected channel index. Indices not specified in
+/// 'projections' will be left untouched in 'projectedChildren'.
+void projectChildren(
+    std::vector<VectorPtr>& projectedChildren,
+    const RowVectorPtr& src,
+    const std::vector<IdentityProjection>& projections,
+    int32_t size,
+    const BufferPtr& mapping);
+
+/// Overload of the above function that takes reference to const vector of
+/// VectorPtr as 'src' argument, instead of row vector.
+void projectChildren(
+    std::vector<VectorPtr>& projectedChildren,
+    const std::vector<VectorPtr>& src,
+    const std::vector<IdentityProjection>& projections,
+    int32_t size,
+    const BufferPtr& mapping);
 
 } // namespace facebook::velox::exec

@@ -78,6 +78,11 @@ struct PlanNodeStats {
   /// up.
   CpuWallTiming cpuWallTiming;
 
+  /// Sum of CPU, scheduled and wall times spent on background activities
+  /// (activities that are not running on driver threads) for all corresponding
+  /// operators.
+  CpuWallTiming backgroundTiming;
+
   /// Sum of blocked wall time for all corresponding operators.
   uint64_t blockedWallNanos{0};
 
@@ -86,6 +91,8 @@ struct PlanNodeStats {
   uint64_t peakMemoryBytes{0};
 
   uint64_t numMemoryAllocations{0};
+
+  uint64_t physicalWrittenBytes{0};
 
   /// Operator-specific counters.
   std::unordered_map<std::string, RuntimeMetric> customStats;
@@ -98,6 +105,9 @@ struct PlanNodeStats {
 
   /// Number of total splits.
   int numSplits{0};
+
+  // Total bytes in memory for spilling
+  uint64_t spilledInputBytes{0};
 
   /// Total bytes written for spilling.
   uint64_t spilledBytes{0};

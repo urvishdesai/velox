@@ -34,6 +34,11 @@ BooleanMix refineBooleanMixNonNull(
 }
 } // namespace
 
+// Return a BooleanMix representing the status of boolean values in vector. If
+// vector contains a mix of true and false, extract the boolean values to a raw
+// buffer valuesOut. valuesOut may point to a raw buffer possessed by vector.
+// nullsOut remain unchanged if there is no null in vector. tempValues and
+// tempNulls may or may not be set by this function.
 BooleanMix getFlatBool(
     BaseVector* vector,
     const SelectivityVector& activeRows,
@@ -99,16 +104,12 @@ BooleanMix getFlatBool(
       memset(valuesToSet, 0, bits::nbytes(size));
       DecodedVector decoded(*vector, activeRows);
       auto values = decoded.data<uint64_t>();
-      auto nulls = decoded.nulls();
+      auto nulls = decoded.nulls(&activeRows);
       auto indices = decoded.indices();
       activeRows.applyToSelected([&](int32_t i) {
         auto index = indices[i];
         bool isNull = nulls && bits::isBitNull(nulls, i);
-        if (mergeNullsToValues && nulls) {
-          if (!isNull && bits::isBitSet(values, index)) {
-            bits::setBit(valuesToSet, i);
-          }
-        } else if (!isNull && bits::isBitSet(values, index)) {
+        if (!isNull && bits::isBitSet(values, index)) {
           bits::setBit(valuesToSet, i);
         }
         if (nullsToSet && isNull) {

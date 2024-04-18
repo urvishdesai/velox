@@ -14,7 +14,6 @@
 
 add_library(
   velox_aggregates
-  AggregateNames.h
   ApproxDistinctAggregate.cpp
   ApproxMostFrequentAggregate.cpp
   ApproxPercentileAggregate.cpp
@@ -22,36 +21,42 @@ add_library(
   ArrayAggAggregate.cpp
   AverageAggregate.cpp
   BitwiseAggregates.cpp
+  BitwiseXorAggregate.cpp
   BoolAggregates.cpp
+  CentralMomentsAggregates.cpp
+  Compare.cpp
+  CountAggregate.cpp
   CountIfAggregate.cpp
   CovarianceAggregates.cpp
   ChecksumAggregate.cpp
+  EntropyAggregates.cpp
+  GeometricMeanAggregate.cpp
   HistogramAggregate.cpp
   MapAggAggregate.cpp
-  MapAggregateBase.h
-  MapAggregateBase.cpp
   MapUnionAggregate.cpp
   MapUnionSumAggregate.cpp
+  MaxSizeForStatsAggregate.cpp
   MinMaxAggregates.cpp
   MinMaxByAggregates.cpp
-  CountAggregate.cpp
+  MultiMapAggAggregate.cpp
   PrestoHasher.cpp
-  SingleValueAccumulator.cpp
+  ReduceAgg.cpp
+  RegisterAggregateFunctions.cpp
+  SetAggregates.cpp
   SumAggregate.cpp
-  SumAggregate.h
-  ValueList.cpp
-  VarianceAggregates.cpp
-  MaxSizeForStatsAggregate.cpp
-  RegisterAggregateFunctions.cpp)
+  SumDataSizeForStatsAggregate.cpp
+  VarianceAggregates.cpp)
 
 target_link_libraries(
   velox_aggregates
   velox_common_hyperloglog
   velox_exec
+  velox_expression
   velox_presto_serializer
+  velox_functions_aggregates
   velox_functions_lib
   velox_functions_util
-  ${FOLLY_WITH_DEPENDENCIES})
+  Folly::folly)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)

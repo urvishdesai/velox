@@ -40,12 +40,6 @@ namespace facebook::velox::exec {
       case TypeKind::BIGINT: {                                           \
         return TEMPLATE_FUNC<TypeKind::BIGINT>(__VA_ARGS__);             \
       }                                                                  \
-      case TypeKind::DATE: {                                             \
-        return TEMPLATE_FUNC<TypeKind::DATE>(__VA_ARGS__);               \
-      }                                                                  \
-      case TypeKind::INTERVAL_DAY_TIME: {                                \
-        return TEMPLATE_FUNC<TypeKind::INTERVAL_DAY_TIME>(__VA_ARGS__);  \
-      }                                                                  \
       case TypeKind::VARCHAR:                                            \
       case TypeKind::VARBINARY: {                                        \
         return TEMPLATE_FUNC<TypeKind::VARCHAR>(__VA_ARGS__);            \
@@ -83,16 +77,9 @@ void VectorHasher::hashValues(
     rows.applyToSelected([&](vector_size_t row) {
       result[row] = mix ? bits::hashMix(result[row], hash) : hash;
     });
-  } else if (decoded_.isIdentityMapping()) {
-    rows.applyToSelected([&](vector_size_t row) {
-      if (decoded_.isNullAt(row)) {
-        result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
-        return;
-      }
-      auto hash = hashOne<Kind>(decoded_, row);
-      result[row] = mix ? bits::hashMix(result[row], hash) : hash;
-    });
-  } else {
+  } else if (
+      !decoded_.isIdentityMapping() &&
+      rows.countSelected() > decoded_.base()->size()) {
     cachedHashes_.resize(decoded_.base()->size());
     std::fill(cachedHashes_.begin(), cachedHashes_.end(), kNullHash);
     rows.applyToSelected([&](vector_size_t row) {
@@ -106,6 +93,15 @@ void VectorHasher::hashValues(
         hash = hashOne<Kind>(decoded_, row);
         cachedHashes_[baseIndex] = hash;
       }
+      result[row] = mix ? bits::hashMix(result[row], hash) : hash;
+    });
+  } else {
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decoded_.isNullAt(row)) {
+        result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
+        return;
+      }
+      auto hash = hashOne<Kind>(decoded_, row);
       result[row] = mix ? bits::hashMix(result[row], hash) : hash;
     });
   }
@@ -164,7 +160,7 @@ bool VectorHasher::makeValueIdsFlatWithNulls<bool>(
     const SelectivityVector& rows,
     uint64_t* result) {
   const auto* values = decoded_.data<uint64_t>();
-  const auto* nulls = decoded_.nulls();
+  const auto* nulls = decoded_.nulls(&rows);
   rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
     if (bits::isBitNull(nulls, row)) {
       if (multiplier_ == 1) {
@@ -214,7 +210,7 @@ bool VectorHasher::makeValueIdsFlatWithNulls(
     const SelectivityVector& rows,
     uint64_t* result) {
   const auto* values = decoded_.data<T>();
-  const auto* nulls = decoded_.nulls();
+  const auto* nulls = decoded_.nulls(&rows);
 
   bool success = true;
   rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
@@ -253,36 +249,42 @@ bool VectorHasher::makeValueIdsDecoded(
   auto values = decoded_.data<T>();
 
   bool success = true;
-  rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+  int numCachedHashes = 0;
+  rows.testSelected([&](vector_size_t row) INLINE_LAMBDA {
     if constexpr (mayHaveNulls) {
       if (decoded_.isNullAt(row)) {
         if (multiplier_ == 1) {
           result[row] = 0;
         }
-        return;
+        return true;
       }
     }
-    auto baseIndex = indices[row];
-    uint64_t id = cachedHashes_[baseIndex];
-    if (id == 0) {
-      T value = values[baseIndex];
 
-      if (!success) {
-        // If all were not mappable we just analyze the remaining so we can
-        // decide the hash mode.
-        analyzeValue(value);
-        return;
+    auto baseIndex = indices[row];
+    uint64_t& id = cachedHashes_[baseIndex];
+
+    if (success) {
+      if (id == 0) {
+        T value = values[baseIndex];
+        id = valueId(value);
+        numCachedHashes++;
+        if (id == kUnmappable) {
+          analyzeValue(value);
+          success = false;
+        }
       }
-      id = valueId(value);
-      if (id == kUnmappable) {
-        analyzeValue(value);
-        success = false;
-        return;
+      result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+    } else {
+      if (id == 0) {
+        id = kUnmappable;
+        numCachedHashes++;
+        analyzeValue(values[baseIndex]);
       }
-      cachedHashes_[baseIndex] = id;
     }
-    result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+
+    return success || numCachedHashes < cachedHashes_.size();
   });
+
   return success;
 }
 
@@ -378,8 +380,7 @@ void VectorHasher::lookupValueIdsTyped(
     const DecodedVector& decoded,
     SelectivityVector& rows,
     raw_vector<uint64_t>& hashes,
-    uint64_t* result,
-    bool noNulls) const {
+    uint64_t* result) const {
   using T = typename TypeTraits<Kind>::NativeType;
   if (decoded.isConstantMapping()) {
     if (decoded.isNullAt(rows.begin())) {
@@ -399,9 +400,9 @@ void VectorHasher::lookupValueIdsTyped(
       });
     }
   } else if (decoded.isIdentityMapping()) {
-    if (Kind == TypeKind::BIGINT && isRange_ && noNulls) {
+    if (Kind == TypeKind::BIGINT && isRange_) {
       lookupIdsRangeSimd<int64_t>(decoded, rows, result);
-    } else if (Kind == TypeKind::INTEGER && isRange_ && noNulls) {
+    } else if (Kind == TypeKind::INTEGER && isRange_) {
       lookupIdsRangeSimd<int32_t>(decoded, rows, result);
     } else {
       rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
@@ -508,8 +509,7 @@ void VectorHasher::lookupValueIds(
     const BaseVector& values,
     SelectivityVector& rows,
     ScratchMemory& scratchMemory,
-    raw_vector<uint64_t>& result,
-    bool noNulls) const {
+    raw_vector<uint64_t>& result) const {
   scratchMemory.decoded.decode(values, rows);
   VALUE_ID_TYPE_DISPATCH(
       lookupValueIdsTyped,
@@ -517,15 +517,21 @@ void VectorHasher::lookupValueIds(
       scratchMemory.decoded,
       rows,
       scratchMemory.hashes,
-      result.data(),
-      noNulls);
+      result.data());
 }
 
 void VectorHasher::hash(
     const SelectivityVector& rows,
     bool mix,
     raw_vector<uint64_t>& result) {
-  VELOX_DYNAMIC_TYPE_DISPATCH(hashValues, typeKind_, rows, mix, result.data());
+  if (typeKind_ == TypeKind::UNKNOWN) {
+    rows.applyToSelected([&](auto row) {
+      result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
+    });
+  } else {
+    VELOX_DYNAMIC_TYPE_DISPATCH(
+        hashValues, typeKind_, rows, mix, result.data());
+  }
 }
 
 void VectorHasher::hashPrecomputed(
@@ -566,7 +572,7 @@ void VectorHasher::analyzeValue(StringView value) {
   auto data = value.data();
   if (!rangeOverflow_) {
     if (size > kStringASRangeMaxSize) {
-      rangeOverflow_ = true;
+      setRangeOverflow();
     } else {
       int64_t number = stringAsNumber(data, size);
       updateRange(number);
@@ -578,7 +584,7 @@ void VectorHasher::analyzeValue(StringView value) {
     auto pair = uniqueValues_.insert(unique);
     if (pair.second) {
       if (uniqueValues_.size() > kMaxDistinct) {
-        distinctOverflow_ = true;
+        setDistinctOverflow();
         return;
       }
       copyStringToLocal(&*pair.first);
@@ -592,7 +598,7 @@ void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
     return;
   }
   if (distinctStringsBytes_ > kMaxDistinctStringsBytes) {
-    distinctOverflow_ = true;
+    setDistinctOverflow();
     return;
   }
   if (uniqueValuesStorage_.empty()) {
@@ -614,15 +620,27 @@ void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
       reinterpret_cast<int64_t>(str->data() + start));
 }
 
+void VectorHasher::setDistinctOverflow() {
+  distinctOverflow_ = true;
+  uniqueValues_.clear();
+  uniqueValuesStorage_.clear();
+  distinctStringsBytes_ = 0;
+}
+
+void VectorHasher::setRangeOverflow() {
+  rangeOverflow_ = true;
+  hasRange_ = false;
+}
+
 std::unique_ptr<common::Filter> VectorHasher::getFilter(
     bool nullAllowed) const {
   switch (typeKind_) {
     case TypeKind::TINYINT:
-      FOLLY_FALLTHROUGH;
+      [[fallthrough]];
     case TypeKind::SMALLINT:
-      FOLLY_FALLTHROUGH;
+      [[fallthrough]];
     case TypeKind::INTEGER:
-      FOLLY_FALLTHROUGH;
+      [[fallthrough]];
     case TypeKind::BIGINT:
       if (!distinctOverflow_) {
         std::vector<int64_t> values;
@@ -633,7 +651,7 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
 
         return common::createBigintValues(values, nullAllowed);
       }
-      FOLLY_FALLTHROUGH;
+      [[fallthrough]];
     default:
       // TODO Add support for strings.
       return nullptr;
@@ -681,7 +699,6 @@ void extendRange(
       extendRange<int16_t>(reserve, min, max);
       break;
     case TypeKind::INTEGER:
-    case TypeKind::DATE:
       extendRange<int32_t>(reserve, min, max);
       break;
     case TypeKind::BIGINT:
@@ -725,7 +742,7 @@ void VectorHasher::cardinality(
   if (!hasRange_ || rangeOverflow_) {
     asRange = kRangeTooLarge;
   } else if (__builtin_sub_overflow(max_, min_, &signedRange)) {
-    rangeOverflow_ = true;
+    setRangeOverflow();
     asRange = kRangeTooLarge;
   } else if (signedRange < kMaxRange) {
     // We check that after the extension by reservePct the range of max - min
@@ -740,7 +757,7 @@ void VectorHasher::cardinality(
     extendRange(type_->kind(), reservePct, min, max);
     asRange = (max - min) + 2;
   } else {
-    rangeOverflow_ = true;
+    setRangeOverflow();
     asRange = kRangeTooLarge;
   }
   if (distinctOverflow_) {
@@ -813,8 +830,7 @@ void VectorHasher::merge(const VectorHasher& other) {
     min_ = std::min(min_, other.min_);
     max_ = std::max(max_, other.max_);
   } else {
-    hasRange_ = false;
-    rangeOverflow_ = true;
+    setRangeOverflow();
   }
   if (!distinctOverflow_ && !other.distinctOverflow_) {
     // Unique values can be merged without dispatch on type. All the
@@ -827,17 +843,36 @@ void VectorHasher::merge(const VectorHasher& other) {
       uniqueValues_.insert(value);
     }
   } else {
-    distinctOverflow_ = true;
+    setDistinctOverflow();
   }
 }
 
 std::string VectorHasher::toString() const {
   std::stringstream out;
-  out << "<VectorHasher type=" << type_->toString() << "  isRange_=" << isRange_
-      << " rangeSize= " << rangeSize_ << " min=" << min_ << " max=" << max_
-      << " multiplier=" << multiplier_
-      << " numDistinct=" << uniqueValues_.size() << ">";
+  out << "VectorHasher channel: " << channel_ << " " << type_->toString()
+      << " multiplier: " << multiplier_;
+  if (isRange_) {
+    out << " range size " << rangeSize_ << ": [" << min_ << ", " << max_ << "]";
+  }
+  if (!distinctOverflow_) {
+    out << " numDistinct: " << uniqueValues_.size();
+  }
   return out.str();
+}
+
+std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
+    const RowTypePtr& rowType,
+    const std::vector<core::FieldAccessTypedExprPtr>& keys) {
+  const auto numKeys = keys.size();
+
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.reserve(numKeys);
+  for (const auto& key : keys) {
+    const auto channel = exprToChannel(key.get(), rowType);
+    hashers.push_back(VectorHasher::create(key->type(), channel));
+  }
+
+  return hashers;
 }
 
 } // namespace facebook::velox::exec

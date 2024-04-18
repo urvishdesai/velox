@@ -384,7 +384,7 @@ UTF8PROC_DLLEXPORT utf8proc_bool utf8proc_grapheme_break_stateful(
 
 UTF8PROC_DLLEXPORT utf8proc_bool
 utf8proc_grapheme_break(utf8proc_int32_t c1, utf8proc_int32_t c2) {
-  return utf8proc_grapheme_break_stateful(c1, c2, NULL);
+  return utf8proc_grapheme_break_stateful(c1, c2, nullptr);
 }
 
 static utf8proc_int32_t seqindex_decode_entry(const utf8proc_uint16_t** entry) {
@@ -589,7 +589,7 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_decompose(
     utf8proc_ssize_t bufsize,
     utf8proc_int16_t options) {
   return utf8proc_decompose_custom(
-      str, strlen, buffer, bufsize, options, NULL, NULL);
+      str, strlen, buffer, bufsize, options, nullptr, nullptr);
 }
 
 UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_decompose_custom(
@@ -630,7 +630,7 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_decompose_custom(
         if (uc < 0)
           return UTF8PROC_ERROR_INVALIDUTF8;
       }
-      if (custom_func != NULL) {
+      if (custom_func != nullptr) {
         uc = custom_func(uc, custom_data); /* user-specified custom mapping */
       }
       decomp_result = utf8proc_decompose_char(
@@ -713,9 +713,9 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_normalize_utf32(
     length = wpos;
   }
   if (options & UTF8PROC_COMPOSE) {
-    utf8proc_int32_t* starter = NULL;
+    utf8proc_int32_t* starter = nullptr;
     utf8proc_int32_t current_char;
-    const utf8proc_property_t *starter_property = NULL, *current_property;
+    const utf8proc_property_t *starter_property = nullptr, *current_property;
     utf8proc_propval_t max_combining_class = -1;
     utf8proc_ssize_t rpos;
     utf8proc_ssize_t wpos = 0;
@@ -735,7 +735,7 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_normalize_utf32(
             *starter = UTF8PROC_HANGUL_SBASE +
                 (hangul_lindex * UTF8PROC_HANGUL_VCOUNT + hangul_vindex) *
                     UTF8PROC_HANGUL_TCOUNT;
-            starter_property = NULL;
+            starter_property = nullptr;
             continue;
           }
         }
@@ -746,7 +746,7 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_normalize_utf32(
           hangul_tindex = current_char - UTF8PROC_HANGUL_TBASE;
           if (hangul_tindex >= 0 && hangul_tindex < UTF8PROC_HANGUL_TCOUNT) {
             *starter += hangul_tindex;
-            starter_property = NULL;
+            starter_property = nullptr;
             continue;
           }
         }
@@ -771,7 +771,7 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_normalize_utf32(
                 (!(options & UTF8PROC_STABLE) ||
                  !(unsafe_get_property(composition)->comp_exclusion))) {
               *starter = composition;
-              starter_property = NULL;
+              starter_property = nullptr;
               continue;
             }
           }
@@ -784,7 +784,7 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_normalize_utf32(
         }
       } else {
         starter = buffer + wpos;
-        starter_property = NULL;
+        starter_property = nullptr;
         max_combining_class = -1;
       }
       wpos++;
@@ -827,7 +827,7 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_map(
     utf8proc_ssize_t strlen,
     utf8proc_uint8_t** dstptr,
     utf8proc_int16_t options) {
-  return utf8proc_map_custom(str, strlen, dstptr, options, NULL, NULL);
+  return utf8proc_map_custom(str, strlen, dstptr, options, nullptr, nullptr);
 }
 
 UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_map_custom(
@@ -839,9 +839,9 @@ UTF8PROC_DLLEXPORT utf8proc_ssize_t utf8proc_map_custom(
     void* custom_data) {
   utf8proc_int32_t* buffer;
   utf8proc_ssize_t result;
-  *dstptr = NULL;
+  *dstptr = nullptr;
   result = utf8proc_decompose_custom(
-      str, strlen, NULL, 0, options, custom_func, custom_data);
+      str, strlen, nullptr, 0, options, custom_func, custom_data);
   if (result < 0)
     return result;
   buffer = (utf8proc_int32_t*)malloc(result * sizeof(utf8proc_int32_t) + 1);
@@ -923,13 +923,17 @@ UTF8PROC_DLLEXPORT utf8proc_uint8_t* utf8proc_NFKC_Casefold(
 // This function is not part of the utf8proc, it copy it from duckdb.cpp
 // it should be faster than utf8proc_iterate
 // from http://www.zedwood.com/article/cpp-utf8-char-to-codepoint
+// `end` is a pointer to the first byte past the end of the string.
 UTF8PROC_DLLEXPORT utf8proc_int32_t
-utf8proc_codepoint(const char* u_input, int& sz) {
+utf8proc_codepoint(const char* u_input, const char* end, int& sz) {
   auto u = (const unsigned char*)u_input;
   unsigned char u0 = u[0];
   if (u0 <= 127) {
     sz = 1;
     return u0;
+  }
+  if (end - u_input < 2) {
+    return -1;
   }
   unsigned char u1 = u[1];
   if (u0 >= 192 && u0 <= 223) {
@@ -939,10 +943,16 @@ utf8proc_codepoint(const char* u_input, int& sz) {
   if (u[0] == 0xed && (u[1] & 0xa0) == 0xa0) {
     return -1; // code points, 0xd800 to 0xdfff
   }
+  if (end - u_input < 3) {
+    return -1;
+  }
   unsigned char u2 = u[2];
   if (u0 >= 224 && u0 <= 239) {
     sz = 3;
     return (u0 - 224) * 4096 + (u1 - 128) * 64 + (u2 - 128);
+  }
+  if (end - u_input < 4) {
+    return -1;
   }
   unsigned char u3 = u[3];
   if (u0 >= 240 && u0 <= 247) {

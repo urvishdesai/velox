@@ -23,10 +23,6 @@ namespace {
 template <bool IsNotNULL>
 class IsNullFunction : public exec::VectorFunction {
  public:
-  bool isDefaultNullBehavior() const override {
-    return false;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -38,7 +34,7 @@ class IsNullFunction : public exec::VectorFunction {
     if (arg->isConstantEncoding()) {
       bool isNull = arg->isNullAt(rows.begin());
       auto localResult = BaseVector::createConstant(
-          BOOLEAN(), IsNotNULL ? !isNull : isNull, rows.size(), pool);
+          BOOLEAN(), IsNotNULL ? !isNull : isNull, rows.end(), pool);
       context.moveOrCopyResult(localResult, rows, result);
       return;
     }
@@ -46,7 +42,7 @@ class IsNullFunction : public exec::VectorFunction {
     if (!arg->mayHaveNulls()) {
       // No nulls.
       auto localResult = BaseVector::createConstant(
-          BOOLEAN(), IsNotNULL ? true : false, rows.size(), pool);
+          BOOLEAN(), IsNotNULL ? true : false, rows.end(), pool);
       context.moveOrCopyResult(localResult, rows, result);
       return;
     }
@@ -56,7 +52,7 @@ class IsNullFunction : public exec::VectorFunction {
       if constexpr (IsNotNULL) {
         isNull = arg->nulls();
       } else {
-        isNull = AlignedBuffer::allocate<bool>(rows.size(), pool);
+        isNull = AlignedBuffer::allocate<bool>(rows.end(), pool);
         memcpy(
             isNull->asMutable<int64_t>(),
             arg->rawNulls(),
@@ -66,10 +62,10 @@ class IsNullFunction : public exec::VectorFunction {
     } else {
       exec::DecodedArgs decodedArgs(rows, args, context);
 
-      isNull = AlignedBuffer::allocate<bool>(rows.size(), pool);
+      isNull = AlignedBuffer::allocate<bool>(rows.end(), pool);
       memcpy(
           isNull->asMutable<int64_t>(),
-          decodedArgs.at(0)->nulls(),
+          decodedArgs.at(0)->nulls(&rows),
           bits::nbytes(rows.end()));
 
       if (!IsNotNULL) {
@@ -78,12 +74,7 @@ class IsNullFunction : public exec::VectorFunction {
     }
 
     auto localResult = std::make_shared<FlatVector<bool>>(
-        pool,
-        BOOLEAN(),
-        nullptr,
-        rows.size(),
-        isNull,
-        std::vector<BufferPtr>{});
+        pool, BOOLEAN(), nullptr, rows.end(), isNull, std::vector<BufferPtr>{});
     context.moveOrCopyResult(localResult, rows, result);
   }
 
@@ -98,18 +89,20 @@ class IsNullFunction : public exec::VectorFunction {
 };
 } // namespace
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_is_null,
     IsNullFunction<false>::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<IsNullFunction</*IsNotNUll=*/false>>());
 
 void registerIsNullFunction(const std::string& name) {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_is_null, name);
 }
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_is_not_null,
     IsNullFunction<true>::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<IsNullFunction</*IsNotNUll=*/true>>());
 
 void registerIsNotNullFunction(const std::string& name) {

@@ -22,8 +22,12 @@ namespace facebook::velox::test {
 
 class MayHaveNullsRecursiveTest : public testing::Test {
  protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   std::shared_ptr<velox::memory::MemoryPool> pool_{
-      memory::getDefaultMemoryPool()};
+      memory::memoryManager()->addLeafPool()};
   VectorMaker vectorMaker_{pool_.get()};
 
   enum class TestOptions {

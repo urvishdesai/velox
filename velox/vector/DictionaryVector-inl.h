@@ -29,26 +29,7 @@ void DictionaryVector<T>::setInternalState() {
   // Sanity check indices for non-null positions. Enabled in debug mode only to
   // avoid performance hit in production.
 #ifndef NDEBUG
-  for (auto i = 0; i < BaseVector::length_; ++i) {
-    const bool isNull =
-        BaseVector::rawNulls_ && bits::isBitNull(BaseVector::rawNulls_, i);
-    if (isNull) {
-      continue;
-    }
-
-    // Verify index for a non-null position. It must be >= 0 and < size of the
-    // base vector.
-    VELOX_DCHECK_GE(
-        rawIndices_[i],
-        0,
-        "Dictionary index must be greater than zero. Index: {}.",
-        i);
-    VELOX_DCHECK_LT(
-        rawIndices_[i],
-        dictionaryValues_->size(),
-        "Dictionary index must be less than base vector's size. Index: {}.",
-        i);
-  }
+  validate({});
 #endif
 
   if (isLazyNotLoaded(*dictionaryValues_)) {
@@ -59,6 +40,9 @@ void DictionaryVector<T>::setInternalState() {
     // Do not load Lazy vector
     return;
   }
+  // Ensure any internal state in dictionaryValues_ is initialized, and it
+  // points to the loaded vector underneath any lazy layers.
+  dictionaryValues_ = BaseVector::loadedVectorShared(dictionaryValues_);
 
   if (dictionaryValues_->isScalar()) {
     scalarDictionaryValues_ =
@@ -82,7 +66,7 @@ DictionaryVector<T>::DictionaryVector(
     velox::memory::MemoryPool* pool,
     BufferPtr nulls,
     size_t length,
-    std::shared_ptr<BaseVector> dictionaryValues,
+    VectorPtr dictionaryValues,
     BufferPtr dictionaryIndices,
     const SimpleVectorStats<T>& stats,
     std::optional<vector_size_t> distinctValueCount,
@@ -203,6 +187,34 @@ VectorPtr DictionaryVector<T>::slice(vector_size_t offset, vector_size_t length)
       valueVector(),
       BaseVector::sliceBuffer(
           *INTEGER(), indices_, offset, length, this->pool_));
+}
+
+template <typename T>
+void DictionaryVector<T>::validate(const VectorValidateOptions& options) const {
+  SimpleVector<T>::validate(options);
+  auto indicesByteSize =
+      BaseVector::byteSize<vector_size_t>(BaseVector::length_);
+  VELOX_CHECK_GE(indices_->size(), indicesByteSize);
+  for (auto i = 0; i < BaseVector::length_; ++i) {
+    const bool isNull =
+        BaseVector::rawNulls_ && bits::isBitNull(BaseVector::rawNulls_, i);
+    if (isNull) {
+      continue;
+    }
+    // Verify index for a non-null position. It must be >= 0 and < size of the
+    // base vector.
+    VELOX_CHECK_GE(
+        rawIndices_[i],
+        0,
+        "Dictionary index must be greater than zero. Index: {}.",
+        i);
+    VELOX_CHECK_LT(
+        rawIndices_[i],
+        dictionaryValues_->size(),
+        "Dictionary index must be less than base vector's size. Index: {}.",
+        i);
+  }
+  dictionaryValues_->validate(options);
 }
 
 } // namespace velox

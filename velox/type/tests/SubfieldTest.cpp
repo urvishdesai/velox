@@ -20,9 +20,10 @@
 using namespace facebook::velox::common;
 
 std::vector<std::unique_ptr<Subfield::PathElement>> tokenize(
-    const std::string& path) {
+    const std::string& path,
+    const std::shared_ptr<Separators>& separators = Separators::get()) {
   std::vector<std::unique_ptr<Subfield::PathElement>> elements;
-  Tokenizer tokenizer(path);
+  Tokenizer tokenizer(path, separators);
   while (tokenizer.hasNext()) {
     elements.push_back(tokenizer.next());
   }
@@ -47,8 +48,10 @@ TEST(SubfieldTest, invalidPaths) {
   assertInvalidSubfield("a[2].[3].", "Invalid subfield path: a[2].^[3].");
 }
 
-void testColumnName(const std::string& name) {
-  auto elements = tokenize(name);
+void testColumnName(
+    const std::string& name,
+    const std::shared_ptr<Separators>& separators = Separators::get()) {
+  auto elements = tokenize(name, separators);
   EXPECT_EQ(elements.size(), 1);
   EXPECT_EQ(*elements[0].get(), Subfield::NestedField(name));
 }
@@ -59,6 +62,9 @@ TEST(SubfieldTest, columnNamesWithSpecialCharacters) {
   testColumnName("a/b/c:12");
   testColumnName("@basis");
   testColumnName("@basis|city_id");
+  auto separators = std::make_shared<Separators>();
+  separators->dot = '\0';
+  testColumnName("city.id@address:number/date|day$a-b$10_bucket", separators);
 }
 
 std::vector<std::unique_ptr<Subfield::PathElement>> createElements() {
@@ -78,6 +84,7 @@ std::vector<std::unique_ptr<Subfield::PathElement>> createElements() {
 
 void testRoundTrip(const Subfield& path) {
   auto actual = Subfield(tokenize(path.toString()));
+  ASSERT_TRUE(actual.valid());
   EXPECT_EQ(actual, path) << "at " << path.toString() << ", "
                           << actual.toString();
 }
@@ -113,6 +120,9 @@ TEST(SubfieldTest, basic) {
       }
     }
   }
+
+  ASSERT_FALSE(Subfield().valid());
+  ASSERT_EQ(Subfield().toString(), "");
 }
 
 TEST(SubfieldTest, prefix) {

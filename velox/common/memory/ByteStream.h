@@ -15,22 +15,27 @@
  */
 #pragma once
 
+#include <folly/io/IOBuf.h>
+#include "velox/common/base/Scratch.h"
 #include "velox/common/memory/StreamArena.h"
 #include "velox/type/Type.h"
 
 #include <folly/io/IOBuf.h>
+#include <memory>
 
 namespace facebook::velox {
 
 struct ByteRange {
-  // Start of buffer. Not owned.
+  /// Start of buffer. Not owned.
   uint8_t* buffer;
 
-  // Number of bytes or bits starting at 'buffer'.
+  /// Number of bytes or bits starting at 'buffer'.
   int32_t size;
 
-  // Index of next byte/bit to be read/written in 'buffer'.
+  /// Index of next byte/bit to be read/written in 'buffer'.
   int32_t position;
+
+  std::string toString() const;
 };
 
 class OutputStreamListener {
@@ -86,115 +91,64 @@ class OStreamOutputStream : public OutputStream {
   std::ostream* out_;
 };
 
-// Stream over a chain of ByteRanges. Provides read, write and
-// comparison for equality between stream contents and memory. Used
-// for streams in repartitioning or for complex variable length data
-// in hash tables. The stream is seekable and supports overwriting of
-// previous content, for example, writing a message body and then
-// seeking back to start to write a length header.
-class ByteStream {
+/// Read-only stream over one or more byte buffers.
+class ByteInputStream {
+ protected:
+  /// TODO Remove after refactoring SpillInput.
+  ByteInputStream() {}
+
  public:
-  // For input.
-  ByteStream() : isBits_(false), isReverseBitOrder_(false) {}
-  virtual ~ByteStream() = default;
-
-  // For output.
-  ByteStream(
-      StreamArena* arena,
-      bool isBits = false,
-      bool isReverseBitOrder = false)
-      : arena_(arena), isBits_(isBits), isReverseBitOrder_(isReverseBitOrder) {}
-
-  ByteStream(const ByteStream& other) = delete;
-
-  void operator=(const ByteStream& other) = delete;
-
-  void resetInput(std::vector<ByteRange>&& ranges) {
-    ranges_ = std::move(ranges);
+  explicit ByteInputStream(std::vector<ByteRange> ranges)
+      : ranges_{std::move(ranges)} {
+    VELOX_CHECK(!ranges_.empty());
     current_ = &ranges_[0];
-    lastRangeEnd_ = ranges_.back().size;
   }
 
-  void setRange(ByteRange range) {
-    ranges_.resize(1);
-    ranges_[0] = range;
-    current_ = ranges_.data();
-    lastRangeEnd_ = ranges_[0].size;
+  /// Disable copy constructor.
+  ByteInputStream(const ByteInputStream&) = delete;
+
+  /// Disable copy assignment operator.
+  ByteInputStream& operator=(const ByteInputStream& other) = delete;
+
+  /// Enable move constructor.
+  ByteInputStream(ByteInputStream&& other) noexcept
+      : ranges_{std::move(other.ranges_)}, current_{other.current_} {}
+
+  /// Enable move assignment operator.
+  ByteInputStream& operator=(ByteInputStream&& other) noexcept {
+    if (this != &other) {
+      ranges_ = std::move(other.ranges_);
+      current_ = other.current_;
+      other.current_ = nullptr;
+    }
+    return *this;
   }
 
-  const std::vector<ByteRange>& ranges() const {
-    return ranges_;
-  }
+  /// TODO Remove after refactoring SpillInput.
+  virtual ~ByteInputStream() = default;
 
-  void startWrite(int32_t initialSize) {
-    extend(initialSize);
-  }
+  /// Returns total number of bytes available in the stream.
+  size_t size() const;
 
-  void seek(int32_t range, int32_t position) {
-    current_ = &ranges_[range];
-    current_->position = position;
-  }
+  /// Returns true if all input has been read.
+  ///
+  /// TODO: Remove 'virtual' after refactoring SpillInput.
+  virtual bool atEnd() const;
 
+  /// Returns current position (number of bytes from the start) in the stream.
   std::streampos tellp() const;
 
-  void seekp(std::streampos position);
+  /// Moves current position to specified one.
+  void seekp(std::streampos pos);
 
-  // Returns the size written into ranges_. This is the sum of the
-  // capacities of non-last ranges + the greatest write position of
-  // the last range.
-  size_t size() const {
-    if (ranges_.empty()) {
-      return 0;
-    }
-    size_t total = 0;
-    for (auto i = 0; i < ranges_.size() - 1; ++i) {
-      total += ranges_[i].size;
-    }
-    return total + std::max(ranges_.back().position, lastRangeEnd_);
-  }
+  /// Returns the remaining size left from current reading position.
+  size_t remainingSize() const;
 
-  // For input. Returns true if all input has been read.
-  bool atEnd() const {
-    if (!current_) {
-      return false;
-    }
-    if (current_->position < current_->size) {
-      return false;
-    }
+  std::string toString() const;
 
-    VELOX_CHECK(current_ >= ranges_.data() && current_ <= &ranges_.back());
-    return current_ == &ranges_.back();
-  }
+  uint8_t readByte();
 
-  int32_t lastRangeEnd() {
-    updateEnd();
-    return lastRangeEnd_;
-  }
-
-  // Sets 'current_' to point to the next range of input.  // The
-  // input is consecutive ByteRanges in 'ranges_' for the base class
-  // but any view over external buffers can be made by specialization.
-  virtual void next(bool throwIfPastEnd = true) {
-    VELOX_CHECK(current_ >= &ranges_[0]);
-    size_t position = current_ - &ranges_[0];
-    VELOX_CHECK(position < ranges_.size());
-    if (position == ranges_.size() - 1) {
-      if (throwIfPastEnd) {
-        throw std::runtime_error("Reading past end of ByteStream");
-      }
-      return;
-    }
-    ++current_;
-    current_->position = 0;
-  }
-
-  uint8_t readByte() {
-    if (current_->position < current_->size) {
-      return current_->buffer[current_->position++];
-    }
-    next();
-    return readByte();
-  }
+  void readBytes(uint8_t* bytes, int32_t size);
 
   template <typename T>
   T read() {
@@ -219,65 +173,123 @@ class ByteStream {
     readBytes(reinterpret_cast<uint8_t*>(data), size);
   }
 
-  void readBytes(uint8_t* bytes, int32_t size) {
-    int32_t offset = 0;
-    for (;;) {
-      int32_t available = current_->size - current_->position;
-      int32_t numUsed = std::min(available, size);
-      memcpy(bytes + offset, current_->buffer + current_->position, numUsed);
-      offset += numUsed;
-      size -= numUsed;
-      current_->position += numUsed;
-      if (!size) {
-        return;
-      }
-      next();
-    }
+  /// Returns a view over the read buffer for up to 'size' next
+  /// bytes. The size of the value may be less if the current byte
+  /// range ends within 'size' bytes from the current position.  The
+  /// size will be 0 if at end.
+  std::string_view nextView(int32_t size);
+
+  void skip(int32_t size);
+
+ protected:
+  /// Sets 'current_' to point to the next range of input.  // The
+  /// input is consecutive ByteRanges in 'ranges_' for the base class
+  /// but any view over external buffers can be made by specialization.
+  ///
+  /// TODO: Remove 'virtual' after refactoring SpillInput.
+  virtual void next(bool throwIfPastEnd = true);
+
+  // TODO: Remove  after refactoring SpillInput.
+  const std::vector<ByteRange>& ranges() const {
+    return ranges_;
   }
 
-  // Returns a view over the read buffer for up to 'size' next
-  // bytes. The size of the value may be less if the current byte
-  // range ends within 'size' bytes from the current position.  The
-  // size will be 0 if at end.
-  std::string_view nextView(int32_t size) {
-    if (current_->position == current_->size) {
-      if (current_ == &ranges_.back()) {
-        return std::string_view(nullptr, 0);
-      }
-      next();
-    }
-    VELOX_CHECK(current_->size);
-    auto position = current_->position;
-    auto viewSize = std::min(current_->size - current_->position, size);
-    current_->position += viewSize;
-    return std::string_view(
-        reinterpret_cast<char*>(current_->buffer) + position, viewSize);
+  // TODO: Remove  after refactoring SpillInput.
+  void setRange(ByteRange range) {
+    ranges_.resize(1);
+    ranges_[0] = range;
+    current_ = ranges_.data();
   }
 
-  void skip(int32_t size) {
-    for (;;) {
-      int32_t available = current_->size - current_->position;
-      int32_t numUsed = std::min(available, size);
-      size -= numUsed;
-      current_->position += numUsed;
-      if (!size) {
-        return;
-      }
-      next();
-    }
+ private:
+  std::vector<ByteRange> ranges_;
+
+  // Pointer to the current element of 'ranges_'.
+  ByteRange* current_{nullptr};
+};
+
+/// Stream over a chain of ByteRanges. Provides read, write and
+/// comparison for equality between stream contents and memory. Used
+/// for streams in repartitioning or for complex variable length data
+/// in hash tables. The stream is seekable and supports overwriting of
+/// previous content, for example, writing a message body and then
+/// seeking back to start to write a length header.
+class ByteOutputStream {
+ public:
+  /// For output.
+  ByteOutputStream(
+      StreamArena* arena,
+      bool isBits = false,
+      bool isReverseBitOrder = false)
+      : arena_(arena), isBits_(isBits), isReverseBitOrder_(isReverseBitOrder) {}
+
+  ByteOutputStream(const ByteOutputStream& other) = delete;
+
+  void operator=(const ByteOutputStream& other) = delete;
+
+  // Forcing a move constructor to be able to return ByteOutputStream objects
+  // from a function.
+  ByteOutputStream(ByteOutputStream&&) = default;
+
+  /// Sets 'this' to range over 'range'. If this is for purposes of writing,
+  /// lastWrittenPosition specifies the end of any pre-existing content in
+  /// 'range'.
+  void setRange(ByteRange range, int32_t lastWrittenPosition) {
+    ranges_.resize(1);
+    ranges_[0] = range;
+    current_ = ranges_.data();
+    VELOX_CHECK_GE(ranges_.back().size, lastWrittenPosition);
+    lastRangeEnd_ = lastWrittenPosition;
+  }
+
+  const std::vector<ByteRange>& ranges() const {
+    return ranges_;
+  }
+
+  /// Prepares 'this' for writing. Can be called several times,
+  /// e.g. PrestoSerializer resets these. The memory formerly backing
+  /// 'ranges_' is not owned and the caller needs to recycle or free
+  /// this independently.
+  void startWrite(int32_t initialSize) {
+    ranges_.clear();
+    isReversed_ = false;
+    allocatedBytes_ = 0;
+    current_ = nullptr;
+    lastRangeEnd_ = 0;
+    extend(initialSize);
+  }
+
+  void seek(int32_t range, int32_t position) {
+    current_ = &ranges_[range];
+    current_->position = position;
+  }
+
+  std::streampos tellp() const;
+
+  void seekp(std::streampos position);
+
+  /// Returns the size written into ranges_. This is the sum of the
+  /// capacities of non-last ranges + the greatest write position of
+  /// the last range.
+  size_t size() const;
+
+  int32_t lastRangeEnd() const {
+    updateEnd();
+    return lastRangeEnd_;
   }
 
   template <typename T>
   void append(folly::Range<const T*> values) {
     if (current_->position + sizeof(T) * values.size() > current_->size) {
-      appendStringPiece(folly::StringPiece(
+      appendStringView(std::string_view(
           reinterpret_cast<const char*>(&values[0]),
           values.size() * sizeof(T)));
       return;
     }
-    auto target = reinterpret_cast<T*>(current_->buffer + current_->position);
-    auto end = target + values.size();
-    auto valuePtr = &values[0];
+
+    auto* target = reinterpret_cast<T*>(current_->buffer + current_->position);
+    const auto* end = target + values.size();
+    auto* valuePtr = &values[0];
     while (target != end) {
       *target = *valuePtr;
       ++target;
@@ -286,53 +298,35 @@ class ByteStream {
     current_->position += sizeof(T) * values.size();
   }
 
-  void appendBool(bool value, int32_t count) {
-    if (count == 1 && current_->size > current_->position) {
-      bits::setBit(
-          reinterpret_cast<uint64_t*>(current_->buffer),
-          current_->position,
-          value);
-      ++current_->position;
-      return;
-    }
-    int32_t offset = 0;
-    VELOX_DCHECK(isBits_);
-    for (;;) {
-      int32_t bitsFit =
-          std::min(count - offset, current_->size - current_->position);
-      bits::fillBits(
-          reinterpret_cast<uint64_t*>(current_->buffer),
-          current_->position,
-          current_->position + bitsFit,
-          value);
-      current_->position += bitsFit;
-      offset += bitsFit;
-      if (offset == count) {
+  void appendBool(bool value, int32_t count);
+
+  // A fast path for appending bits into pre-cleared buffers after first extend.
+  inline void
+  appendBitsFresh(const uint64_t* bits, int32_t begin, int32_t end) {
+    const auto position = current_->position;
+    if (begin == 0 && end <= 56) {
+      const auto available = current_->size - position;
+      // There must be 8 bytes writable. If available is 56, there are 7, so >.
+      if (available > 56) {
+        const auto offset = position & 7;
+        uint64_t* buffer =
+            reinterpret_cast<uint64_t*>(current_->buffer + (position >> 3));
+        const auto mask = bits::lowMask(offset);
+        *buffer = (*buffer & mask) | (bits[0] << offset);
+        current_->position += end;
         return;
       }
-      extend(bits::nbytes(count - offset));
     }
+    appendBits(bits, begin, end);
   }
 
-  void appendStringPiece(folly::StringPiece value) {
-    int32_t bytes = value.size();
-    int32_t offset = 0;
-    for (;;) {
-      int32_t bytesFit =
-          std::min(bytes - offset, current_->size - current_->position);
-      memcpy(
-          current_->buffer + current_->position,
-          value.data() + offset,
-          bytesFit);
-      current_->position += bytesFit;
-      offset += bytesFit;
-      if (offset == bytes) {
-        return;
-      }
-      extend(
-          bits::roundUp(bytes - offset, memory::AllocationTraits::kPageSize));
-    }
-  }
+  // Writes 'bits' from bit positions begin..end to the current position of
+  // 'this'. Extends 'this' if writing past end.
+  void appendBits(const uint64_t* bits, int32_t begin, int32_t end);
+
+  void appendStringView(StringView value);
+
+  void appendStringView(std::string_view value);
 
   template <typename T>
   void appendOne(const T& value) {
@@ -341,61 +335,130 @@ class ByteStream {
 
   void flush(OutputStream* stream);
 
-  // Returns the next byte that would be written to by a write. This
-  // is used after an append to release the remainder of the reserved
-  // space.
-  char* writePosition() {
-    if (ranges_.empty()) {
-      return nullptr;
-    }
-    return reinterpret_cast<char*>(current_->buffer) + current_->position;
+  /// Returns the next byte that would be written to by a write. This
+  /// is used after an append to release the remainder of the reserved
+  /// space.
+  char* writePosition();
+
+  int32_t testingAllocatedBytes() const {
+    return allocatedBytes_;
   }
 
- private:
-  void extend(int32_t bytes = memory::AllocationTraits::kPageSize);
+  /// Returns a ByteInputStream to range over the current content of 'this'. The
+  /// result is valid as long as 'this' is live and not changed.
+  ByteInputStream inputStream() const;
 
-  void updateEnd() {
+  std::string toString() const;
+
+ private:
+  // Returns a range of 'size' items of T. If there is no contiguous space in
+  // 'this', uses 'scratch' to make a temp block that is appended to 'this' in
+  template <typename T>
+  T* getAppendWindow(int32_t size, ScratchPtr<T>& scratchPtr) {
+    const int32_t bytes = sizeof(T) * size;
+    if (!current_) {
+      extend(bytes);
+    }
+    auto available = current_->size - current_->position;
+    if (available >= bytes) {
+      current_->position += bytes;
+      return reinterpret_cast<T*>(
+          current_->buffer + current_->position - bytes);
+    }
+    // If the tail is not large enough, make  temp of the right size
+    // in scratch. Extend the stream so that there is guaranteed space to copy
+    // the scratch to the stream. This copy takes place in destruction of
+    // AppendWindow and must not allocate so that it is noexcept.
+    ensureSpace(bytes);
+    return scratchPtr.get(size);
+  }
+
+  void extend(int32_t bytes);
+
+  // Calls extend() enough times to make sure 'bytes' bytes can be
+  // appended without new allocation. Does not change the append
+  // position.
+  void ensureSpace(int32_t bytes);
+
+  int32_t newRangeSize(int32_t bytes) const;
+
+  void updateEnd() const {
     if (!ranges_.empty() && current_ == &ranges_.back() &&
         current_->position > lastRangeEnd_) {
       lastRangeEnd_ = current_->position;
     }
   }
 
-  StreamArena* arena_;
+  StreamArena* const arena_{nullptr};
+
   // Indicates that position in ranges_ is in bits, not bytes.
   const bool isBits_;
+
   const bool isReverseBitOrder_;
-  // True if the bit order in ranges_ has been inverted. Presto requires reverse
-  // bit order.
+
+  // True if the bit order in ranges_ has been inverted. Presto requires
+  // reverse bit order.
   bool isReversed_ = false;
+
   std::vector<ByteRange> ranges_;
+  // The total number of bytes allocated from 'arena_' in 'ranges_'.
+  int64_t allocatedBytes_{0};
+
   // Pointer to the current element of 'ranges_'.
-  ByteRange* current_ = nullptr;
+  ByteRange* current_{nullptr};
 
   // Number of bits/bytes that have been written in the last element
   // of 'ranges_'. In a write situation, all non-last ranges are full
   // and the last may be partly full. The position in the last range
   // is not necessarily the the end if there has been a seek.
-  int32_t lastRangeEnd_{0};
+  mutable int32_t lastRangeEnd_{0};
+
+  template <typename T>
+  friend class AppendWindow;
+};
+
+/// A scoped wrapper that provides 'size' T's of writable space in 'stream'.
+/// Normally gives an address into 'stream's buffer but can use 'scratch' to
+/// make a contiguous piece if stream does not have a suitable run.
+template <typename T>
+class AppendWindow {
+ public:
+  AppendWindow(ByteOutputStream& stream, Scratch& scratch)
+      : stream_(stream), scratchPtr_(scratch) {}
+
+  ~AppendWindow() noexcept {
+    if (scratchPtr_.size()) {
+      try {
+        stream_.appendStringView(std::string_view(
+            reinterpret_cast<const char*>(scratchPtr_.get()),
+            scratchPtr_.size() * sizeof(T)));
+      } catch (const std::exception& e) {
+        // This is impossible because construction ensures there is space for
+        // the bytes in the stream.
+        LOG(FATAL) << "throw from AppendWindo append: " << e.what();
+      }
+    }
+  }
+
+  T* get(int32_t size) {
+    return stream_.getAppendWindow(size, scratchPtr_);
+  }
+
+ private:
+  ByteOutputStream& stream_;
+  ScratchPtr<T> scratchPtr_;
 };
 
 template <>
-inline Timestamp ByteStream::read<Timestamp>() {
+inline Timestamp ByteInputStream::read<Timestamp>() {
   Timestamp value;
   readBytes(reinterpret_cast<uint8_t*>(&value), sizeof(value));
   return value;
 }
 
 template <>
-inline UnscaledLongDecimal ByteStream::read<UnscaledLongDecimal>() {
-  UnscaledLongDecimal value;
-  readBytes(reinterpret_cast<uint8_t*>(&value), sizeof(value));
-  return value;
-}
-
-template <>
-inline Date ByteStream::read<Date>() {
-  Date value;
+inline int128_t ByteInputStream::read<int128_t>() {
+  int128_t value;
   readBytes(reinterpret_cast<uint8_t*>(&value), sizeof(value));
   return value;
 }
@@ -408,12 +471,12 @@ class IOBufOutputStream : public OutputStream {
       int32_t initialSize = memory::AllocationTraits::kPageSize)
       : OutputStream(listener),
         arena_(std::make_shared<StreamArena>(&pool)),
-        out_(std::make_unique<ByteStream>(arena_.get())) {
+        out_(std::make_unique<ByteOutputStream>(arena_.get())) {
     out_->startWrite(initialSize);
   }
 
   void write(const char* s, std::streamsize count) override {
-    out_->appendStringPiece(folly::StringPiece(s, count));
+    out_->appendStringView(std::string_view(s, count));
     if (listener_) {
       listener_->onWrite(s, count);
     }
@@ -429,7 +492,7 @@ class IOBufOutputStream : public OutputStream {
 
  private:
   std::shared_ptr<StreamArena> arena_;
-  std::unique_ptr<ByteStream> out_;
+  std::unique_ptr<ByteOutputStream> out_;
 };
 
 } // namespace facebook::velox

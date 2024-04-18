@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/dwio/common/SelectiveColumnReaderInternal.h"
+#include "velox/dwio/dwrf/common/DecoderUtil.h"
 #include "velox/dwio/dwrf/reader/DwrfData.h"
 
 namespace facebook::velox::dwrf {
@@ -27,7 +28,7 @@ class SelectiveStringDictionaryColumnReader
   using ValueType = int32_t;
 
   SelectiveStringDictionaryColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& nodeType,
+      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       DwrfParams& params,
       common::ScanSpec& scanSpec);
 
@@ -80,6 +81,9 @@ class SelectiveStringDictionaryColumnReader
       dwio::common::IntDecoder</*isSigned*/ false>& lengthDecoder,
       dwio::common::DictionaryValues& values);
   void ensureInitialized();
+
+  void makeFlat(VectorPtr* result);
+
   std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> dictIndex_;
   std::unique_ptr<ByteRleDecoder> inDictionaryReader_;
   std::unique_ptr<dwio::common::SeekableInputStream> strideDictStream_;
@@ -91,29 +95,29 @@ class SelectiveStringDictionaryColumnReader
   int64_t lastStrideIndex_;
   size_t positionOffset_;
   size_t strideDictSizeOffset_;
+  RleVersion version_;
 
   const StrideIndexProvider& provider_;
+  dwio::common::ColumnReaderStatistics& statistics_;
 
   // lazy load the dictionary
   std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> lengthDecoder_;
   std::unique_ptr<dwio::common::SeekableInputStream> blobStream_;
   bool initialized_{false};
+  vector_size_t numRowsScanned_;
 };
 
 template <typename TVisitor>
 void SelectiveStringDictionaryColumnReader::readWithVisitor(
     RowSet rows,
     TVisitor visitor) {
-  vector_size_t numRows = rows.back() + 1;
-  auto decoder = dynamic_cast<RleDecoderV1<false>*>(dictIndex_.get());
-  VELOX_CHECK(decoder, "Only RLEv1 is supported");
-  if (nullsInReadRange_) {
-    decoder->readWithVisitor<true, TVisitor>(
-        nullsInReadRange_->as<uint64_t>(), visitor);
+  if (version_ == velox::dwrf::RleVersion_1) {
+    decodeWithVisitor<velox::dwrf::RleDecoderV1<false>>(
+        dictIndex_.get(), visitor);
   } else {
-    decoder->readWithVisitor<false, TVisitor>(nullptr, visitor);
+    decodeWithVisitor<velox::dwrf::RleDecoderV2<false>>(
+        dictIndex_.get(), visitor);
   }
-  readOffset_ += numRows;
 }
 
 template <typename TFilter, bool isDense, typename ExtractValues>
@@ -133,7 +137,13 @@ void SelectiveStringDictionaryColumnReader::processFilter(
     common::Filter* filter,
     RowSet rows,
     ExtractValues extractValues) {
-  switch (filter ? filter->kind() : common::FilterKind::kAlwaysTrue) {
+  if (filter == nullptr) {
+    readHelper<common::AlwaysTrue, isDense>(
+        &dwio::common::alwaysTrue(), rows, extractValues);
+    return;
+  }
+
+  switch (filter->kind()) {
     case common::FilterKind::kAlwaysTrue:
       readHelper<common::AlwaysTrue, isDense>(filter, rows, extractValues);
       break;

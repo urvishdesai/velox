@@ -28,6 +28,7 @@
 
 #include "velox/expression/ComplexViewTypes.h"
 #include "velox/expression/DecodedArgs.h"
+#include "velox/expression/KindToSimpleType.h"
 #include "velox/expression/UdfTypeResolver.h"
 #include "velox/expression/VariadicView.h"
 #include "velox/type/StringView.h"
@@ -632,24 +633,39 @@ struct VectorReader<Variadic<T>> {
   std::vector<std::unique_ptr<VectorReader<T>>> childReaders_;
 };
 
-template <typename T>
-struct VectorReader<Generic<T>> {
+template <typename T, bool comparable, bool orderable>
+struct VectorReader<Generic<T, comparable, orderable>> {
   using exec_in_t = GenericView;
   using exec_null_free_in_t = exec_in_t;
 
-  explicit VectorReader(const DecodedVector* decoded) : decoded_(*decoded) {}
+  template <TypeKind kind>
+  void ensureCastedReader() {
+    if constexpr (TypeTraits<kind>::isPrimitiveType) {
+      this->operator[](0)
+          .template ensureReader<typename KindToSimpleType<kind>::type>();
+    }
+  }
 
-  explicit VectorReader(const VectorReader<Generic<T>>&) = delete;
+  explicit VectorReader(const DecodedVector* decoded) : decoded_(*decoded) {
+    if (decoded->size() && decoded->base()->type()->isPrimitiveType()) {
+      TypeKind kind = decoded->base()->typeKind();
+      VELOX_DYNAMIC_TYPE_DISPATCH_ALL(ensureCastedReader, kind);
+    }
+  }
 
-  VectorReader<Generic<T>>& operator=(const VectorReader<Generic<T>>&) = delete;
+  explicit VectorReader(
+      const VectorReader<Generic<T, comparable, orderable>>&) = delete;
 
-  bool isSet(size_t offset) const {
+  VectorReader<Generic<T, comparable, orderable>>& operator=(
+      const VectorReader<Generic<T, comparable, orderable>>&) = delete;
+
+  bool isSet(vector_size_t offset) const {
     return !decoded_.isNullAt(offset);
   }
 
-  exec_in_t operator[](size_t offset) const {
-    auto index = decoded_.index(offset);
-    return GenericView{decoded_, castReaders_, castType_, index};
+  exec_in_t operator[](vector_size_t offset) const {
+    // We pass the non-decoded index.
+    return GenericView{decoded_, castReaders_, castType_, offset};
   }
 
   exec_null_free_in_t readNullFree(vector_size_t offset) const {
@@ -700,6 +716,51 @@ struct VectorReader<Generic<T>> {
   // and are shared across GenericViews constructed by the reader.
   mutable std::array<std::shared_ptr<void>, 3> castReaders_;
   mutable std::optional<const std::type_info*> castType_ = std::nullopt;
+};
+
+template <>
+struct VectorReader<DynamicRow> {
+  using in_vector_t = RowVector;
+  using exec_in_t = DynamicRowView<true>;
+  using exec_null_free_in_t = DynamicRowView<false>;
+
+  explicit VectorReader(const DecodedVector* decoded)
+      : decoded_(*decoded),
+        vector_(detail::getDecoded<in_vector_t>(decoded_)),
+        childrenDecoders_{vector_.childrenSize()} {
+    for (int i = 0; i < vector_.childrenSize(); i++) {
+      childReaders_.push_back(std::make_unique<VectorReader<Any>>(
+          detail::decode(childrenDecoders_[i], *vector_.childAt(i))));
+    }
+  }
+
+  exec_in_t operator[](size_t offset) const {
+    auto index = decoded_.index(offset);
+    return {&childReaders_, index};
+  }
+
+  exec_null_free_in_t readNullFree(size_t offset) const {
+    auto index = decoded_.index(offset);
+    return {&childReaders_, index};
+  }
+
+  bool isSet(size_t offset) const {
+    return !decoded_.isNullAt(offset);
+  }
+
+  bool mayHaveNulls() const {
+    return decoded_.mayHaveNulls();
+  }
+
+  const BaseVector* baseVector() const {
+    return decoded_.base();
+  }
+
+ private:
+  const DecodedVector& decoded_;
+  const in_vector_t& vector_;
+  std::vector<DecodedVector> childrenDecoders_;
+  std::vector<std::unique_ptr<VectorReader<Any>>> childReaders_;
 };
 
 template <typename T>

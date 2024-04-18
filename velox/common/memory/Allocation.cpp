@@ -30,12 +30,27 @@ Allocation::~Allocation() {
   }
 }
 
-void Allocation::append(uint8_t* address, int32_t numPages) {
-  numPages_ += numPages;
+void Allocation::append(uint8_t* address, MachinePageCount numPages) {
   VELOX_CHECK(
       runs_.empty() || address != runs_.back().data(),
       "Appending a duplicate address into a PageRun");
+  if (FOLLY_UNLIKELY(numPages > Allocation::PageRun::kMaxPagesInRun)) {
+    VELOX_MEM_ALLOC_ERROR(fmt::format(
+        "The number of pages to append {} exceeds the PageRun limit {}",
+        numPages,
+        Allocation::PageRun::kMaxPagesInRun));
+  }
+  numPages_ += numPages;
   runs_.emplace_back(address, numPages);
+}
+
+void Allocation::appendMove(Allocation& other) {
+  for (auto& run : other.runs_) {
+    numPages_ += run.numPages();
+    runs_.push_back(std::move(run));
+  }
+  other.runs_.clear();
+  other.numPages_ = 0;
 }
 
 void Allocation::findRun(uint64_t offset, int32_t* index, int32_t* offsetInRun)
@@ -76,10 +91,15 @@ ContiguousAllocation::~ContiguousAllocation() {
   }
 }
 
-void ContiguousAllocation::set(void* data, uint64_t size) {
+void ContiguousAllocation::set(void* data, uint64_t size, uint64_t maxSize) {
   data_ = data;
   size_ = size;
+  maxSize_ = maxSize != 0 ? maxSize : size;
   sanityCheck();
+}
+
+void ContiguousAllocation::grow(MachinePageCount increment) {
+  pool_->growContiguous(increment, *this);
 }
 
 void ContiguousAllocation::clear() {
@@ -88,15 +108,27 @@ void ContiguousAllocation::clear() {
 }
 
 MachinePageCount ContiguousAllocation::numPages() const {
-  return bits::roundUp(size_, AllocationTraits::kPageSize) /
-      AllocationTraits::kPageSize;
+  return AllocationTraits::numPages(size_);
+}
+
+std::optional<folly::Range<char*>> ContiguousAllocation::hugePageRange() const {
+  auto begin = reinterpret_cast<uintptr_t>(data_);
+  auto roundedBegin = bits::roundUp(begin, AllocationTraits::kHugePageSize);
+  auto roundedEnd = (begin + maxSize_) / AllocationTraits::kHugePageSize *
+      AllocationTraits::kHugePageSize;
+  if (roundedEnd <= roundedBegin) {
+    return std::nullopt;
+  }
+  return folly::Range<char*>(
+      reinterpret_cast<char*>(roundedBegin), roundedEnd - roundedBegin);
 }
 
 std::string ContiguousAllocation::toString() const {
   return fmt::format(
-      "ContiguousAllocation[data:{}, size:{}, pool:{}]",
+      "ContiguousAllocation[data:{}, size:{}, maxSize: {}, pool:{}]",
       data_,
       size_,
+      maxSize_,
       pool_ == nullptr ? "null" : "set");
 }
 } // namespace facebook::velox::memory

@@ -51,7 +51,7 @@ class FormatData {
   /// of a column are of interest, e.g. is null filter.
   virtual void readNulls(
       vector_size_t numValues,
-      const uint64_t* FOLLY_NULLABLE incomingNulls,
+      const uint64_t* incomingNulls,
       BufferPtr& nulls,
       bool nullsOnly = false) = 0;
 
@@ -92,7 +92,7 @@ class FormatData {
   struct FilterRowGroupsResult {
     std::vector<uint64_t> filterResult;
     std::vector<std::pair<
-        velox::common::MetadataFilter::LeafNode*,
+        const velox::common::MetadataFilter::LeafNode*,
         std::vector<uint64_t>>>
         metadataFilterResults;
     int totalCount = 0;
@@ -132,7 +132,8 @@ class FormatData {
 /// Base class for format-specific reader initialization arguments.
 class FormatParams {
  public:
-  explicit FormatParams(memory::MemoryPool& pool) : pool_(pool) {}
+  explicit FormatParams(memory::MemoryPool& pool, ColumnReaderStatistics& stats)
+      : pool_(pool), stats_(stats) {}
 
   virtual ~FormatParams() = default;
 
@@ -146,8 +147,13 @@ class FormatParams {
     return pool_;
   }
 
+  ColumnReaderStatistics& runtimeStatistics() {
+    return stats_;
+  }
+
  private:
   memory::MemoryPool& pool_;
+  ColumnReaderStatistics& stats_;
 };
 
 } // namespace facebook::velox::dwio::common

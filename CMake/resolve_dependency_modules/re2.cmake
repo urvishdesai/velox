@@ -34,15 +34,16 @@ set(RE2_USE_ICU ON)
 set(RE2_BUILD_TESTING OFF)
 
 FetchContent_MakeAvailable(re2)
-
-if(${ICU_SOURCE} STREQUAL "BUNDLED")
-  # build re2 after icu so the files are available
-  add_dependencies(re2 ICU ICU::uc)
+if(ICU_SOURCE)
+  # empty var will cause a syntax error
+  if(${ICU_SOURCE} STREQUAL "BUNDLED")
+    # build re2 after icu so the files are available
+    add_dependencies(re2 ICU ICU::uc)
+  endif()
 endif()
 
 set(re2_LIBRARIES ${re2_BINARY_DIR}/libre2.a)
 set(re2_INCLUDE_DIRS ${re2_SOURCE_DIR})
-add_library(re2::re2 ALIAS re2)
 
 set(RE2_ROOT ${re2_BINARY_DIR})
 set(re2_ROOT ${re2_BINARY_DIR})

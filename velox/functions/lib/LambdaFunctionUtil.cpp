@@ -25,7 +25,7 @@ BufferPtr flattenNulls(
   }
 
   BufferPtr nulls =
-      AlignedBuffer::allocate<bool>(rows.size(), decodedVector.base()->pool());
+      AlignedBuffer::allocate<bool>(rows.end(), decodedVector.base()->pool());
   auto rawNulls = nulls->asMutable<uint64_t>();
   rows.applyToSelected([&](vector_size_t row) {
     bits::setNull(rawNulls, row, decodedVector.isNullAt(row));
@@ -104,7 +104,7 @@ ArrayVectorPtr flattenArray(
       array->pool(),
       array->type(),
       newNulls,
-      rows.size(),
+      rows.end(),
       newOffsets,
       newSizes,
       BaseVector::wrapInDictionary(
@@ -142,7 +142,7 @@ MapVectorPtr flattenMap(
       map->pool(),
       map->type(),
       newNulls,
-      rows.size(),
+      rows.end(),
       newOffsets,
       newSizes,
       BaseVector::wrapInDictionary(
@@ -154,4 +154,29 @@ MapVectorPtr flattenMap(
           map->mapValues()));
 }
 
+BufferPtr addNullsForUnselectedRows(
+    const VectorPtr& vector,
+    const SelectivityVector& rows) {
+  // Set nulls for rows not present in 'rows'.
+  BufferPtr nulls = allocateNulls(rows.size(), vector->pool(), bits::kNull);
+
+  // bits::kNull is 0. Hence, bits::orBits() simply copies the bits from the
+  // selectivity vector into the nulls buffer. We cannot use memcpy because it
+  // will copy extra bits at the tail if rows.end() is not a multiple of 8.
+  bits::orBits(
+      nulls->asMutable<uint64_t>(),
+      rows.asRange().bits(),
+      rows.begin(),
+      rows.end());
+
+  if (vector->nulls() != nullptr) {
+    // Transfer original nulls
+    bits::andBits(
+        nulls->asMutable<uint64_t>(),
+        vector->rawNulls(),
+        rows.begin(),
+        rows.end());
+  }
+  return nulls;
+}
 } // namespace facebook::velox::functions

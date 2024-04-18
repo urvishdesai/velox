@@ -19,42 +19,49 @@ add_executable(
   BitConcatenationTest.cpp
   BitPackDecoderTest.cpp
   ChainedBufferTests.cpp
+  ColumnSelectorTests.cpp
   DataBufferTests.cpp
   DecoderUtilTest.cpp
+  ExecutorBarrierTest.cpp
+  OnDemandUnitLoaderTests.cpp
   LocalFileSinkTest.cpp
+  MemorySinkTest.cpp
   LoggedExceptionTest.cpp
+  ParallelForTest.cpp
   RangeTests.cpp
   ReadFileInputStreamTests.cpp
+  ReaderTest.cpp
   RetryTests.cpp
   TestBufferedInput.cpp
-  TestColumnSelector.cpp
-  TypeTests.cpp)
+  TypeTests.cpp
+  WriterTest.cpp)
 add_test(velox_dwio_common_test velox_dwio_common_test)
 target_link_libraries(
   velox_dwio_common_test
   velox_dwio_common_test_utils
   velox_temp_path
+  velox_vector_test_lib
   Boost::regex
-  ${VELOX_LINK_LIBS}
-  ${FOLLY_WITH_DEPENDENCIES}
+  velox_link_libs
+  Folly::folly
   ${TEST_LINK_LIBS}
   gflags::gflags
   gtest
   gtest_main
   gmock
   glog::glog
-  ${FMT})
+  fmt::fmt)
 
 add_executable(velox_dwio_common_data_buffer_benchmark DataBufferBenchmark.cpp)
 
 target_link_libraries(
   velox_dwio_common_data_buffer_benchmark velox_dwio_common velox_memory
-  velox_dwio_common_exception ${FOLLY} ${FOLLY_BENCHMARK})
+  velox_dwio_common_exception Folly::folly ${FOLLY_BENCHMARK})
 
 add_executable(velox_dwio_common_int_decoder_benchmark IntDecoderBenchmark.cpp)
 target_link_libraries(
   velox_dwio_common_int_decoder_benchmark velox_dwio_common_exception
-  velox_exception velox_dwio_dwrf_common ${FOLLY} ${FOLLY_BENCHMARK})
+  velox_exception velox_dwio_dwrf_common Folly::folly ${FOLLY_BENCHMARK})
 
 add_library(velox_e2e_filter_test_base E2EFilterTestBase.cpp)
 
@@ -63,19 +70,29 @@ target_link_libraries(
   velox_functions_prestosql
   velox_parse_parser
   velox_vector_test_lib
-  ${VELOX_LINK_LIBS}
-  ${FOLLY_WITH_DEPENDENCIES}
-  ${FMT}
-  ${LZ4}
-  ${LZO}
-  ${ZSTD}
-  ${ZLIB_LIBRARIES}
+  velox_link_libs
+  Folly::folly
+  fmt::fmt
+  lz4::lz4
+  lzo2::lzo2
+  zstd::zstd
+  ZLIB::ZLIB
   ${TEST_LINK_LIBS})
 
-if(VELOX_ENABLE_ARROW)
+if(VELOX_ENABLE_ARROW AND VELOX_ENABLE_BENCHMARKS)
+  add_subdirectory(Lemire/FastPFor)
   add_executable(velox_dwio_common_bitpack_decoder_benchmark
                  BitPackDecoderBenchmark.cpp)
+
+  target_compile_options(velox_dwio_common_bitpack_decoder_benchmark
+                         PRIVATE -Wno-deprecated-declarations)
+
   target_link_libraries(
-    velox_dwio_common_bitpack_decoder_benchmark velox_dwio_common arrow duckdb
-    ${FOLLY} ${FOLLY_BENCHMARK})
+    velox_dwio_common_bitpack_decoder_benchmark
+    velox_dwio_common
+    arrow
+    velox_fastpforlib
+    duckdb_static
+    Folly::folly
+    ${FOLLY_BENCHMARK})
 endif()

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/dwio/common/SelectiveColumnReaderInternal.h"
+#include "velox/dwio/dwrf/common/DecoderUtil.h"
 #include "velox/dwio/dwrf/reader/DwrfData.h"
 
 namespace facebook::velox::dwrf {
@@ -27,7 +28,7 @@ class SelectiveTimestampColumnReader
   using ValueType = int64_t;
 
   SelectiveTimestampColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& nodeType,
+      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       DwrfParams& params,
       common::ScanSpec& scanSpec);
 
@@ -40,14 +41,22 @@ class SelectiveTimestampColumnReader
   void getValues(RowSet rows, VectorPtr* result) override;
 
  private:
-  template <bool dense>
-  void readHelper(RowSet rows);
+  template <bool isDense>
+  void readHelper(common::Filter* filter, RowSet rows);
+
+  void
+  processNulls(const bool isNull, const RowSet rows, const uint64_t* rawNulls);
+  void processFilter(
+      const common::Filter* filter,
+      const RowSet rows,
+      const uint64_t* rawNulls);
 
   std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ true>> seconds_;
   std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> nano_;
 
   // Values from copied from 'seconds_'. Nanos are in 'values_'.
   BufferPtr secondsValues_;
+  RleVersion version_;
 };
 
 } // namespace facebook::velox::dwrf

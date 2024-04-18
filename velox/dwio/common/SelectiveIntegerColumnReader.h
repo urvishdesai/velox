@@ -25,18 +25,18 @@ namespace facebook::velox::dwio::common {
 class SelectiveIntegerColumnReader : public SelectiveColumnReader {
  public:
   SelectiveIntegerColumnReader(
-      std::shared_ptr<const dwio::common::TypeWithId> requestedType,
+      const TypePtr& requestedType,
       dwio::common::FormatParams& params,
       velox::common::ScanSpec& scanSpec,
-      const TypePtr& type)
+      std::shared_ptr<const dwio::common::TypeWithId> fileType)
       : SelectiveColumnReader(
-            std::move(requestedType),
+            requestedType,
+            std::move(fileType),
             params,
-            scanSpec,
-            type) {}
+            scanSpec) {}
 
   void getValues(RowSet rows, VectorPtr* result) override {
-    getIntValues(rows, nodeType_->type, result);
+    getIntValues(rows, requestedType_, result);
   }
 
  protected:
@@ -118,7 +118,13 @@ void SelectiveIntegerColumnReader::processFilter(
     velox::common::Filter* filter,
     ExtractValues extractValues,
     RowSet rows) {
-  switch (filter ? filter->kind() : velox::common::FilterKind::kAlwaysTrue) {
+  if (filter == nullptr) {
+    readHelper<Reader, velox::common::AlwaysTrue, isDense>(
+        &dwio::common::alwaysTrue(), rows, extractValues);
+    return;
+  }
+
+  switch (filter->kind()) {
     case velox::common::FilterKind::kAlwaysTrue:
       readHelper<Reader, velox::common::AlwaysTrue, isDense>(
           filter, rows, extractValues);
@@ -179,7 +185,13 @@ void SelectiveIntegerColumnReader::processValueHook(
       readHelper<Reader, velox::common::AlwaysTrue, isDense>(
           &alwaysTrue(),
           rows,
-          ExtractToHook<aggregate::SumHook<int64_t, int64_t>>(hook));
+          ExtractToHook<aggregate::SumHook<int64_t, int64_t, false>>(hook));
+      break;
+    case aggregate::AggregationHook::kSumBigintToBigintOverflow:
+      readHelper<Reader, velox::common::AlwaysTrue, isDense>(
+          &alwaysTrue(),
+          rows,
+          ExtractToHook<aggregate::SumHook<int64_t, int64_t, true>>(hook));
       break;
     case aggregate::AggregationHook::kBigintMax:
       readHelper<Reader, velox::common::AlwaysTrue, isDense>(
@@ -211,12 +223,12 @@ void SelectiveIntegerColumnReader::readCommon(RowSet rows) {
       } else {
         processValueHook<Reader, false>(rows, scanSpec_->valueHook());
       }
-      return;
-    }
-    if (isDense) {
-      processFilter<Reader, true>(filter, ExtractToReader(this), rows);
     } else {
-      processFilter<Reader, false>(filter, ExtractToReader(this), rows);
+      if (isDense) {
+        processFilter<Reader, true>(filter, ExtractToReader(this), rows);
+      } else {
+        processFilter<Reader, false>(filter, ExtractToReader(this), rows);
+      }
     }
   } else {
     if (isDense) {

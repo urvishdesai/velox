@@ -50,7 +50,7 @@ class SortArrayTest : public SparkFunctionBaseTest {
       const VectorPtr& input,
       const VectorPtr& expected) {
     SCOPED_TRACE(expr);
-    auto result = evaluate<ArrayVector>(expr, makeRowVector({input}));
+    auto result = evaluate(expr, makeRowVector({input}));
     assertEqualVectors(expected, result);
   }
 
@@ -127,12 +127,12 @@ TEST_F(SortArrayTest, timestamp) {
 }
 
 TEST_F(SortArrayTest, date) {
-  auto input = makeNullableArrayVector(dateInput());
+  auto input = makeNullableArrayVector(dateInput(), ARRAY(DATE()));
   auto expected = dateAscNullSmallest();
   testSortArray(
       input,
-      makeNullableArrayVector(expected),
-      makeNullableArrayVector(reverseNested(expected)));
+      makeNullableArrayVector(expected, ARRAY(DATE())),
+      makeNullableArrayVector(reverseNested(expected), ARRAY(DATE())));
 }
 
 TEST_F(SortArrayTest, bool) {

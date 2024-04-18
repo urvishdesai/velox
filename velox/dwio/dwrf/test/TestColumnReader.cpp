@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
+#include "folly/executors/CPUThreadPoolExecutor.h"
 #include "velox/common/base/tests/GTestUtils.h"
-#include "velox/dwio/common/Adaptor.h"
+#include "velox/common/encode/Coding.h"
 #include "velox/dwio/common/exception/Exceptions.h"
 #include "velox/dwio/dwrf/common/wrap/dwrf-proto-wrapper.h"
 #include "velox/dwio/dwrf/reader/ColumnReader.h"
 #include "velox/dwio/dwrf/reader/SelectiveDwrfReader.h"
+#include "velox/dwio/dwrf/reader/StreamLabels.h"
 #include "velox/dwio/dwrf/test/OrcTest.h"
-#include "velox/dwio/type/fbhive/HiveTypeParser.h"
+#include "velox/type/fbhive/HiveTypeParser.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DictionaryVector.h"
 #include "velox/vector/FlatVector.h"
@@ -36,7 +38,7 @@ using namespace facebook::velox::dwio::common;
 using namespace facebook::velox;
 using namespace facebook::velox::dwrf;
 using namespace facebook::velox::test;
-using facebook::velox::dwio::type::fbhive::HiveTypeParser;
+using facebook::velox::type::fbhive::HiveTypeParser;
 
 class TestStrideIndexProvider : public StrideIndexProvider {
  public:
@@ -108,15 +110,20 @@ std::shared_ptr<T> getChild(std::shared_ptr<F>& batch, size_t index) {
 
 class ColumnReaderTestBase {
  protected:
+  ColumnReaderTestBase() : pool_{&streams_.getMemoryPool()}, labels_{pool_} {}
+
   virtual ~ColumnReaderTestBase() = default;
 
   void buildReader(
       const std::shared_ptr<const Type>& requestedType,
+      const std::shared_ptr<const Type>& fileType = nullptr,
       std::vector<uint64_t> nodes = {},
-      const std::shared_ptr<const Type>& dataType = nullptr,
       common::ScanSpec* scanSpec = nullptr) {
     const std::shared_ptr<const RowType>& rowType =
         std::dynamic_pointer_cast<const RowType>(requestedType);
+    if (parallelDecoding()) {
+      executor_ = std::make_unique<folly::CPUThreadPoolExecutor>(2);
+    }
     ColumnSelector cs(rowType, nodes, true);
     auto options = RowReaderOptions();
     options.setReturnFlatVector(returnFlatVector());
@@ -126,27 +133,34 @@ class ColumnReaderTestBase {
     EXPECT_CALL(streams_, getRowReaderOptionsProxy())
         .WillRepeatedly(testing::Return(&options));
 
-    auto dataTypeWithId =
-        TypeWithId::create(dataType ? dataType : requestedType);
+    std::shared_ptr<const TypeWithId> fileTypeWithId =
+        TypeWithId::create(fileType ? fileType : requestedType);
 
     if (useSelectiveReader()) {
       if (!scanSpec) {
         scanSpec_ = std::make_unique<common::ScanSpec>("root");
-        scanSpec_->addAllChildFields(*dataTypeWithId->type);
+        scanSpec_->addAllChildFields(*fileTypeWithId->type());
         scanSpec = scanSpec_.get();
       }
       makeFieldSpecs("", 0, rowType, scanSpec);
       selectiveColumnReader_ = SelectiveDwrfReader::build(
           cs.getSchemaWithId(),
-          dataTypeWithId,
+          fileTypeWithId,
           streams_,
+          labels_,
+          columnReaderStatistics_,
           scanSpec,
-          FlatMapContext::nonFlatMapContext());
+          FlatMapContext{});
       selectiveColumnReader_->setIsTopLevel();
       columnReader_ = nullptr;
     } else {
-      columnReader_ =
-          ColumnReader::build(cs.getSchemaWithId(), dataTypeWithId, streams_);
+      columnReader_ = ColumnReader::build(
+          cs.getSchemaWithId(),
+          fileTypeWithId,
+          streams_,
+          labels_,
+          executor_.get(),
+          parallelDecoding() ? 2 : 0);
       selectiveColumnReader_ = nullptr;
     }
   }
@@ -155,7 +169,7 @@ class ColumnReaderTestBase {
     if (columnReader_) {
       columnReader_->next(numValues, result);
     } else {
-      selectiveColumnReader_->next(numValues, result);
+      selectiveColumnReader_->next(numValues, result, nullptr);
     }
   }
 
@@ -181,7 +195,7 @@ class ColumnReaderTestBase {
     if (columnReader_) {
       columnReader_->next(readSize, batch);
     } else {
-      selectiveColumnReader_->next(readSize, batch);
+      selectiveColumnReader_->next(readSize, batch, nullptr);
     }
 
     ASSERT_EQ(readSize, batch->size());
@@ -197,29 +211,39 @@ class ColumnReaderTestBase {
     } else {
       selectiveColumnReader_.reset(nullptr);
     }
+    if (executor_) {
+      executor_.reset();
+    }
   }
 
   virtual bool useSelectiveReader() const = 0;
   virtual bool returnFlatVector() const = 0;
+  virtual bool parallelDecoding() const = 0;
 
   MockStripeStreams streams_;
+  memory::AllocationPool pool_;
+  StreamLabels labels_;
   std::unique_ptr<ColumnReader> columnReader_;
   std::unique_ptr<SelectiveColumnReader> selectiveColumnReader_;
+  std::unique_ptr<folly::Executor> executor_;
 
  private:
   std::unique_ptr<common::ScanSpec> scanSpec_;
+  ColumnReaderStatistics columnReaderStatistics_;
 };
 
 struct StringReaderTestParams {
   const bool useSelectiveReader;
   const bool returnFlatVector;
   const bool expectMemoryReuse;
+  const bool parallelDecoding;
 
   std::string toString() const {
     std::ostringstream out;
     out << (useSelectiveReader ? "selective" : "") << "_"
         << (returnFlatVector ? "as_flat" : "") << "_"
-        << (expectMemoryReuse ? "reuse" : "");
+        << (expectMemoryReuse ? "reuse" : "") << "_"
+        << (parallelDecoding ? "parallel" : "");
     return out.str();
   }
 };
@@ -228,9 +252,15 @@ class StringReaderTests
     : public ::testing::TestWithParam<StringReaderTestParams>,
       public ColumnReaderTestBase {
  protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   StringReaderTests()
-      : expectMemoryReuse_{GetParam().expectMemoryReuse},
-        returnFlatVector_{GetParam().returnFlatVector} {}
+      : useSelectiveReader_{GetParam().useSelectiveReader},
+        returnFlatVector_{GetParam().returnFlatVector},
+        expectMemoryReuse_{GetParam().expectMemoryReuse},
+        parallelDecoding_{GetParam().parallelDecoding} {}
 
   VectorPtr newBatch(const TypePtr& rowType) const {
     return useSelectiveReader()
@@ -246,27 +276,34 @@ class StringReaderTests
     }
   }
 
-  const bool expectMemoryReuse_;
+  const bool useSelectiveReader_;
   const bool returnFlatVector_;
+  const bool expectMemoryReuse_;
+  const bool parallelDecoding_;
 
- private:
   bool useSelectiveReader() const override {
-    return GetParam().useSelectiveReader;
+    return useSelectiveReader_;
   }
 
   bool returnFlatVector() const override {
     return returnFlatVector_;
+  }
+
+  bool parallelDecoding() const override {
+    return parallelDecoding_;
   }
 };
 
 struct ReaderTestParams {
   const bool useSelectiveReader;
   const bool expectMemoryReuse;
+  const bool parallelDecoding;
 
   std::string toString() const {
     std::ostringstream out;
     out << (useSelectiveReader ? "selective" : "") << "_"
-        << (expectMemoryReuse ? "reuse" : "");
+        << (expectMemoryReuse ? "reuse" : "") << "_"
+        << (parallelDecoding ? "parallel" : "");
     return out.str();
   }
 };
@@ -274,7 +311,14 @@ struct ReaderTestParams {
 class TestColumnReader : public testing::TestWithParam<ReaderTestParams>,
                          public ColumnReaderTestBase {
  protected:
-  TestColumnReader() : expectMemoryReuse_{GetParam().expectMemoryReuse} {}
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
+  TestColumnReader()
+      : useSelectiveReader_{GetParam().useSelectiveReader},
+        expectMemoryReuse_{GetParam().expectMemoryReuse},
+        parallelDecoding_{GetParam().parallelDecoding} {}
 
   VectorPtr newBatch(const TypePtr& rowType) const {
     return useSelectiveReader()
@@ -294,22 +338,47 @@ class TestColumnReader : public testing::TestWithParam<ReaderTestParams>,
     }
   }
 
+  const bool useSelectiveReader_;
+  const bool expectMemoryReuse_;
+  const bool parallelDecoding_;
+
   bool useSelectiveReader() const override {
-    return GetParam().useSelectiveReader;
+    return useSelectiveReader_;
   }
 
   bool returnFlatVector() const override {
     return false;
   }
 
-  const bool expectMemoryReuse_;
+  bool parallelDecoding() const override {
+    return parallelDecoding_;
+  }
+};
+
+struct NonSelectiveReaderTestParams {
+  const bool expectMemoryReuse;
+  const bool parallelDecoding;
+
+  std::string toString() const {
+    std::ostringstream out;
+    out << (expectMemoryReuse ? "reuse" : "") << "_"
+        << (parallelDecoding ? "parallel" : "");
+    return out.str();
+  }
 };
 
 // For test cases where SelectiveColumnReader does not have support.
-class TestNonSelectiveColumnReader : public testing::TestWithParam<bool>,
-                                     public ColumnReaderTestBase {
+class TestNonSelectiveColumnReader
+    : public testing::TestWithParam<NonSelectiveReaderTestParams>,
+      public ColumnReaderTestBase {
  protected:
-  TestNonSelectiveColumnReader() : expectMemoryReuse_{GetParam()} {}
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
+  TestNonSelectiveColumnReader()
+      : expectMemoryReuse_{GetParam().expectMemoryReuse},
+        parallelDecoding_{GetParam().parallelDecoding} {}
 
   VectorPtr newBatch(const TypePtr& rowType) const {
     return nullptr;
@@ -331,36 +400,68 @@ class TestNonSelectiveColumnReader : public testing::TestWithParam<bool>,
     return false;
   }
 
+  bool parallelDecoding() const override {
+    return parallelDecoding_;
+  }
+
   const bool expectMemoryReuse_;
+  const bool parallelDecoding_;
 };
 
-class SchemaMismatchTest : public TestWithParam<bool>,
+struct SchemaMismatchTestParam {
+  const bool useSelectiveReader;
+  const bool parallelDecoding;
+
+  std::string toString() const {
+    std::ostringstream out;
+    out << (useSelectiveReader ? "selective" : "") << "_"
+        << (parallelDecoding ? "parallel" : "");
+    return out.str();
+  }
+};
+
+class SchemaMismatchTest : public TestWithParam<SchemaMismatchTestParam>,
                            public ColumnReaderTestBase {
  protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
+  SchemaMismatchTest()
+      : useSelectiveReader_{GetParam().useSelectiveReader},
+        parallelDecoding_{GetParam().parallelDecoding} {}
+
   VectorPtr newBatch(const TypePtr& rowType) {
     return useSelectiveReader()
         ? BaseVector::create(rowType, 0, &streams_.getMemoryPool())
         : nullptr;
   }
 
+  const bool useSelectiveReader_;
+  const bool parallelDecoding_;
+
   bool useSelectiveReader() const override {
-    return GetParam();
+    return useSelectiveReader_;
   }
 
   bool returnFlatVector() const override {
     return false;
   }
 
+  bool parallelDecoding() const override {
+    return parallelDecoding_;
+  }
+
   template <typename From, typename To>
   void runTest(uint64_t size) {
-    auto dataType = ROW({"c0"}, {CppToType<From>::create()});
+    auto fileType = ROW({"c0"}, {CppToType<From>::create()});
     auto requestedType = ROW({"c0"}, {CppToType<To>::create()});
 
     // build asIsColumnReader_ and asIsSelectiveColumnReader_.
-    buildReader(dataType);
+    buildReader(fileType);
     asIsColumnReader_ = std::move(columnReader_);
     asIsSelectiveColumnReader_ = std::move(selectiveColumnReader_);
-    VectorPtr asIsBatch = newBatch(dataType);
+    VectorPtr asIsBatch = newBatch(fileType);
     if (asIsColumnReader_) {
       asIsColumnReader_->next(size, asIsBatch, nullptr);
     } else {
@@ -370,7 +471,7 @@ class SchemaMismatchTest : public TestWithParam<bool>,
     // build columnReader_ and selectiveColumnReader_. They are used as
     // mismatch ColumnReaders
     auto scanSpec2 = std::make_unique<common::ScanSpec>("root2");
-    buildReader(requestedType, {}, dataType, scanSpec2.get());
+    buildReader(requestedType, fileType, {}, scanSpec2.get());
     VectorPtr mismatchBatch = newBatch(requestedType);
     if (columnReader_) {
       columnReader_->next(size, mismatchBatch, nullptr);
@@ -719,6 +820,132 @@ TEST_P(TestColumnReader, testByteSkipsWithNulls) {
   EXPECT_TRUE(byteBatch->isNullAt(2));
   EXPECT_TRUE(byteBatch->isNullAt(3));
   EXPECT_TRUE(byteBatch->isNullAt(4));
+}
+
+TEST_P(TestColumnReader, testIntegerRLEv2) {
+  // col_0's data (RLEv2 with PATCHED_BASE)
+  int32_t col0[] = {2030, 2000, 2020, 1000000, 2040, 2050, 2060,
+                    2070, 2080, 2090, 2100,    2110, 2120, 2130,
+                    2140, 2150, 2160, 2170,    2180, 2190};
+  const unsigned char buffer0[] = {0x8e, 0x13, 0x2b, 0x21, 0x07, 0xd0, 0x1e,
+                                   0x00, 0x14, 0x70, 0x28, 0x32, 0x3c, 0x46,
+                                   0x50, 0x5a, 0x64, 0x6e, 0x78, 0x82, 0x8c,
+                                   0x96, 0xa0, 0xaa, 0xb4, 0xbe, 0xfc, 0xe8};
+  // col_2's data (RLEv2 with Delta)
+  int32_t col2[] = {1,  2,  4,  6,  10, 12, 16, 18, 22, 28,
+                    30, 32, 34, 36, 38, 40, 42, 44, 46, 48};
+  const unsigned char buffer2[] = {
+      0xc6,
+      0x13,
+      0x02,
+      0x02,
+      0x22,
+      0x42,
+      0x42,
+      0x46,
+      0x22,
+      0x22,
+      0x22,
+      0x22,
+      0x22};
+
+  // expects that with Filter
+  int32_t expects_col0[] = {2110, 2120, 2130, 2140};
+  int32_t expects_col1[] = {11, 12, 13, 14};
+  int32_t expects_col2[] = {32, 34, 36, 38};
+  int32_t size = VELOX_ARRAY_SIZE(col0);
+
+  // set format
+  streams_.setFormat(DwrfFormat::kOrc);
+  // set getEncoding
+  proto::ColumnEncoding directEncoding;
+  proto::ColumnEncoding directv2Encoding;
+  directEncoding.set_kind(proto::ColumnEncoding_Kind_DIRECT);
+  directv2Encoding.set_kind(proto::ColumnEncoding_Kind_DIRECT_V2);
+  EXPECT_CALL(streams_, getEncodingProxy(0))
+      .WillRepeatedly(Return(&directEncoding)); // row type use direct only
+  EXPECT_CALL(streams_, getEncodingProxy(1))
+      .WillRepeatedly(Return(&directv2Encoding)); // col_0 use RLEv2
+  EXPECT_CALL(streams_, getEncodingProxy(2))
+      .WillRepeatedly(Return(&directEncoding)); // col_1 use RLEv1
+  EXPECT_CALL(streams_, getEncodingProxy(3))
+      .WillRepeatedly(Return(&directv2Encoding)); // col_2 use RLEv2
+
+  // set getStream
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_PRESENT, false))
+      .WillRepeatedly(Return(nullptr));
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_ROW_INDEX, false))
+      .WillRepeatedly(Return(nullptr));
+  // col_0's DATA stream
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_DATA, true))
+      .WillRepeatedly(Return(
+          new SeekableArrayInputStream(buffer0, VELOX_ARRAY_SIZE(buffer0))));
+  // col_1's DATA stream
+  std::array<char, 1024> data;
+  std::vector<int64_t> v;
+  data[0] = 0x9c; // rle literal, -100
+  for (int64_t i = 0; i < size; ++i) {
+    v.push_back(i);
+  }
+  auto count = writeVsLongs(data.data() + 1, v);
+  EXPECT_CALL(streams_, getStreamProxy(2, proto::Stream_Kind_DATA, true))
+      .WillRepeatedly(
+          Invoke([&](auto /* unused */, auto /* unused */, auto /* unused */) {
+            return new SeekableArrayInputStream(data.data(), count + 1);
+          }));
+  // col_2's DATA stream
+  EXPECT_CALL(streams_, getStreamProxy(3, proto::Stream_Kind_DATA, true))
+      .WillRepeatedly(Return(
+          new SeekableArrayInputStream(buffer2, VELOX_ARRAY_SIZE(buffer2))));
+
+  // create the row type
+  auto rowType =
+      HiveTypeParser().parse("struct<col_0:int,col_1:int,col_2:int>");
+  auto fileType = TypeWithId::create(rowType)->type();
+  VectorPtr batch = newBatch(rowType);
+  if (useSelectiveReader()) {
+    auto scanSpec = std::make_unique<common::ScanSpec>("root");
+    scanSpec->addAllChildFields(*fileType);
+    scanSpec->childByName("col_0")->setFilter(
+        std::make_unique<common::BigintRange>(2100, 2140, false));
+    scanSpec->childByName("col_1")->setFilter(
+        std::make_unique<common::BigintRange>(11, 20, false));
+    buildReader(rowType, nullptr, {}, scanSpec.get());
+    selectiveColumnReader_->next(size, batch, nullptr);
+
+    auto rowVector = std::dynamic_pointer_cast<RowVector>(batch);
+    ASSERT_NE(rowVector->childAt(0)->encoding(), VectorEncoding::Simple::LAZY);
+    ASSERT_NE(rowVector->childAt(1)->encoding(), VectorEncoding::Simple::LAZY);
+    ASSERT_EQ(rowVector->childAt(2)->encoding(), VectorEncoding::Simple::LAZY);
+
+    auto colBatch = getChild<FlatVector<int32_t>>(batch, 0);
+    auto colBatch2 = getChild<FlatVector<int32_t>>(batch, 1);
+    auto colBatch3 = getChild<FlatVector<int32_t>>(batch, 2);
+    ASSERT_EQ(VELOX_ARRAY_SIZE(expects_col0), colBatch->size());
+    ASSERT_EQ(colBatch->size(), colBatch2->size());
+    ASSERT_EQ(colBatch2->size(), colBatch3->size());
+    for (size_t i = 0; i < batch->size(); ++i) {
+      ASSERT_EQ(expects_col0[i], colBatch->valueAt(i));
+      ASSERT_EQ(expects_col1[i], colBatch2->valueAt(i));
+      ASSERT_EQ(expects_col2[i], colBatch3->valueAt(i));
+    }
+  } else {
+    buildReader(rowType);
+    skipAndRead(batch, /* read */ size);
+    auto colBatch = getChild<FlatVector<int32_t>>(batch, 0);
+    auto colBatch2 = getChild<FlatVector<int32_t>>(batch, 1);
+    auto colBatch3 = getChild<FlatVector<int32_t>>(batch, 2);
+    ASSERT_EQ(size, colBatch->size());
+    ASSERT_EQ(colBatch->size(), colBatch2->size());
+    ASSERT_EQ(colBatch2->size(), colBatch3->size());
+    for (size_t i = 0; i < batch->size(); ++i) {
+      ASSERT_EQ(col0[i], colBatch->valueAt(i));
+      ASSERT_EQ(i, colBatch2->valueAt(i));
+      ASSERT_EQ(col2[i], colBatch3->valueAt(i));
+    }
+  }
+  // reset format
+  streams_.setFormat(DwrfFormat::kDwrf);
 }
 
 TEST_P(TestColumnReader, testIntegerWithNulls) {
@@ -1194,13 +1421,17 @@ TEST_P(StringReaderTests, testStringDictSkipNoNulls) {
     if (columnReader_) {
       columnReader_->next(rowsRead, batch);
     } else {
-      selectiveColumnReader_->next(rowsRead, batch);
+      selectiveColumnReader_->next(rowsRead, batch, nullptr);
     }
 
     ASSERT_EQ(rowsRead, batch->size());
     ASSERT_EQ(0, getNullCount(batch));
 
-    if (returnFlatVector_) {
+    if (useSelectiveReader()) {
+      // Selective reader can return either flat or dictionary vector based on
+      // selectivity.
+      stringBatch = getOnlyChild<SimpleVector<StringView>>(batch);
+    } else if (returnFlatVector_) {
       stringBatch = getOnlyChild<FlatVector<StringView>>(batch);
     } else {
       stringBatch = getOnlyChild<DictionaryVector<StringView>>(batch);
@@ -2523,7 +2754,7 @@ TEST_P(TestNonSelectiveColumnReader, testListSkipWithNullsNoData) {
   // create the row type
   auto rowType = HiveTypeParser().parse("struct<col0:array<bigint>>");
   // selected filter tree nodes list
-  buildReader(rowType, {0, 1});
+  buildReader(rowType, nullptr, {0, 1});
 
   VectorPtr batch = newBatch(rowType);
 
@@ -3033,7 +3264,7 @@ TEST_P(TestNonSelectiveColumnReader, testMapSkipWithNullsNoData) {
 
   // create the row type
   auto rowType = HiveTypeParser().parse("struct<col0:map<bigint,bigint>>");
-  buildReader(rowType, {0, 1});
+  buildReader(rowType, nullptr, {0, 1});
 
   VectorPtr batch = newBatch(rowType);
 
@@ -3091,7 +3322,7 @@ TEST_P(TestNonSelectiveColumnReader, testMapWithAllNulls) {
 
   // create the row type
   auto rowType = HiveTypeParser().parse("struct<col0:map<bigint,bigint>>");
-  buildReader(rowType, {0, 1});
+  buildReader(rowType, nullptr, {0, 1});
 
   VectorPtr batch = newBatch(rowType);
   skipAndRead(batch, /* read */ 8);
@@ -3648,6 +3879,184 @@ TEST_P(TestColumnReader, testTimestamp) {
   }
 }
 
+TEST_P(TestColumnReader, testDecimal64) {
+  // set getEncoding
+  proto::ColumnEncoding directEncoding;
+  directEncoding.set_kind(proto::ColumnEncoding_Kind_DIRECT);
+  EXPECT_CALL(streams_, getEncodingProxy(_))
+      .WillRepeatedly(Return(&directEncoding));
+
+  // set getStream
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_ROW_INDEX, false))
+      .WillRepeatedly(Return(nullptr));
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_PRESENT, false))
+      .WillRepeatedly(Return(nullptr));
+  // col_0's Data Stream
+  char numBuffer[65];
+  for (int i = 0; i < 65; ++i) {
+    if (i < 32) {
+      numBuffer[i] = static_cast<char>(0x3f - 2 * i);
+    } else {
+      numBuffer[i] = static_cast<char>(2 * (i - 32));
+    }
+  }
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_DATA, true))
+      .WillRepeatedly(Return(new SeekableArrayInputStream(
+          numBuffer, VELOX_ARRAY_SIZE(numBuffer), 3)));
+  // col_0's Secondary Stream
+  const unsigned char buffer2[] = {0x3e, 0x00, 0x04}; // [0x02] * 65
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_NANO_DATA, true))
+      .WillRepeatedly(Return(
+          new SeekableArrayInputStream(buffer2, VELOX_ARRAY_SIZE(buffer2))));
+
+  // create the row type
+  auto rowType = HiveTypeParser().parse("struct<col_0:decimal(12, 2)>");
+  buildReader(rowType);
+  VectorPtr batch = newBatch(rowType);
+  skipAndRead(batch, /* read */ 64);
+
+  auto intBatch = getOnlyChild<FlatVector<int64_t>>(batch);
+  ASSERT_EQ(64, batch->size());
+  ASSERT_EQ(64, intBatch->size());
+  ASSERT_EQ(0, getNullCount(batch));
+  ASSERT_EQ(0, getNullCount(intBatch));
+  for (int64_t i = 0; i < 64; ++i) {
+    ASSERT_EQ(i - 32, intBatch->valueAt(i));
+  }
+}
+
+TEST_P(TestColumnReader, testDecimal64WithSkip) {
+  // set getEncoding
+  proto::ColumnEncoding directEncoding;
+  directEncoding.set_kind(proto::ColumnEncoding_Kind_DIRECT);
+  EXPECT_CALL(streams_, getEncodingProxy(_))
+      .WillRepeatedly(Return(&directEncoding));
+
+  // set getStream
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_ROW_INDEX, false))
+      .WillRepeatedly(Return(nullptr));
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_PRESENT, false))
+      .WillRepeatedly(Return(nullptr));
+  const unsigned char presentBuffer[] = {0xfe, 0xff, 0x80}; // [0xff]
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_PRESENT, false))
+      .WillRepeatedly(Return(new SeekableArrayInputStream(
+          presentBuffer, VELOX_ARRAY_SIZE(presentBuffer))));
+  const unsigned char numBuffer[] = {
+      0xf8, 0xe8, 0xe2, 0xcf, 0xf4, 0xcb, 0xb6, 0xda, 0x0d, 0x86, 0xc1, 0xcc,
+      0xcd, 0x9e, 0xd5, 0xc5, 0x11, 0xb4, 0xf6, 0xfc, 0xf3, 0xb9, 0xba, 0x16,
+      0xca, 0xe7, 0xa3, 0xa6, 0xdf, 0x1c, 0xea, 0xad, 0xc0, 0xe5, 0x24, 0xf8,
+      0x94, 0x8c, 0x2f, 0x86, 0xa4, 0x3c, 0x94, 0x4d, 0x62};
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_DATA, true))
+      .WillRepeatedly(Return(new SeekableArrayInputStream(
+          numBuffer, VELOX_ARRAY_SIZE(numBuffer))));
+  const unsigned char buffer1[] = {0x06, 0x00, 0x14}; // [0x0a] * 9
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_NANO_DATA, true))
+      .WillRepeatedly(Return(
+          new SeekableArrayInputStream(buffer1, VELOX_ARRAY_SIZE(buffer1))));
+
+  // create the row type
+  auto rowType = HiveTypeParser().parse("struct<col_0:decimal(12, 10)>");
+  buildReader(rowType);
+  VectorPtr batch = newBatch(rowType);
+  skipAndRead(batch, /* read */ 6);
+
+  auto intBatch = getOnlyChild<FlatVector<int64_t>>(batch);
+  ASSERT_EQ(0, getNullCount(batch));
+  ASSERT_EQ(0, getNullCount(intBatch));
+  ASSERT_EQ(6, batch->size());
+  ASSERT_EQ(6, intBatch->size());
+  ASSERT_EQ(493827160549382716, intBatch->valueAt(0));
+  ASSERT_EQ(4938271605493827, intBatch->valueAt(1));
+  ASSERT_EQ(49382716054938, intBatch->valueAt(2));
+  ASSERT_EQ(493827160549, intBatch->valueAt(3));
+  ASSERT_EQ(4938271605, intBatch->valueAt(4));
+  ASSERT_EQ(49382716, intBatch->valueAt(5));
+  skip(2);
+  next(1, batch);
+  intBatch = getOnlyChild<FlatVector<int64_t>>(batch);
+  ASSERT_EQ(1, batch->size());
+  ASSERT_EQ(1, intBatch->size());
+  ASSERT_EQ(0, getNullCount(batch));
+  ASSERT_EQ(0, getNullCount(intBatch));
+  EXPECT_EQ(49, intBatch->valueAt(0));
+}
+
+TEST_P(TestColumnReader, testDecimal128WithSkip) {
+  // set getEncoding
+  proto::ColumnEncoding directEncoding;
+  directEncoding.set_kind(proto::ColumnEncoding_Kind_DIRECT);
+  EXPECT_CALL(streams_, getEncodingProxy(_))
+      .WillRepeatedly(Return(&directEncoding));
+
+  // set getStream
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_ROW_INDEX, false))
+      .WillRepeatedly(Return(nullptr));
+  EXPECT_CALL(streams_, getStreamProxy(_, proto::Stream_Kind_PRESENT, false))
+      .WillRepeatedly(Return(nullptr));
+  const unsigned char presentBuffer[] = {0xfe, 0xff, 0xf8};
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_PRESENT, false))
+      .WillRepeatedly(Return(new SeekableArrayInputStream(
+          presentBuffer, VELOX_ARRAY_SIZE(presentBuffer))));
+  const unsigned char numBuffer[] = {
+      0xf8, 0xe8, 0xe2, 0xcf, 0xf4, 0xcb, 0xb6, 0xda, 0x0d, 0x86, 0xc1, 0xcc,
+      0xcd, 0x9e, 0xd5, 0xc5, 0x11, 0xb4, 0xf6, 0xfc, 0xf3, 0xb9, 0xba, 0x16,
+      0xca, 0xe7, 0xa3, 0xa6, 0xdf, 0x1c, 0xea, 0xad, 0xc0, 0xe5, 0x24, 0xf8,
+      0x94, 0x8c, 0x2f, 0x86, 0xa4, 0x3c, 0x94, 0x4d, 0x62, 0xaa, 0xcd, 0xb3,
+      0xf2, 0x9e, 0xf0, 0x99, 0xd6, 0xbe, 0xf8, 0xb6, 0x9e, 0xe4, 0xb7, 0xfd,
+      0xce, 0x8f, 0x34, 0xa9, 0xcd, 0xb3, 0xf2, 0x9e, 0xf0, 0x99, 0xd6, 0xbe,
+      0xf8, 0xb6, 0x9e, 0xe4, 0xb7, 0xfd, 0xce, 0x8f, 0x34, 0xfe, 0xff, 0xff,
+      0xff, 0xff, 0x8f, 0x91, 0x8a, 0x93, 0xe8, 0xa3, 0xec, 0xd0, 0x96, 0xd4,
+      0xcc, 0xf6, 0xac, 0x02, 0xfd, 0xff, 0xff, 0xff, 0xff, 0x8f, 0x91, 0x8a,
+      0x93, 0xe8, 0xa3, 0xec, 0xd0, 0x96, 0xd4, 0xcc, 0xf6, 0xac, 0x02,
+  };
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_DATA, true))
+      .WillRepeatedly(Return(new SeekableArrayInputStream(
+          numBuffer, VELOX_ARRAY_SIZE(numBuffer))));
+  const unsigned char buffer1[] = {0x0a, 0x00, 0x4a}; // [0x02] * 13
+  EXPECT_CALL(streams_, getStreamProxy(1, proto::Stream_Kind_NANO_DATA, true))
+      .WillRepeatedly(Return(
+          new SeekableArrayInputStream(buffer1, VELOX_ARRAY_SIZE(buffer1))));
+
+  // create the row type
+  auto rowType = HiveTypeParser().parse("struct<col_0:decimal(38, 37)>");
+  auto decimalType = asRowType(rowType)->childAt(0);
+  buildReader(rowType);
+  VectorPtr batch = newBatch(rowType);
+  skipAndRead(batch, /* read */ 6);
+
+  auto intBatch = getOnlyChild<FlatVector<int128_t>>(batch);
+  ASSERT_EQ(0, getNullCount(batch));
+  ASSERT_EQ(0, getNullCount(intBatch));
+  ASSERT_EQ(6, batch->size());
+  ASSERT_EQ(6, intBatch->size());
+  ASSERT_EQ(493827160549382716, (long)intBatch->valueAt(0));
+  ASSERT_EQ(4938271605493827, (long)intBatch->valueAt(1));
+  ASSERT_EQ(49382716054938, (long)intBatch->valueAt(2));
+  ASSERT_EQ(493827160549, (long)intBatch->valueAt(3));
+  ASSERT_EQ(4938271605, (long)intBatch->valueAt(4));
+  ASSERT_EQ(49382716, (long)intBatch->valueAt(5));
+  skip(2);
+  next(5, batch);
+  intBatch = getOnlyChild<FlatVector<int128_t>>(batch);
+  ASSERT_EQ(5, batch->size());
+  ASSERT_EQ(5, intBatch->size());
+  ASSERT_EQ(0, getNullCount(batch));
+  ASSERT_EQ(0, getNullCount(intBatch));
+  ASSERT_EQ(49, (long)intBatch->valueAt(0));
+  ASSERT_EQ(
+      "1.7320508075688772935274463415058723669",
+      DecimalUtil::toString(intBatch->valueAt(1), decimalType));
+  ASSERT_EQ(
+      "-1.7320508075688772935274463415058723669",
+      DecimalUtil::toString(intBatch->valueAt(2), decimalType));
+  ASSERT_EQ(
+      "9.9999999999999999999999999999999999999",
+      DecimalUtil::toString(intBatch->valueAt(3), decimalType));
+  ASSERT_EQ(
+      "-9.9999999999999999999999999999999999999",
+      DecimalUtil::toString(intBatch->valueAt(4), decimalType));
+}
+
 TEST_P(TestColumnReader, testLargeSkip) {
   // set getEncoding
   proto::ColumnEncoding directEncoding;
@@ -3763,7 +4172,7 @@ TEST_P(StringReaderTests, testStringDirectUseBatchAfterClose) {
           Return(new SeekableArrayInputStream(lengths.data(), lengths.size())));
 
   auto rowType = HiveTypeParser().parse("struct<myString:string>");
-  buildReader(rowType, {});
+  buildReader(rowType, nullptr, {});
 
   std::vector<VectorPtr> batches;
   for (size_t i = 0; i < ROW_COUNT; ++i) {
@@ -4711,64 +5120,113 @@ TEST_P(SchemaMismatchTest, testFloat) {
 VELOX_INSTANTIATE_TEST_SUITE_P(
     TestColumnReaderNoReuse,
     TestColumnReader,
-    ::testing::Values(ReaderTestParams{false, false}));
+    ::testing::Values(ReaderTestParams{false, false, false}));
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    TestColumnReaderNoReuseParallel,
+    TestColumnReader,
+    ::testing::Values(ReaderTestParams{false, false, true}));
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     TestColumnReaderReuse,
     TestColumnReader,
-    ::testing::Values(ReaderTestParams{false, true}));
+    ::testing::Values(ReaderTestParams{false, true, false}));
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    TestColumnReaderReuseParallel,
+    TestColumnReader,
+    ::testing::Values(ReaderTestParams{false, true, true}));
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     TestSelectiveColumnReader,
     TestColumnReader,
-    ::testing::Values(ReaderTestParams{true, false}));
+    ::testing::Values(ReaderTestParams{true, false, false}));
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     TestNonSelectiveColumnReaderNoReuse,
     TestNonSelectiveColumnReader,
-    ::testing::Values(false));
+    ::testing::Values(NonSelectiveReaderTestParams{false, false}));
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    TestNonSelectiveColumnReaderNoReuseParallel,
+    TestNonSelectiveColumnReader,
+    ::testing::Values(NonSelectiveReaderTestParams{false, true}));
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     TestNonSelectiveColumnReaderReuse,
     TestNonSelectiveColumnReader,
-    ::testing::Values(true));
+    ::testing::Values(NonSelectiveReaderTestParams{true, false}));
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    TestNonSelectiveColumnReaderReuseParallel,
+    TestNonSelectiveColumnReader,
+    ::testing::Values(NonSelectiveReaderTestParams{true, true}));
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     StringViewReaderNoReuse,
     StringReaderTests,
-    ::testing::Values(StringReaderTestParams{false, false, false}),
+    ::testing::Values(StringReaderTestParams{false, false, false, false}),
+    [](auto p) { return p.param.toString(); });
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    StringViewReaderNoReuseParallel,
+    StringReaderTests,
+    ::testing::Values(StringReaderTestParams{false, false, false, true}),
     [](auto p) { return p.param.toString(); });
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     StringViewReaderReuse,
     StringReaderTests,
-    ::testing::Values(StringReaderTestParams{false, false, true}),
+    ::testing::Values(StringReaderTestParams{false, false, true, false}),
+    [](auto p) { return p.param.toString(); });
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    StringViewReaderReuseParallel,
+    StringReaderTests,
+    ::testing::Values(StringReaderTestParams{false, false, true, true}),
     [](auto p) { return p.param.toString(); });
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     FlatStringViewReaderNoReuse,
     StringReaderTests,
-    ::testing::Values(StringReaderTestParams{false, true, false}),
+    ::testing::Values(StringReaderTestParams{false, true, false, false}),
+    [](auto p) { return p.param.toString(); });
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    FlatStringViewReaderNoReuseParallel,
+    StringReaderTests,
+    ::testing::Values(StringReaderTestParams{false, true, false, true}),
     [](auto p) { return p.param.toString(); });
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     FlatStringViewReaderReuse,
     StringReaderTests,
-    ::testing::Values(StringReaderTestParams{false, true, true}),
+    ::testing::Values(StringReaderTestParams{false, true, true, false}),
+    [](auto p) { return p.param.toString(); });
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    FlatStringViewReaderReuseParallel,
+    StringReaderTests,
+    ::testing::Values(StringReaderTestParams{false, true, true, true}),
     [](auto p) { return p.param.toString(); });
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     SelectiveStringViewReader,
     StringReaderTests,
-    ::testing::Values(StringReaderTestParams{true, false, false}),
+    ::testing::Values(StringReaderTestParams{true, false, false, false}),
     [](auto p) { return p.param.toString(); });
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     SchemaMismatch,
     SchemaMismatchTest,
-    Values(false));
+    Values(SchemaMismatchTestParam{false, false}));
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    SchemaMismatchParallel,
+    SchemaMismatchTest,
+    Values(SchemaMismatchTestParam{false, true}));
 
 VELOX_INSTANTIATE_TEST_SUITE_P(
     SelectiveSchemaMismatch,
     SchemaMismatchTest,
-    Values(true));
+    Values(SchemaMismatchTestParam{true, false}));

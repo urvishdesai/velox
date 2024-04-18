@@ -39,14 +39,15 @@ inline std::string getExampleFilePath(const std::string& fileName) {
 
 class MockStripeStreams : public StripeStreams {
  public:
-  MockStripeStreams() : pool_{memory::getDefaultMemoryPool()} {};
+  MockStripeStreams() : pool_{memory::memoryManager()->addLeafPool()} {};
   ~MockStripeStreams() = default;
 
   std::unique_ptr<dwio::common::SeekableInputStream> getStream(
       const DwrfStreamIdentifier& si,
+      std::string_view /* unused */,
       bool throwIfNotFound) const override {
     return std::unique_ptr<dwio::common::SeekableInputStream>(getStreamProxy(
-        si.encodingKey().node,
+        si.encodingKey().node(),
         static_cast<proto::Stream_Kind>(si.kind()),
         throwIfNotFound));
   }
@@ -54,8 +55,9 @@ class MockStripeStreams : public StripeStreams {
   std::function<BufferPtr()> getIntDictionaryInitializerForNode(
       const EncodingKey& ek,
       uint64_t /* unused */,
+      const StreamLabels& /* streamLabels */,
       uint64_t /* unused */) override {
-    return [this, nodeId = ek.node, sequenceId = ek.sequence]() {
+    return [this, nodeId = ek.node(), sequenceId = ek.sequence()]() {
       BufferPtr dictionaryData;
       genMockDictDataSetter(nodeId, sequenceId)(
           dictionaryData, &getMemoryPool());
@@ -65,11 +67,15 @@ class MockStripeStreams : public StripeStreams {
 
   const proto::ColumnEncoding& getEncoding(
       const EncodingKey& ek) const override {
-    return *getEncodingProxy(ek.node);
+    return *getEncodingProxy(ek.node());
   }
 
   DwrfFormat format() const override {
-    return DwrfFormat::kDwrf;
+    return this->format_;
+  }
+
+  void setFormat(DwrfFormat format) {
+    this->format_ = format;
   }
 
   MOCK_METHOD2(
@@ -112,6 +118,10 @@ class MockStripeStreams : public StripeStreams {
     return *getStrideIndexProviderProxy();
   }
 
+  int64_t stripeRows() const override {
+    return 1'000'000;
+  }
+
   uint32_t rowsPerRowGroup() const override {
     // Disable efficient skipping using row index.
     return 1'000'000;
@@ -120,6 +130,7 @@ class MockStripeStreams : public StripeStreams {
  private:
   std::shared_ptr<memory::MemoryPool> pool_;
   dwio::common::RowReaderOptions options_;
+  DwrfFormat format_ = DwrfFormat::kDwrf;
 };
 
 inline uint64_t zigZagEncode(int64_t val) {
@@ -229,10 +240,11 @@ class ProtoWriter : public WriterBase {
   ProtoWriter(
       std::shared_ptr<memory::MemoryPool> pool,
       memory::MemoryPool& sinkPool)
-      : WriterBase{std::make_unique<dwio::common::MemorySink>(sinkPool, 1024)} {
+      : WriterBase{std::make_unique<dwio::common::MemorySink>(
+            1024,
+            dwio::common::FileSink::Options{.pool = &sinkPool})} {
     initContext(
-        std::make_shared<Config>(),
-        pool->addChild("proto_writer", MemoryPool::Kind::kAggregate));
+        std::make_shared<Config>(), pool->addAggregateChild("proto_writer"));
   }
 
   template <typename T>

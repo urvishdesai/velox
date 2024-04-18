@@ -22,15 +22,16 @@ add_library(
   ArrayDistinct.cpp
   ArrayDuplicates.cpp
   ArrayIntersectExcept.cpp
-  ArrayMatch.cpp
+  ArrayAndMapMatch.cpp
   ArrayPosition.cpp
   ArrayShuffle.cpp
   ArraySort.cpp
   ArraySum.cpp
   Comparisons.cpp
-  DecimalArithmetic.cpp
+  DecimalFunctions.cpp
   ElementAt.cpp
   FilterFunctions.cpp
+  FindFirst.cpp
   FromUnixTime.cpp
   FromUtf8.cpp
   GreatestLeast.cpp
@@ -38,13 +39,15 @@ add_library(
   JsonFunctions.cpp
   Map.cpp
   MapEntries.cpp
+  MapFromEntries.cpp
   MapKeysAndValues.cpp
   MapZipWith.cpp
   Not.cpp
   Reduce.cpp
-  Repeat.cpp
   Reverse.cpp
   RowFunction.cpp
+  Sequence.cpp
+  SimpleComparisonMatcher.cpp
   Slice.cpp
   Split.cpp
   StringFunctions.cpp
@@ -53,6 +56,7 @@ add_library(
   Transform.cpp
   TransformKeys.cpp
   TransformValues.cpp
+  TypeOf.cpp
   URLFunctions.cpp
   Utf8Utils.cpp
   VectorArithmetic.cpp
@@ -70,7 +74,7 @@ target_link_libraries(
   velox_type_tz
   velox_presto_types
   velox_functions_util
-  ${FOLLY})
+  Folly::folly)
 
 set_property(TARGET velox_functions_prestosql_impl PROPERTY JOB_POOL_COMPILE
                                                             high_memory_pool)
@@ -82,6 +86,7 @@ endif()
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
   add_subdirectory(coverage)
+  add_subdirectory(fuzzer)
 elseif(${VELOX_BUILD_TEST_UTILS})
   add_subdirectory(tests/utils)
 endif()

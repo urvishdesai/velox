@@ -15,11 +15,6 @@
  */
 #pragma once
 
-#include <folly/hash/Checksum.h>
-#include <cstdint>
-#define XXH_INLINE_ALL
-#include <xxhash.h>
-
 #include "velox/functions/Udf.h"
 #include "velox/functions/lib/string/StringCore.h"
 #include "velox/functions/lib/string/StringImpl.h"
@@ -52,266 +47,21 @@ struct CodePointFunction {
   }
 };
 
-/// crc32(varbinary) → bigint
-/// Return an int64_t checksum calculated using the crc32 method in zlib.
-template <typename T>
-struct CRC32Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<int64_t>& result, const arg_type<Varchar>& input) {
-    result = static_cast<int64_t>(folly::crc32_type(
-        reinterpret_cast<const unsigned char*>(input.data()), input.size()));
-  }
-};
-
-/// xxhash64(varbinary) → varbinary
-/// Return an 8-byte binary to hash64 of input (varbinary such as string)
-template <typename T>
-struct XxHash64Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<Varbinary>& result, const arg_type<Varbinary>& input) {
-    // Seed is set to 0.
-    int64_t hash = folly::Endian::swap64(XXH64(input.data(), input.size(), 0));
-    static const auto kLen = sizeof(int64_t);
-
-    // Resizing output and copy
-    result.resize(kLen);
-    std::memcpy(result.data(), &hash, kLen);
-  }
-};
-
-/// md5(varbinary) → varbinary
-template <typename T>
-struct Md5Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  template <typename TTo, typename TFrom>
-  FOLLY_ALWAYS_INLINE void call(TTo& result, const TFrom& input) {
-    stringImpl::md5(result, input);
-  }
-};
-
-/// sha1(varbinary) -> varbinary
-template <typename T>
-struct Sha1Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<Varbinary>& result, const arg_type<Varbinary>& input) {
-    result.resize(20);
-    folly::ssl::OpenSSLHash::sha1(
-        folly::MutableByteRange((uint8_t*)result.data(), result.size()),
-        folly::ByteRange((const uint8_t*)input.data(), input.size()));
-  }
-};
-
-/// sha256(varbinary) -> varbinary
-template <typename T>
-struct Sha256Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  template <typename TTo, typename TFrom>
-  FOLLY_ALWAYS_INLINE void call(TTo& result, const TFrom& input) {
-    stringImpl::sha256(result, input);
-  }
-};
-
-/// sha512(varbinary) -> varbinary
-template <typename T>
-struct Sha512Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  template <typename TTo, typename TFrom>
-  FOLLY_ALWAYS_INLINE void call(TTo& result, const TFrom& input) {
-    stringImpl::sha512(result, input);
-  }
-};
-
-/// spooky_hash_v2_32(varbinary) -> varbinary
-template <typename T>
-struct SpookyHashV232Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<Varbinary>& result, const arg_type<Varbinary>& input) {
-    // Swap bytes with folly::Endian::swap32 similar to the Java implementation,
-    // Velox and SpookyHash only support little-endian platforms.
-    uint32_t hash = folly::Endian::swap32(
-        folly::hash::SpookyHashV2::Hash32(input.data(), input.size(), 0));
-    static const auto kHashLength = sizeof(int32_t);
-    result.resize(kHashLength);
-    std::memcpy(result.data(), &hash, kHashLength);
-  }
-};
-
-/// spooky_hash_v2_64(varbinary) -> varbinary
-template <typename T>
-struct SpookyHashV264Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<Varbinary>& result, const arg_type<Varbinary>& input) {
-    // Swap bytes with folly::Endian::swap64 similar to the Java implementation,
-    // Velox and SpookyHash only support little-endian platforms.
-    uint64_t hash = folly::Endian::swap64(
-        folly::hash::SpookyHashV2::Hash64(input.data(), input.size(), 0));
-    static const auto kHashLength = sizeof(int64_t);
-    result.resize(kHashLength);
-    std::memcpy(result.data(), &hash, kHashLength);
-  }
-};
-
-/// hmac_sha1(varbinary) -> varbinary
-template <typename T>
-struct HmacSha1Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  template <typename TOuput, typename TInput>
-  FOLLY_ALWAYS_INLINE void
-  call(TOuput& result, const TInput& data, const TInput& key) {
-    stringImpl::hmacSha1(result, key, data);
-  }
-};
-
-/// hmac_sha256(varbinary) -> varbinary
-template <typename T>
-struct HmacSha256Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  template <typename TTo, typename TFrom>
-  FOLLY_ALWAYS_INLINE void
-  call(TTo& result, const TFrom& data, const TFrom& key) {
-    stringImpl::hmacSha256(result, key, data);
-  }
-};
-
-/// hmac_sha512(varbinary) -> varbinary
-template <typename T>
-struct HmacSha512Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  template <typename TTo, typename TFrom>
-  FOLLY_ALWAYS_INLINE void
-  call(TTo& result, const TFrom& data, const TFrom& key) {
-    stringImpl::hmacSha512(result, key, data);
-  }
-};
-
-/// hmac_md5(varbinary) -> varbinary
-template <typename T>
-struct HmacMd5Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varbinary>& result,
-      const arg_type<Varbinary>& data,
-      const arg_type<Varbinary>& key) {
-    stringImpl::hmacMd5(result, key, data);
-  }
-};
-
-template <typename T>
-struct ToHexFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varbinary>& result,
-      const arg_type<Varchar>& input) {
-    stringImpl::toHex(result, input);
-  }
-};
-
-template <typename T>
-struct FromHexFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varchar>& result,
-      const arg_type<Varbinary>& input) {
-    stringImpl::fromHex(result, input);
-  }
-};
-
-template <typename T>
-struct ToBase64Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varchar>& result,
-      const arg_type<Varbinary>& input) {
-    stringImpl::toBase64(result, input);
-  }
-};
-
-template <typename T>
-struct FromBase64Function {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varbinary>& result,
-      const arg_type<Varchar>& input) {
-    stringImpl::fromBase64(result, input);
-  }
-};
-
-template <typename T>
-struct FromBase64UrlFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varbinary>& result,
-      const arg_type<Varchar>& input) {
-    stringImpl::fromBase64Url(result, input);
-  }
-};
-
-template <typename T>
-struct ToBase64UrlFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varchar>& result,
-      const arg_type<Varbinary>& input) {
-    stringImpl::toBase64Url(result, input);
-  }
-};
-
-template <typename T>
-struct UrlEncodeFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varchar>& result,
-      const arg_type<Varbinary>& input) {
-    stringImpl::urlEscape(result, input);
-  }
-};
-
-template <typename T>
-struct UrlDecodeFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Varchar>& result,
-      const arg_type<Varbinary>& input) {
-    stringImpl::urlUnescape(result, input);
-  }
-};
-
 /// substr(string, start) -> varchar
 ///
 ///     Returns the rest of string from the starting position start.
 ///     Positions start with 1. A negative starting position is interpreted as
-///     being relative to the end of the string.
+///     being relative to the end of the string. Returns empty string if
+///     absolute value of start is greater then length of the string.
+
 ///
 /// substr(string, start, length) -> varchar
 ///
 ///     Returns a substring from string of length length from the
 ///     starting position start. Positions start with 1. A negative starting
 ///     position is interpreted as being relative to the end of the string.
+///     Returns empty string if absolute value of start is greater then length
+///     of the string.
 template <typename T>
 struct SubstrFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
@@ -347,7 +97,7 @@ struct SubstrFunction {
       I start,
       I length = std::numeric_limits<I>::max()) {
     // Following Presto semantics
-    if (start == 0) {
+    if (start == 0 || length <= 0) {
       result.setEmpty();
       return;
     }
@@ -360,14 +110,13 @@ struct SubstrFunction {
     }
 
     // Following Presto semantics
-    if (start <= 0 || start > numCharacters || length <= 0) {
+    if (start <= 0 || start > numCharacters) {
       result.setEmpty();
       return;
     }
 
     // Adjusting length
-    if (length == std::numeric_limits<I>::max() ||
-        length + start - 1 > numCharacters) {
+    if (numCharacters - start + 1 < length) {
       // set length to the max valid length
       length = numCharacters - start + 1;
     }
@@ -404,10 +153,39 @@ struct TrimFunctionBase {
     stringImpl::trimUnicodeWhiteSpace<leftTrim, rightTrim>(result, input);
   }
 
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      const arg_type<Varchar>& trimCharacters) {
+    if (stringCore::isAscii(trimCharacters.data(), trimCharacters.size())) {
+      callAscii(result, input, trimCharacters);
+    } else {
+      VELOX_UNSUPPORTED(
+          "trim functions with custom trim characters and non-ASCII inputs are not supported yet");
+    }
+  }
+
   FOLLY_ALWAYS_INLINE void callAscii(
       out_type<Varchar>& result,
       const arg_type<Varchar>& input) {
-    stringImpl::trimAsciiWhiteSpace<leftTrim, rightTrim>(result, input);
+    stringImpl::trimAscii<leftTrim, rightTrim>(
+        result, input, stringImpl::isAsciiWhiteSpace);
+  }
+
+  FOLLY_ALWAYS_INLINE void callAscii(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      const arg_type<Varchar>& trimCharacters) {
+    const auto numChars = trimCharacters.size();
+    const auto* chars = trimCharacters.data();
+    stringImpl::trimAscii<leftTrim, rightTrim>(result, input, [&](char c) {
+      for (auto i = 0; i < numChars; ++i) {
+        if (c == chars[i]) {
+          return true;
+        }
+      }
+      return false;
+    });
   }
 };
 
@@ -431,6 +209,51 @@ struct LengthFunction {
 
   FOLLY_ALWAYS_INLINE void callAscii(int64_t& result, const StringView& input) {
     result = stringImpl::length<true>(input);
+  }
+};
+
+/// Returns number of bytes in the specified varbinary.
+template <typename T>
+struct LengthVarbinaryFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(int64_t& result, const StringView& input) {
+    result = input.size();
+  }
+};
+
+template <typename T>
+struct StartsWithFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<bool>& result,
+      const arg_type<Varchar>& x,
+      const arg_type<Varchar>& y) {
+    if (x.size() < y.size()) {
+      result = false;
+      return;
+    }
+
+    result = (memcmp(x.data(), y.data(), y.size()) == 0);
+  }
+};
+
+template <typename T>
+struct EndsWithFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<bool>& result,
+      const arg_type<Varchar>& x,
+      const arg_type<Varchar>& y) {
+    if (x.size() < y.size()) {
+      result = false;
+      return;
+    }
+
+    result =
+        (memcmp(x.data() + (x.size() - y.size()), y.data(), y.size()) == 0);
   }
 };
 
@@ -518,55 +341,156 @@ struct StrLPosFunction : public StrPosFunctionBase<T, true> {};
 template <typename T>
 struct StrRPosFunction : public StrPosFunctionBase<T, false> {};
 
+/// hamming_distance(string, string) -> bigint
+/// Computes the hamming distance between two strings.
 template <typename T>
-struct FromBigEndian32 {
+struct HammingDistanceFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<int32_t>& result, const arg_type<Varbinary>& input) {
-    static constexpr auto kTypeLength = sizeof(int32_t);
-    VELOX_USER_CHECK_EQ(input.size(), kTypeLength, "Expected 4-byte input");
-    memcpy(&result, input.data(), kTypeLength);
-    result = folly::Endian::big(result);
+  void call(
+      out_type<int64_t>& result,
+      const arg_type<Varchar>& left,
+      const arg_type<Varchar>& right) {
+    int64_t leftLength = left.size();
+    int64_t rightLength = right.size();
+
+    int64_t distance = 0;
+    int64_t leftPosition = 0;
+    int64_t rightPosition = 0;
+    while (leftPosition < leftLength && rightPosition < rightLength) {
+      int leftSize = 0;
+      int rightSize = 0;
+      auto codePointLeft = utf8proc_codepoint(
+          left.data() + leftPosition, left.data() + leftLength, leftSize);
+      auto codePointRight = utf8proc_codepoint(
+          right.data() + rightPosition, right.data() + rightLength, rightSize);
+
+      // if both code points are invalid, we do not care if they are equal
+      // the following code treats them as equal if they happen to be of the
+      // same length
+      leftPosition += codePointLeft >= 0 ? leftSize : -codePointLeft;
+      rightPosition += codePointRight >= 0 ? rightSize : -codePointRight;
+
+      if (codePointLeft != codePointRight) {
+        distance++;
+      }
+    }
+    VELOX_USER_CHECK(
+        leftPosition == leftLength && rightPosition == rightLength,
+        "The input strings to hamming_distance function must have the same length");
+
+    result = distance;
+  }
+
+  void callAscii(
+      out_type<int64_t>& result,
+      const arg_type<Varchar>& left,
+      const arg_type<Varchar>& right) {
+    int64_t leftLength = left.size();
+    int64_t rightLength = right.size();
+    VELOX_USER_CHECK_EQ(
+        leftLength,
+        rightLength,
+        "The input strings to hamming_distance function must have the same length");
+
+    auto leftCodePoints = reinterpret_cast<const uint8_t*>(left.data());
+    auto rightCodePoints = reinterpret_cast<const uint8_t*>(right.data());
+    int64_t distance = 0;
+    for (int i = 0; i < leftLength; i++) {
+      if (leftCodePoints[i] != rightCodePoints[i]) {
+        distance++;
+      }
+    }
+    result = distance;
   }
 };
 
 template <typename T>
-struct ToBigEndian32 {
+struct LevenshteinDistanceFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<Varbinary>& result, const arg_type<int32_t>& input) {
-    static constexpr auto kTypeLength = sizeof(int32_t);
-    auto value = folly::Endian::big(input);
-    result.setNoCopy(
-        StringView(reinterpret_cast<const char*>(&value), kTypeLength));
+  void call(
+      out_type<int64_t>& result,
+      const arg_type<Varchar>& left,
+      const arg_type<Varchar>& right) {
+    auto leftCodePoints = stringImpl::stringToCodePoints(left);
+    auto rightCodePoints = stringImpl::stringToCodePoints(right);
+    doCall<int32_t>(
+        result,
+        leftCodePoints.data(),
+        rightCodePoints.data(),
+        leftCodePoints.size(),
+        rightCodePoints.size());
   }
-};
 
-template <typename T>
-struct FromBigEndian64 {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<int64_t>& result, const arg_type<Varbinary>& input) {
-    static constexpr auto kTypeLength = sizeof(int64_t);
-    VELOX_USER_CHECK_EQ(input.size(), kTypeLength, "Expected 8-byte input");
-    memcpy(&result, input.data(), kTypeLength);
-    result = folly::Endian::big(result);
+  void callAscii(
+      out_type<int64_t>& result,
+      const arg_type<Varchar>& left,
+      const arg_type<Varchar>& right) {
+    auto leftCodePoints = reinterpret_cast<const uint8_t*>(left.data());
+    auto rightCodePoints = reinterpret_cast<const uint8_t*>(right.data());
+    doCall<uint8_t>(
+        result, leftCodePoints, rightCodePoints, left.size(), right.size());
   }
-};
 
-template <typename T>
-struct ToBigEndian64 {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
+  template <typename TCodePoint>
+  void doCall(
+      out_type<int64_t>& result,
+      const TCodePoint* leftCodePoints,
+      const TCodePoint* rightCodePoints,
+      size_t leftCodePointsSize,
+      size_t rightCodePointsSize) {
+    if (leftCodePointsSize < rightCodePointsSize) {
+      doCall(
+          result,
+          rightCodePoints,
+          leftCodePoints,
+          rightCodePointsSize,
+          leftCodePointsSize);
+      return;
+    }
+    if (rightCodePointsSize == 0) {
+      result = leftCodePointsSize;
+      return;
+    }
 
-  FOLLY_ALWAYS_INLINE
-  void call(out_type<Varbinary>& result, const arg_type<int64_t>& input) {
-    static constexpr auto kTypeLength = sizeof(int64_t);
-    auto value = folly::Endian::big(input);
-    result.setNoCopy(
-        StringView(reinterpret_cast<const char*>(&value), kTypeLength));
+    static const int32_t kMaxCombinedInputSize = 1'000'000;
+    auto combinedInputSize = leftCodePointsSize * rightCodePointsSize;
+    VELOX_USER_CHECK_LE(
+        combinedInputSize,
+        kMaxCombinedInputSize,
+        "The combined inputs size exceeded max Levenshtein distance combined input size,"
+        " the code points size of left is {}, code points size of right is {}",
+        leftCodePointsSize,
+        rightCodePointsSize);
+
+    std::vector<int32_t> distances;
+    distances.reserve(rightCodePointsSize);
+    for (int i = 0; i < rightCodePointsSize; i++) {
+      distances.push_back(i + 1);
+    }
+
+    for (int i = 0; i < leftCodePointsSize; i++) {
+      auto leftUpDistance = distances[0];
+      if (leftCodePoints[i] == rightCodePoints[0]) {
+        distances[0] = i;
+      } else {
+        distances[0] = std::min(i, distances[0]) + 1;
+      }
+      for (int j = 1; j < rightCodePointsSize; j++) {
+        auto leftUpDistanceNext = distances[j];
+        if (leftCodePoints[i] == rightCodePoints[j]) {
+          distances[j] = leftUpDistance;
+        } else {
+          distances[j] =
+              std::min(
+                  distances[j - 1], std::min(leftUpDistance, distances[j])) +
+              1;
+        }
+        leftUpDistance = leftUpDistanceNext;
+      }
+    }
+    result = distances[rightCodePointsSize - 1];
   }
 };
 

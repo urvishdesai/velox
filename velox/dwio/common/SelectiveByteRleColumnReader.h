@@ -23,15 +23,15 @@ namespace facebook::velox::dwio::common {
 class SelectiveByteRleColumnReader : public SelectiveColumnReader {
  public:
   SelectiveByteRleColumnReader(
-      std::shared_ptr<const dwio::common::TypeWithId> requestedType,
+      const TypePtr& requestedType,
+      std::shared_ptr<const dwio::common::TypeWithId> fileType,
       dwio::common::FormatParams& params,
-      velox::common::ScanSpec& scanSpec,
-      const TypePtr& type)
+      velox::common::ScanSpec& scanSpec)
       : SelectiveColumnReader(
-            std::move(requestedType),
+            requestedType,
+            std::move(fileType),
             params,
-            scanSpec,
-            type) {}
+            scanSpec) {}
 
   bool hasBulkPath() const override {
     return false;

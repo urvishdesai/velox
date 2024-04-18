@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include <parquet/level_conversion.h>
 #include "velox/dwio/common/TypeWithId.h"
 #include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
+#include "velox/dwio/parquet/writer/arrow/LevelConversion.h"
 
 namespace facebook::velox::parquet {
 
@@ -36,12 +36,13 @@ class ParquetTypeWithId : public dwio::common::TypeWithId {
 
   ParquetTypeWithId(
       TypePtr type,
-      std::vector<std::shared_ptr<const TypeWithId>>&& children,
+      std::vector<std::unique_ptr<TypeWithId>>&& children,
       uint32_t id,
       uint32_t maxId,
       uint32_t column,
       std::string name,
       std::optional<thrift::Type::type> parquetType,
+      std::optional<thrift::LogicalType> logicalType,
       uint32_t maxRepeat,
       uint32_t maxDefine,
       int32_t precision = 0,
@@ -50,6 +51,7 @@ class ParquetTypeWithId : public dwio::common::TypeWithId {
       : TypeWithId(type, std::move(children), id, maxId, column),
         name_(name),
         parquetType_(parquetType),
+        logicalType_(std::move(logicalType)),
         maxRepeat_(maxRepeat),
         maxDefine_(maxDefine),
         precision_(precision),
@@ -58,22 +60,25 @@ class ParquetTypeWithId : public dwio::common::TypeWithId {
 
   bool isLeaf() const {
     // Negative column ordinal means non-leaf column.
-    return static_cast<int32_t>(column) >= 0;
+    return static_cast<int32_t>(column()) >= 0;
   }
 
   const ParquetTypeWithId& parquetChildAt(uint32_t index) const {
     return *reinterpret_cast<const ParquetTypeWithId*>(childAt(index).get());
   }
 
-  const ParquetTypeWithId* FOLLY_NULLABLE parquetParent() const {
-    return reinterpret_cast<const ParquetTypeWithId*>(parent);
+  const ParquetTypeWithId* parquetParent() const {
+    return reinterpret_cast<const ParquetTypeWithId*>(parent());
   }
 
   /// Fills 'info' and returns the mode for interpreting levels.
-  LevelMode makeLevelInfo(::parquet::internal::LevelInfo& info) const;
+  LevelMode makeLevelInfo(arrow::LevelInfo& info) const;
+
+  std::vector<std::unique_ptr<ParquetTypeWithId::TypeWithId>> moveChildren() &&;
 
   const std::string name_;
   const std::optional<thrift::Type::type> parquetType_;
+  const std::optional<thrift::LogicalType> logicalType_;
   const uint32_t maxRepeat_;
   const uint32_t maxDefine_;
   const int32_t precision_;

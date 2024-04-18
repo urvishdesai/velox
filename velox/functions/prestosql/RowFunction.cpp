@@ -32,21 +32,18 @@ class RowFunction : public exec::VectorFunction {
         context.pool(),
         outputType,
         BufferPtr(nullptr),
-        rows.size(),
+        rows.end(),
         std::move(argsCopy),
         0 /*nullCount*/);
     context.moveOrCopyResult(row, rows, result);
   }
-
-  bool isDefaultNullBehavior() const override {
-    return false;
-  }
 };
 } // namespace
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_concat_row,
     std::vector<std::shared_ptr<exec::FunctionSignature>>{},
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<RowFunction>());
 
 } // namespace facebook::velox::functions

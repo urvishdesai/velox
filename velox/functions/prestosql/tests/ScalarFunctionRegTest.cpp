@@ -27,27 +27,28 @@ class ScalarFunctionRegTest : public testing::Test {};
 TEST_F(ScalarFunctionRegTest, prefix) {
   // Remove all functions and check for no entries.
   exec::vectorFunctionFactories().wlock()->clear();
-  exec::SimpleFunctions().testingClear();
+  exec::mutableSimpleFunctions().clearRegistry();
   EXPECT_EQ(0, exec::vectorFunctionFactories().rlock()->size());
-  EXPECT_EQ(0, exec::SimpleFunctions().getFunctionNames().size());
+  EXPECT_EQ(0, exec::simpleFunctions().getFunctionNames().size());
 
   // Register without prefix and memorize function maps.
   prestosql::registerAllScalarFunctions();
   const std::unordered_map<std::string, exec::VectorFunctionEntry>
       scalarVectorFuncMapBase = *(exec::vectorFunctionFactories().rlock());
   std::unordered_set<std::string> scalarSimpleFuncBaseNames;
-  for (const auto& funcName : exec::SimpleFunctions().getFunctionNames()) {
+  for (const auto& funcName : exec::simpleFunctions().getFunctionNames()) {
     scalarSimpleFuncBaseNames.insert(funcName);
   }
 
   // Remove all functions and check for no entries.
   exec::vectorFunctionFactories().wlock()->clear();
-  exec::SimpleFunctions().testingClear();
+  exec::mutableSimpleFunctions().clearRegistry();
   EXPECT_EQ(0, exec::vectorFunctionFactories().rlock()->size());
-  EXPECT_EQ(0, exec::SimpleFunctions().getFunctionNames().size());
+  EXPECT_EQ(0, exec::simpleFunctions().getFunctionNames().size());
 
   // Register with prefix and check all functions have the prefix.
   const std::string prefix{"test.abc_schema."};
+  const auto prefixSize = prefix.size();
   prestosql::registerAllScalarFunctions(prefix);
   std::unordered_map<std::string, exec::VectorFunctionEntry>
       scalarVectorFuncMap = *(exec::vectorFunctionFactories().rlock());
@@ -58,14 +59,18 @@ TEST_F(ScalarFunctionRegTest, prefix) {
   scalarVectorFuncMap.erase("is_null");
 
   for (const auto& entry : scalarVectorFuncMap) {
-    EXPECT_EQ(prefix, entry.first.substr(0, prefix.size()));
-    EXPECT_EQ(
-        1, scalarVectorFuncMapBase.count(entry.first.substr(prefix.size())));
+    const auto& name = entry.first;
+    EXPECT_EQ(prefix, name.substr(0, prefixSize));
+    EXPECT_EQ(1, scalarVectorFuncMapBase.count(name.substr(prefixSize)));
   }
-  for (const auto& funcName : exec::SimpleFunctions().getFunctionNames()) {
-    EXPECT_EQ(prefix, funcName.substr(0, prefix.size()));
-    EXPECT_EQ(
-        1, scalarSimpleFuncBaseNames.count(funcName.substr(prefix.size())));
+
+  for (const auto& funcName : exec::simpleFunctions().getFunctionNames()) {
+    // Skip special forms. They don't have any prefix.
+    if (funcName == "in") {
+      continue;
+    }
+    EXPECT_EQ(prefix, funcName.substr(0, prefixSize));
+    EXPECT_EQ(1, scalarSimpleFuncBaseNames.count(funcName.substr(prefixSize)));
   }
 }
 

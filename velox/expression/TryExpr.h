@@ -41,14 +41,17 @@ class TryExpr : public SpecialForm {
       EvalCtx& context,
       VectorPtr& result) override;
 
-  bool propagatesNulls() const override {
-    return inputs_[0]->propagatesNulls();
-  }
-
   void nullOutErrors(
       const SelectivityVector& rows,
       EvalCtx& context,
-      VectorPtr& result);
+      VectorPtr& result) const;
+
+ private:
+  // This is safe to call only after all metadata is computed for input
+  // expressions.
+  void computePropagatesNulls() override {
+    propagatesNulls_ = inputs_[0]->propagatesNulls();
+  }
 };
 
 class TryCallToSpecialForm : public FunctionCallToSpecialForm {
@@ -58,7 +61,8 @@ class TryCallToSpecialForm : public FunctionCallToSpecialForm {
   ExprPtr constructSpecialForm(
       const TypePtr& type,
       std::vector<ExprPtr>&& compiledChildren,
-      bool trackCpuUsage) override;
+      bool trackCpuUsage,
+      const core::QueryConfig& config) override;
 };
 
 } // namespace facebook::velox::exec

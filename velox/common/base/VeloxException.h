@@ -86,17 +86,27 @@ inline constexpr auto kUnreachableCode = "UNREACHABLE_CODE"_fs;
 // An error raised when a requested operation is not yet supported.
 inline constexpr auto kNotImplemented = "NOT_IMPLEMENTED"_fs;
 
-// An error raised when memory exceeded limits.
+// An error raised when memory pool exceeds limits.
 inline constexpr auto kMemCapExceeded = "MEM_CAP_EXCEEDED"_fs;
 
-// Error caused by memory allocation failure.
+// An error raised when memory pool is aborted.
+inline constexpr auto kMemAborted = "MEM_ABORTED"_fs;
+
+// Error caused by memory allocation failure (inclusive of allocator memory cap
+// exceeded).
 inline constexpr auto kMemAllocError = "MEM_ALLOC_ERROR"_fs;
 
 // Error caused by failing to allocate cache buffer space for IO.
 inline constexpr auto kNoCacheSpace = "NO_CACHE_SPACE"_fs;
 
+// An error raised when spill bytes exceeds limits.
+inline constexpr auto kSpillLimitExceeded = "SPILL_LIMIT_EXCEEDED"_fs;
+
 // Errors indicating file read corruptions.
 inline constexpr auto kFileCorruption = "FILE_CORRUPTION"_fs;
+
+// Errors indicating file not found.
+inline constexpr auto kFileNotFound = "FILE_NOT_FOUND"_fs;
 
 // We do not know how to classify it yet.
 inline constexpr auto kUnknown = "UNKNOWN"_fs;
@@ -123,9 +133,26 @@ class VeloxException : public std::exception {
       const std::exception_ptr& e,
       std::string_view message,
       std::string_view errorSource,
+      std::string_view errorCode,
       bool isRetriable,
       Type exceptionType = Type::kSystem,
       std::string_view exceptionName = "VeloxException");
+
+  VeloxException(
+      const std::exception_ptr& e,
+      std::string_view message,
+      std::string_view errorSource,
+      bool isRetriable,
+      Type exceptionType = Type::kSystem,
+      std::string_view exceptionName = "VeloxException")
+      : VeloxException(
+            e,
+            message,
+            errorSource,
+            "",
+            isRetriable,
+            exceptionType,
+            exceptionName) {}
 
   // Inherited
   const char* what() const noexcept override {
@@ -266,6 +293,7 @@ class VeloxUserError : public VeloxException {
             e,
             message,
             error_source::kErrorSourceUser,
+            error_code::kInvalidArgument,
             isRetriable,
             Type::kUser,
             exceptionName) {}
@@ -310,6 +338,9 @@ class VeloxRuntimeError final : public VeloxException {
             exceptionName) {}
 };
 
+/// Returns a reference to a thread level counter of Velox error throws.
+int64_t& threadNumVeloxThrow();
+
 /// Holds a pointer to a function that provides addition context to be
 /// added to the detailed error message in case of an exception.
 struct ExceptionContext {
@@ -349,6 +380,10 @@ struct ExceptionContext {
 
   bool suspended{false};
 };
+
+/// If exceptionPtr represents an std::exception, convert it to VeloxUserError
+/// to add useful context for debugging.
+std::exception_ptr toVeloxException(const std::exception_ptr& exceptionPtr);
 
 /// Returns a reference to thread_local variable that holds a function that can
 /// be used to get addition context to be added to the detailed error message in

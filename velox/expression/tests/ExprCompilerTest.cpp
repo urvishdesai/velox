@@ -17,8 +17,11 @@
 #include "gtest/gtest.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/expression/Expr.h"
+#include "velox/expression/FieldReference.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/types/JsonType.h"
+#include "velox/parse/Expressions.h"
+#include "velox/parse/ExpressionsParser.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
@@ -27,8 +30,21 @@ namespace facebook::velox::exec::test {
 class ExprCompilerTest : public testing::Test,
                          public velox::test::VectorTestBase {
  protected:
+  static void SetUpTestCase() {
+    parse::registerTypeResolver();
+    functions::prestosql::registerAllScalarFunctions();
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   void SetUp() override {
     functions::prestosql::registerAllScalarFunctions();
+  }
+
+  core::TypedExprPtr makeTypedExpr(
+      const std::string& text,
+      const RowTypePtr& rowType) {
+    auto untyped = parse::parseExpr(text, {});
+    return core::Expressions::inferTypes(untyped, rowType, execCtx_->pool());
   }
 
   core::TypedExprPtr andCall(
@@ -45,10 +61,14 @@ class ExprCompilerTest : public testing::Test,
         BOOLEAN(), std::vector<core::TypedExprPtr>{a, b}, "or");
   }
 
-  core::TypedExprPtr concatCall(const std::vector<core::TypedExprPtr>& args) {
+  core::TypedExprPtr concatCall(
+      const std::vector<core::TypedExprPtr>& args,
+      TypePtr returnType = nullptr) {
     VELOX_CHECK_GE(args.size(), 2);
-    return std::make_shared<core::CallTypedExpr>(
-        args[0]->type(), args, "concat");
+    if (!returnType) {
+      returnType = args[0]->type();
+    }
+    return std::make_shared<core::CallTypedExpr>(returnType, args, "concat");
   }
 
   core::TypedExprPtr call(
@@ -174,7 +194,7 @@ TEST_F(ExprCompilerTest, orFlattening) {
   ASSERT_EQ("and(a, or(b, c, d))", compile(expression)->toString());
 }
 
-TEST_F(ExprCompilerTest, concatFlattening) {
+TEST_F(ExprCompilerTest, concatStringFlattening) {
   auto rowType =
       ROW({"a", "b", "c", "d"}, {VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR()});
 
@@ -200,6 +220,53 @@ TEST_F(ExprCompilerTest, concatFlattening) {
       {field("a"), concatCall({varchar("---"), varchar("...")}), field("b")});
   ASSERT_EQ(
       "concat(a, ---:VARCHAR, ...:VARCHAR, b)",
+      compile(expression)->toString());
+}
+
+TEST_F(ExprCompilerTest, concatArrayFlattening) {
+  // Verify that array concat is flattened only if all its inputs are of the
+  // same type.
+  auto rowType =
+      ROW({"array1", "array2", "intVal"},
+          {ARRAY(INTEGER()), ARRAY(INTEGER()), INTEGER()});
+
+  auto field = makeField(rowType);
+
+  // concat(array1, concat(array2, array2)) => concat(array1, array2, array2)
+  auto expression = concatCall(
+      {field("array1"), concatCall({field("array2"), field("array2")})});
+  ASSERT_EQ("concat(array1, array2, array2)", compile(expression)->toString());
+
+  // concat(array1, concat(array2, concat(array2, intVal)))
+  // => concat(array1, array2, concat(array2, intVal))
+  expression = concatCall(
+      {field("array1"),
+       concatCall(
+           {field("array2"), concatCall({field("array2"), field("intVal")})})});
+  ASSERT_EQ(
+      "concat(array1, array2, concat(array2, intVal))",
+      compile(expression)->toString());
+
+  // concat(intVal, concat(array2, concat(array2, array1)))
+  // => concat(intVal, concat(array2, array2, array1))
+  expression = concatCall(
+      {field("intVal"),
+       concatCall(
+           {field("array2"), concatCall({field("array2"), field("array1")})})},
+      ARRAY(INTEGER()));
+  ASSERT_EQ(
+      "concat(intVal, concat(array2, array2, array1))",
+      compile(expression)->toString());
+
+  // concat(concat(array2, concat(array2, array1)), intVal)
+  // => concat(concat(array2, array2, array1), intVal, )
+  expression = concatCall(
+      {concatCall(
+           {field("array2"), concatCall({field("array2"), field("array1")})}),
+       field("intVal")},
+      ARRAY(INTEGER()));
+  ASSERT_EQ(
+      "concat(concat(array2, array2, array1), intVal)",
       compile(expression)->toString());
 }
 
@@ -242,6 +309,48 @@ TEST_F(ExprCompilerTest, customTypeConstant) {
 
   auto exprSet = compile(expression);
   ASSERT_EQ("[1, 2, 3]:JSON", compile(expression)->toString());
+}
+
+TEST_F(ExprCompilerTest, rewrites) {
+  auto rowType = ROW({"c0", "c1"}, {ARRAY(VARCHAR()), BIGINT()});
+  auto arraySortSql =
+      "array_sort(c0, (x, y) -> if(length(x) < length(y), -1, if(length(x) > length(y), 1, 0)))";
+
+  ASSERT_NO_THROW(std::make_unique<ExprSet>(
+      std::vector<core::TypedExprPtr>{
+          makeTypedExpr(arraySortSql, rowType),
+          makeTypedExpr("c1 + 5", rowType),
+      },
+      execCtx_.get()));
+}
+
+TEST_F(ExprCompilerTest, eliminateUnnecessaryCast) {
+  auto exprSet =
+      compile(makeTypedExpr("cast(c0 as BIGINT)", ROW({{"c0", BIGINT()}})));
+  ASSERT_EQ(exprSet->size(), 1);
+  ASSERT_TRUE(dynamic_cast<const FieldReference*>(exprSet->expr(0).get()));
+}
+
+TEST_F(ExprCompilerTest, lambdaExpr) {
+  // Ensure that metadata computation correctly pulls in distinct fields from
+  // captured columns.
+
+  // Case 1: Standalone Expression
+  auto exprSet = compile(makeTypedExpr(
+      "find_first_index(c0, (x) -> (x = c1))",
+      ROW({"c0", "c1"}, {ARRAY(VARCHAR()), VARCHAR()})));
+  ASSERT_EQ(exprSet->size(), 1);
+  auto distinctFields = exprSet->expr(0)->distinctFields();
+  ASSERT_EQ(distinctFields.size(), 2);
+
+  // Case 2: Shared expression where the metadata is recomputed.
+  exprSet = compile(makeTypedExpr(
+      "if (find_first_index(c0, (x) -> (x = c1)) - 1 = 0, null::bigint, "
+      "find_first_index(c0, (x) -> (x = c1)) - 1)",
+      ROW({"c0", "c1"}, {ARRAY(VARCHAR()), VARCHAR()})));
+  ASSERT_EQ(exprSet->size(), 1);
+  distinctFields = exprSet->expr(0)->distinctFields();
+  ASSERT_EQ(distinctFields.size(), 2);
 }
 
 } // namespace facebook::velox::exec::test

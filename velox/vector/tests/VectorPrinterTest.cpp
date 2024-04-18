@@ -19,7 +19,12 @@
 
 namespace facebook::velox::test {
 
-class VectorPrinterTest : public testing::Test, public VectorTestBase {};
+class VectorPrinterTest : public testing::Test, public VectorTestBase {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+};
 
 // Sanity check that printVector doesn't fail or crash.
 TEST_F(VectorPrinterTest, basic) {
@@ -43,5 +48,13 @@ TEST_F(VectorPrinterTest, basic) {
 
     ASSERT_NO_THROW(printVector(*data, rows));
   }
+}
+
+TEST_F(VectorPrinterTest, map) {
+  auto data = makeMapVector<int64_t, int64_t>({
+      {},
+      {{1, 10}},
+  });
+  ASSERT_NO_THROW(printVector(*data));
 }
 } // namespace facebook::velox::test

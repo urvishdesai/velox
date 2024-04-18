@@ -25,15 +25,15 @@ class SelectiveFloatingPointColumnReader : public SelectiveColumnReader {
  public:
   using ValueType = TRequested;
   SelectiveFloatingPointColumnReader(
-      std::shared_ptr<const dwio::common::TypeWithId> requestedType,
-      const TypePtr& dataType,
+      const TypePtr& requestedType,
+      std::shared_ptr<const dwio::common::TypeWithId> fileType,
       FormatParams& params,
       velox::common::ScanSpec& scanSpec)
       : SelectiveColumnReader(
-            std::move(requestedType),
+            requestedType,
+            std::move(fileType),
             params,
-            scanSpec,
-            dataType) {}
+            scanSpec) {}
 
   // Offers fast path only if data and result widths match.
   bool hasBulkPath() const override {
@@ -45,7 +45,7 @@ class SelectiveFloatingPointColumnReader : public SelectiveColumnReader {
   readCommon(vector_size_t offset, RowSet rows, const uint64_t* incomingNulls);
 
   void getValues(RowSet rows, VectorPtr* result) override {
-    getFlatValues<TRequested, TRequested>(rows, result, nodeType_->type);
+    getFlatValues<TRequested, TRequested>(rows, result, requestedType_);
   }
 
  protected:
@@ -89,7 +89,13 @@ void SelectiveFloatingPointColumnReader<TData, TRequested>::processFilter(
     velox::common::Filter* filter,
     RowSet rows,
     ExtractValues extractValues) {
-  switch (filter ? filter->kind() : velox::common::FilterKind::kAlwaysTrue) {
+  if (filter == nullptr) {
+    readHelper<Reader, velox::common::AlwaysTrue, isDense>(
+        &dwio::common::alwaysTrue(), rows, extractValues);
+    return;
+  }
+
+  switch (filter->kind()) {
     case velox::common::FilterKind::kAlwaysTrue:
       readHelper<Reader, velox::common::AlwaysTrue, isDense>(
           filter, rows, extractValues);
@@ -171,14 +177,14 @@ void SelectiveFloatingPointColumnReader<TData, TRequested>::readCommon(
       } else {
         processValueHook<Reader, false>(rows, scanSpec_->valueHook());
       }
-      return;
-    }
-    if (isDense) {
-      processFilter<Reader, true>(
-          scanSpec_->filter(), rows, ExtractToReader(this));
     } else {
-      processFilter<Reader, false>(
-          scanSpec_->filter(), rows, ExtractToReader(this));
+      if (isDense) {
+        processFilter<Reader, true>(
+            scanSpec_->filter(), rows, ExtractToReader(this));
+      } else {
+        processFilter<Reader, false>(
+            scanSpec_->filter(), rows, ExtractToReader(this));
+      }
     }
   } else {
     if (isDense) {

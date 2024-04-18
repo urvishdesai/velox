@@ -17,10 +17,11 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/memory/MallocAllocator.h"
+#include "velox/common/memory/SharedArbitrator.h"
 #include "velox/common/testutil/TestValue.h"
-#include "velox/dwio/common/DataSink.h"
 #include "velox/exec/Exchange.h"
-#include "velox/exec/PartitionedOutputBufferManager.h"
+#include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
@@ -28,17 +29,25 @@
 #include "velox/parse/ExpressionsParser.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/serializers/PrestoSerializer.h"
+#include "velox/vector/tests/utils/VectorMaker.h"
+#include "velox/vector/tests/utils/VectorTestBase.h"
+
+DECLARE_bool(velox_memory_leak_check_enabled);
+DECLARE_bool(velox_enable_memory_usage_track_in_default_memory_pool);
 
 using namespace facebook::velox::common::testutil;
+using namespace facebook::velox::memory;
 
 namespace facebook::velox::exec::test {
 
-// static
-std::shared_ptr<cache::AsyncDataCache> OperatorTestBase::asyncDataCache_;
-
 OperatorTestBase::OperatorTestBase() {
-  using memory::MemoryAllocator;
-  facebook::velox::exec::ExchangeSource::registerFactory();
+  // Overloads the memory pools used by VectorTestBase to work with memory
+  // arbitrator.
+  rootPool_ = memory::memoryManager()->addRootPool(
+      "", memory::kMaxMemory, exec::MemoryReclaimer::create());
+  pool_ = rootPool_->addLeafChild("", true, exec::MemoryReclaimer::create());
+  vectorMaker_ = velox::test::VectorMaker(pool_.get());
+
   parse::registerTypeResolver();
 }
 
@@ -47,22 +56,45 @@ void OperatorTestBase::registerVectorSerde() {
 }
 
 OperatorTestBase::~OperatorTestBase() {
-  // Revert to default process-wide MemoryAllocator.
-  memory::MemoryAllocator::setDefaultInstance(nullptr);
+  // Wait for all the tasks to be deleted.
+  exec::test::waitForAllTasksToBeDeleted();
+}
+
+void OperatorTestBase::SetUpTestCase() {
+  FLAGS_velox_enable_memory_usage_track_in_default_memory_pool = true;
+  FLAGS_velox_memory_leak_check_enabled = true;
+  memory::SharedArbitrator::registerFactory();
+  resetMemory();
+  functions::prestosql::registerAllScalarFunctions();
+  aggregate::prestosql::registerAllAggregateFunctions();
+  TestValue::enable();
 }
 
 void OperatorTestBase::TearDownTestCase() {
-  Task::testingWaitForAllTasksToBeDeleted();
+  asyncDataCache_->shutdown();
+  waitForAllTasksToBeDeleted();
+  memory::SharedArbitrator::unregisterFactory();
+}
+
+void OperatorTestBase::resetMemory() {
+  if (asyncDataCache_ != nullptr) {
+    asyncDataCache_->clear();
+    asyncDataCache_.reset();
+  }
+  MemoryManagerOptions options;
+  options.allocatorCapacity = 8L << 30;
+  options.arbitratorCapacity = 6L << 30;
+  options.memoryPoolInitCapacity = 512 << 20;
+  options.arbitratorKind = "SHARED";
+  options.checkUsageLeak = true;
+  options.arbitrationStateCheckCb = memoryArbitrationStateCheck;
+  memory::MemoryManager::testingSetInstance(options);
+  asyncDataCache_ =
+      cache::AsyncDataCache::create(memory::memoryManager()->allocator());
+  cache::AsyncDataCache::setInstance(asyncDataCache_.get());
 }
 
 void OperatorTestBase::SetUp() {
-  // Sets the process default MemoryAllocator to an async cache of up
-  // to 4GB backed by a default MemoryAllocator
-  if (!asyncDataCache_) {
-    asyncDataCache_ = std::make_shared<cache::AsyncDataCache>(
-        memory::MemoryAllocator::createDefaultInstance(), 4UL << 30);
-  }
-  memory::MemoryAllocator::setDefaultInstance(asyncDataCache_.get());
   if (!isRegisteredVectorSerde()) {
     this->registerVectorSerde();
   }
@@ -70,10 +102,11 @@ void OperatorTestBase::SetUp() {
   ioExecutor_ = std::make_unique<folly::IOThreadPoolExecutor>(3);
 }
 
-void OperatorTestBase::SetUpTestCase() {
-  functions::prestosql::registerAllScalarFunctions();
-  aggregate::prestosql::registerAllAggregateFunctions();
-  TestValue::enable();
+void OperatorTestBase::TearDown() {
+  waitForAllTasksToBeDeleted();
+  pool_.reset();
+  rootPool_.reset();
+  resetMemory();
 }
 
 std::shared_ptr<Task> OperatorTestBase::assertQuery(
@@ -172,7 +205,7 @@ core::TypedExprPtr OperatorTestBase::parseExpr(
 
   // Wait for the task to go.
   task.reset();
-  Task::testingWaitForAllTasksToBeDeleted();
+  waitForAllTasksToBeDeleted();
 
   // If a spilling directory was set, ensure it was removed after the task is
   // gone.

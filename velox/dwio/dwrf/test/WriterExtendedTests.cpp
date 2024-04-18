@@ -18,14 +18,14 @@
 #include "folly/CPortability.h"
 
 #include "folly/Random.h"
-#include "velox/dwio/common/DataSink.h"
+#include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/dwrf/test/utils/E2EWriterTestUtil.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
-#include "velox/dwio/type/fbhive/HiveTypeParser.h"
+#include "velox/type/fbhive/HiveTypeParser.h"
 #include "velox/vector/FlatVector.h"
 
 using namespace ::testing;
-using namespace facebook::velox::dwio::type::fbhive;
+using namespace facebook::velox::type::fbhive;
 using namespace facebook::velox::dwrf;
 using facebook::velox::memory::MemoryPool;
 using folly::Random;
@@ -114,10 +114,17 @@ void testWriterDefaultFlushPolicy(
       false);
 }
 
-TEST(E2EWriterTests, FlushPolicySimpleEncoding) {
+class E2EWriterTest : public testing::Test {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+};
+
+TEST_F(E2EWriterTest, FlushPolicySimpleEncoding) {
   const size_t batchCount = 200;
   const size_t size = 1000;
-  auto pool = facebook::velox::memory::getDefaultMemoryPool();
+  auto pool = facebook::velox::memory::memoryManager()->addLeafPool();
 
   HiveTypeParser parser;
   auto type = parser.parse(
@@ -168,10 +175,10 @@ TEST(E2EWriterTests, FlushPolicySimpleEncoding) {
 
 // Many streams are not yet allocated prior to the first flush, hence first
 // flush is delayed if we rely on stream usage to estimate stripe size.
-TEST(E2EWriterTests, FlushPolicyDictionaryEncoding) {
+TEST_F(E2EWriterTest, FlushPolicyDictionaryEncoding) {
   const size_t batchCount = 500;
   const size_t size = 1000;
-  auto pool = facebook::velox::memory::getDefaultMemoryPool();
+  auto pool = facebook::velox::memory::memoryManager()->addLeafPool();
 
   HiveTypeParser parser;
   auto type = parser.parse(
@@ -310,10 +317,10 @@ TEST(E2EWriterTests, FlushPolicyDictionaryEncoding) {
 }
 
 // stream usage seems to have a delta that is close to compression block size?
-TEST(E2EWriterTests, FlushPolicyNestedTypes) {
+TEST_F(E2EWriterTest, FlushPolicyNestedTypes) {
   const size_t batchCount = 10;
   const size_t size = 1000;
-  auto pool = facebook::velox::memory::getDefaultMemoryPool();
+  auto pool = facebook::velox::memory::memoryManager()->addLeafPool();
 
   HiveTypeParser parser;
   auto type = parser.parse(
@@ -371,10 +378,10 @@ TEST(E2EWriterTests, FlushPolicyNestedTypes) {
 }
 
 // Flat map has 1.5 orders of magnitude inflated stream memory usage.
-TEST(E2EWriterTests, FlushPolicyFlatMap) {
+TEST_F(E2EWriterTest, FlushPolicyFlatMap) {
   const size_t batchCount = 10;
-  const size_t size = 1000;
-  auto pool = facebook::velox::memory::getDefaultMemoryPool();
+  const size_t size = 500;
+  auto pool = facebook::velox::memory::memoryManager()->addLeafPool();
 
   HiveTypeParser parser;
   // A mixture of columns where dictionary sharing is not necessarily
@@ -391,48 +398,48 @@ TEST(E2EWriterTests, FlushPolicyFlatMap) {
       FlatMapFlushPolicyTestCase{
           /*stripeSize*/ 256 * kSizeKB,
           /*dictSize*/ std::numeric_limits<int64_t>::max(),
-          /*numStripesLower*/ 10,
-          /*numStripesUpper*/ 10,
-          /*enableDictionary*/ true,
-          /*enableDictionarySharing*/ false,
-          /*seed*/ 1321904009},
-      FlatMapFlushPolicyTestCase{
-          /*stripeSize*/ 512 * kSizeKB,
-          /*dictSize*/ std::numeric_limits<int64_t>::max(),
           /*numStripesLower*/ 6,
           /*numStripesUpper*/ 6,
           /*enableDictionary*/ true,
           /*enableDictionarySharing*/ false,
           /*seed*/ 1321904009},
       FlatMapFlushPolicyTestCase{
+          /*stripeSize*/ 512 * kSizeKB,
+          /*dictSize*/ std::numeric_limits<int64_t>::max(),
+          /*numStripesLower*/ 4,
+          /*numStripesUpper*/ 4,
+          /*enableDictionary*/ true,
+          /*enableDictionarySharing*/ false,
+          /*seed*/ 1321904009},
+      FlatMapFlushPolicyTestCase{
           /*stripeSize*/ 2 * kSizeMB,
           /*dictSize*/ std::numeric_limits<int64_t>::max(),
-          /*numStripesLower*/ 3,
-          /*numStripesUpper*/ 3,
+          /*numStripesLower*/ 2,
+          /*numStripesUpper*/ 2,
           /*enableDictionary*/ true,
           /*enableDictionarySharing*/ true,
           /*seed*/ 1321904009},
       FlatMapFlushPolicyTestCase{
           /*stripeSize*/ 256 * kSizeKB,
           /*dictSize*/ std::numeric_limits<int64_t>::max(),
-          /*numStripesLower*/ 10,
-          /*numStripesUpper*/ 10,
-          /*enableDictionary*/ false,
-          /*enableDictionarySharing*/ false,
-          /*seed*/ 1321904009},
-      FlatMapFlushPolicyTestCase{
-          /*stripeSize*/ 512 * kSizeKB,
-          /*dictSize*/ std::numeric_limits<int64_t>::max(),
           /*numStripesLower*/ 6,
           /*numStripesUpper*/ 6,
           /*enableDictionary*/ false,
           /*enableDictionarySharing*/ false,
           /*seed*/ 1321904009},
       FlatMapFlushPolicyTestCase{
+          /*stripeSize*/ 512 * kSizeKB,
+          /*dictSize*/ std::numeric_limits<int64_t>::max(),
+          /*numStripesLower*/ 4,
+          /*numStripesUpper*/ 4,
+          /*enableDictionary*/ false,
+          /*enableDictionarySharing*/ false,
+          /*seed*/ 1321904009},
+      FlatMapFlushPolicyTestCase{
           /*stripeSize*/ 2 * kSizeMB,
           /*dictSize*/ std::numeric_limits<int64_t>::max(),
-          /*numStripesLower*/ 3,
-          /*numStripesUpper*/ 3,
+          /*numStripesLower*/ 2,
+          /*numStripesUpper*/ 2,
           /*enableDictionary*/ false,
           /*enableDictionarySharing*/ true,
           /*seed*/ 1321904009});

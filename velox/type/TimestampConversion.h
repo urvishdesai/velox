@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include "velox/common/base/Status.h"
 #include "velox/type/Timestamp.h"
 
 namespace facebook::velox::util {
@@ -43,6 +44,39 @@ constexpr const int32_t kMaxYear{292278994};
 constexpr const int32_t kYearInterval{400};
 constexpr const int32_t kDaysPerYearInterval{146097};
 
+/// Enum to dictate parsing modes for date strings.
+enum class ParseMode {
+  // For date string conversion, align with DuckDB's implementation.
+  kStrict,
+
+  // For timestamp string conversion, align with DuckDB's implementation.
+  kNonStrict,
+
+  // Strictly processes dates only in complete ISO 8601 format,
+  // e.g. [+-](YYYY-MM-DD).
+  // Align with Presto casting conventions.
+  kStandardCast,
+
+  // Like kStandardCast but permits years less than four digits, missing
+  // day/month, and allows trailing 'T' or spaces.
+  // Align with Spark SQL casting conventions.
+  // Supported formats:
+  // `[+-][Y]Y*`
+  // `[+-][Y]Y*-[M]M`
+  // `[+-][Y]Y*-[M]M*-[D]D`
+  // `[+-][Y]Y*-[M]M*-[D]D *`
+  // `[+-][Y]Y*-[M]M*-[D]DT*`
+  kNonStandardCast,
+
+  // Like kNonStandardCast but does not permit inclusion of timestamp.
+  // Supported formats:
+  // `[+-][Y]Y*`
+  // `[+-][Y]Y*-[M]M`
+  // `[+-][Y]Y*-[M]M*-[D]D`
+  // `[+-][Y]Y*-[M]M*-[D]D *`
+  kNonStandardNoTimeCast
+};
+
 // Returns true if leap year, false otherwise
 bool isLeapYear(int32_t year);
 
@@ -55,20 +89,29 @@ bool isValidDayOfYear(int32_t year, int32_t dayOfYear);
 // Returns max day of month for inputted month of inputted year
 int32_t getMaxDayOfMonth(int32_t year, int32_t month);
 
+/// Computes the last day of month since unix epoch (1970-01-01).
+/// Returns UserError status if the date is invalid.
+Status lastDayOfMonthSinceEpochFromDate(const std::tm& dateTime, int64_t& out);
+
 /// Date conversions.
 
-/// Returns the (signed) number of days since unix epoch (1970-01-01).
-/// Throws VeloxUserError if the date is invalid.
-int64_t daysSinceEpochFromDate(int32_t year, int32_t month, int32_t day);
+/// Computes the (signed) number of days since unix epoch (1970-01-01).
+/// Returns UserError status if the date is invalid.
+Status
+daysSinceEpochFromDate(int32_t year, int32_t month, int32_t day, int64_t& out);
 
-/// Returns the (signed) number of days since unix epoch (1970-01-01).
-int64_t daysSinceEpochFromWeekDate(
+/// Computes the (signed) number of days since unix epoch (1970-01-01).
+/// Returns UserError status if the date is invalid.
+Status daysSinceEpochFromWeekDate(
     int32_t weekYear,
     int32_t weekOfYear,
-    int32_t dayOfWeek);
+    int32_t dayOfWeek,
+    int64_t& out);
 
-/// Returns the (signed) number of days since unix epoch (1970-01-01).
-int64_t daysSinceEpochFromDayOfYear(int32_t year, int32_t dayOfYear);
+/// Computes the (signed) number of days since unix epoch (1970-01-01).
+/// Returns UserError status if the date is invalid.
+Status
+daysSinceEpochFromDayOfYear(int32_t year, int32_t dayOfYear, int64_t& out);
 
 /// Returns the (signed) number of days since unix epoch (1970-01-01), following
 /// the "YYYY-MM-DD" format (ISO 8601). ' ', '/' and '\' are also acceptable
@@ -79,6 +122,16 @@ int64_t fromDateString(const char* buf, size_t len);
 
 inline int64_t fromDateString(const StringView& str) {
   return fromDateString(str.data(), str.size());
+}
+
+/// Cast string to date. Supported date formats vary, depending on input
+/// ParseMode. Refer to ParseMode enum for further info.
+///
+/// Throws VeloxUserError if the format or date is invalid.
+int32_t castFromDateString(const char* buf, size_t len, ParseMode mode);
+
+inline int32_t castFromDateString(const StringView& str, ParseMode mode) {
+  return castFromDateString(str.data(), str.size(), mode);
 }
 
 // Extracts the day of the week from the number of days since epoch
@@ -92,7 +145,7 @@ int64_t
 fromTime(int32_t hour, int32_t minute, int32_t second, int32_t microseconds);
 
 /// Parses the input string and returns the number of cumulative microseconds,
-/// following the "HH:MM:SS[.MS]" format (ISO 8601).
+/// following the "HH:MM[:SS[.MS]]" format (ISO 8601).
 //
 /// Throws VeloxUserError if the format or time is invalid.
 int64_t fromTimeString(const char* buf, size_t len);
@@ -104,7 +157,7 @@ inline int64_t fromTimeString(const StringView& str) {
 // Timestamp conversion
 
 /// Parses a full ISO 8601 timestamp string, following the format
-/// "YYYY-MM-DD HH:MM:SS[.MS] +00:00"
+/// "YYYY-MM-DD HH:MM[:SS[.MS]] +00:00"
 Timestamp fromTimestampString(const char* buf, size_t len);
 
 inline Timestamp fromTimestampString(const StringView& str) {

@@ -103,7 +103,7 @@ class SsdPin {
   bool empty() const {
     return file_ == nullptr;
   }
-  SsdFile* FOLLY_NONNULL file() const {
+  SsdFile* file() const {
     return file_;
   }
 
@@ -114,7 +114,7 @@ class SsdPin {
   std::string toString() const;
 
  private:
-  SsdFile* FOLLY_NULLABLE file_;
+  SsdFile* file_;
   SsdRun run_;
 };
 
@@ -132,8 +132,21 @@ struct SsdCacheStats {
     entriesRead = tsanAtomicValue(other.entriesRead);
     bytesRead = tsanAtomicValue(other.bytesRead);
     entriesCached = tsanAtomicValue(other.entriesCached);
+    regionsCached = tsanAtomicValue(other.regionsCached);
     bytesCached = tsanAtomicValue(other.bytesCached);
+    entriesAgedOut = tsanAtomicValue(other.entriesAgedOut);
+    regionsAgedOut = tsanAtomicValue(other.regionsAgedOut);
     numPins = tsanAtomicValue(other.numPins);
+
+    openFileErrors = tsanAtomicValue(other.openFileErrors);
+    openCheckpointErrors = tsanAtomicValue(other.openCheckpointErrors);
+    openLogErrors = tsanAtomicValue(other.openLogErrors);
+    deleteCheckpointErrors = tsanAtomicValue(other.deleteCheckpointErrors);
+    growFileErrors = tsanAtomicValue(other.growFileErrors);
+    writeSsdErrors = tsanAtomicValue(other.writeSsdErrors);
+    writeCheckpointErrors = tsanAtomicValue(other.writeCheckpointErrors);
+    readSsdErrors = tsanAtomicValue(other.readSsdErrors);
+    readCheckpointErrors = tsanAtomicValue(other.readCheckpointErrors);
   }
 
   tsan_atomic<uint64_t> entriesWritten{0};
@@ -141,8 +154,21 @@ struct SsdCacheStats {
   tsan_atomic<uint64_t> entriesRead{0};
   tsan_atomic<uint64_t> bytesRead{0};
   tsan_atomic<uint64_t> entriesCached{0};
+  tsan_atomic<uint64_t> regionsCached{0};
   tsan_atomic<uint64_t> bytesCached{0};
+  tsan_atomic<uint64_t> entriesAgedOut{0};
+  tsan_atomic<uint64_t> regionsAgedOut{0};
   tsan_atomic<int32_t> numPins{0};
+
+  tsan_atomic<uint32_t> openFileErrors{0};
+  tsan_atomic<uint32_t> openCheckpointErrors{0};
+  tsan_atomic<uint32_t> openLogErrors{0};
+  tsan_atomic<uint32_t> deleteCheckpointErrors{0};
+  tsan_atomic<uint32_t> growFileErrors{0};
+  tsan_atomic<uint32_t> writeSsdErrors{0};
+  tsan_atomic<uint32_t> writeCheckpointErrors{0};
+  tsan_atomic<uint32_t> readSsdErrors{0};
+  tsan_atomic<uint32_t> readCheckpointErrors{0};
 };
 
 // A shard of SsdCache. Corresponds to one file on SSD.  The data
@@ -164,7 +190,8 @@ class SsdFile {
       int32_t shardId,
       int32_t maxRegions,
       int64_t checkpointInternalBytes = 0,
-      folly::Executor* FOLLY_NULLABLE executor = nullptr);
+      bool disableFileCow = false,
+      folly::Executor* executor = nullptr);
 
   // Adds entries of  'pins'  to this file. 'pins' must be in read mode and
   // those pins that are successfully added to SSD are marked as being on SSD.
@@ -186,15 +213,15 @@ class SsdFile {
   // Increments the pin count of the region of 'offset'.
   void pinRegion(uint64_t offset);
 
-  // Decrements the pin count of the region of 'offset'. If the pin
-  // count goes to zero and evict is due, starts the evict.
+  // Decrements the pin count of the region of 'offset'. If the pin count goes
+  // to zero and evict is due, starts the eviction.
   void unpinRegion(uint64_t offset);
 
   // Asserts that the region of 'offset' is pinned. This is called by
   // the pin holder. The pin count can be read without mutex.
   void checkPinned(uint64_t offset) const {
-    tsan_lock_guard<std::mutex> l(mutex_);
-    VELOX_CHECK_LT(0, regionPins_[regionIndex(offset)]);
+    tsan_lock_guard<std::shared_mutex> l(mutex_);
+    VELOX_CHECK_GT(regionPins_[regionIndex(offset)], 0);
   }
 
   // Returns the region number corresponding to offset.
@@ -224,21 +251,34 @@ class SsdFile {
   // Deletes the backing file. Used in testing.
   void deleteFile();
 
+  /// Remove cached entries of files in the fileNum set 'filesToRemove'. If
+  /// successful, return true, and 'filesRetained' contains entries that should
+  /// not be removed, ex., from pinned regions. Otherwise, return false and
+  /// 'filesRetained' could be ignored.
+  bool removeFileEntries(
+      const folly::F14FastSet<uint64_t>& filesToRemove,
+      folly::F14FastSet<uint64_t>& filesRetained);
+
   // Writes a checkpoint state that can be recovered from. The
   // checkpoint is serialized on 'mutex_'. If 'force' is false,
   // rechecks that at least 'checkpointIntervalBytes_' have been
   // written since last checkpoint and silently returns if not.
   void checkpoint(bool force = false);
 
+  /// Returns true if copy on write is disabled for this file. Used in testing.
+  bool testingIsCowDisabled() const;
+
  private:
   // 4 first bytes of a checkpoint file. Allows distinguishing between format
   // versions.
-  static constexpr const char* FOLLY_NONNULL kCheckpointMagic = "CPT1";
+  static constexpr const char* kCheckpointMagic = "CPT1";
   // Magic number separating file names from cache entry data in checkpoint
   // file.
   static constexpr int64_t kCheckpointMapMarker = 0xfffffffffffffffe;
   // Magic number at end of completed checkpoint file.
   static constexpr int64_t kCheckpointEndMarker = 0xcbedf11e;
+
+  static constexpr int kMaxErasedSizePct = 50;
 
   // Increments the pin count of the region of 'offset'. Caller must hold
   // 'mutex_'.
@@ -246,18 +286,17 @@ class SsdFile {
     ++regionPins_[regionIndex(offset)];
   }
 
-  // Returns [offset, size] of contiguous space for storing data of a
-  // number of contiguous 'pins' starting with the pin at index
-  // 'begin'.  Returns nullopt if there is no space. The space does
-  // not necessarily cover all the pins, so multiple calls starting at
-  // the first unwritten pin may be needed.
+  // Returns [offset, size] of contiguous space for storing data of a number of
+  // contiguous 'pins' starting with the pin at index 'begin'.  Returns nullopt
+  // if there is no space. The space does not necessarily cover all the pins, so
+  // multiple calls starting at the first unwritten pin may be needed.
   std::optional<std::pair<uint64_t, int32_t>> getSpace(
       const std::vector<CachePin>& pins,
       int32_t begin);
 
   // Removes all 'entries_' that reference data in regions described by
   // 'regionIndices'.
-  void clearRegionEntriesLocked(const std::vector<int32_t>& regionIndices);
+  void clearRegionEntriesLocked(const std::vector<int32_t>& regions);
 
   // Clears one or more  regions for accommodating new entries. The regions are
   // added to 'writableRegions_'. Returns true if regions could be cleared.
@@ -289,16 +328,26 @@ class SsdFile {
   // the files for making new checkpoints.
   void initializeCheckpoint();
 
+  // Writes 'iovecs' to the SSD file at the 'offset'. Returns true if the write
+  // succeeds; otherwise, log the error and return false.
+  bool
+  write(uint64_t offset, uint64_t length, const std::vector<iovec>& iovecs);
+
   // Synchronously logs that 'regions' are no longer valid in a possibly xisting
   // checkpoint.
   void logEviction(const std::vector<int32_t>& regions);
 
-  // Serializes access to all private data members.
-  mutable std::mutex mutex_;
+  static constexpr const char* kLogExtension = ".log";
+  static constexpr const char* kCheckpointExtension = ".cpt";
+
   // Name of cache file, used as prefix for checkpoint files.
-  std::string fileName_;
-  static constexpr const char* FOLLY_NONNULL kLogExtension = ".log";
-  static constexpr const char* FOLLY_NONNULL kCheckpointExtension = ".cpt";
+  const std::string fileName_;
+
+  // Maximum size of the backing file in kRegionSize units.
+  const int32_t maxRegions_;
+
+  // Serializes access to all private data members.
+  mutable std::shared_mutex mutex_;
 
   // Shard index within 'cache_'.
   int32_t shardId_;
@@ -306,19 +355,17 @@ class SsdFile {
   // Number of kRegionSize regions in the file.
   int32_t numRegions_{0};
 
-  // True if stopped serving traffic. Happens if no evictions are
-  // possible due to everything being pinned. Clears when pins
-  // decrease and space can be cleared.
+  // True if stopped serving traffic. Happens if no evictions are possible due
+  // to everything being pinned. Clears when pins decrease and space can be
+  // cleared.
   bool suspended_{false};
 
-  // Maximum size of the backing file in kRegionSize units.
-  const int32_t maxRegions_;
+  // Number of used bytes in each region. A new entry must fit between the
+  // offset and the end of the region. This is subscripted with the region
+  // index. The regionIndex times kRegionSize is an offset into the file.
+  std::vector<uint32_t> regionSizes_;
 
-  // Number of used bytes in in each region. A new entry must fit
-  // between the offset and the end of the region. This is subscripted
-  // with the region index. The regionIndex times kRegionSize is an
-  // offset into the file.
-  std::vector<uint32_t> regionSize_;
+  std::vector<uint32_t> erasedRegionSizes_;
 
   // Indices of regions available for writing new entries.
   std::vector<int32_t> writableRegions_;
@@ -331,9 +378,6 @@ class SsdFile {
 
   // Map of file number and offset to location in file.
   folly::F14FastMap<FileCacheKey, SsdRun> entries_;
-
-  // Name of backing file.
-  const std::string filename_;
 
   // File descriptor. 0 (stdin) means file not open.
   int32_t fd_{0};
@@ -353,13 +397,13 @@ class SsdFile {
   int64_t checkpointIntervalBytes_{0};
 
   // Executor for async fsync in checkpoint.
-  folly::Executor* FOLLY_NULLABLE executor_;
+  folly::Executor* executor_;
 
   // Count of bytes written after last checkpoint.
   std::atomic<uint64_t> bytesAfterCheckpoint_{0};
 
   // fd for logging evictions.
-  int32_t evictLogFd_{0};
+  int32_t evictLogFd_{-1};
 
   // True if there was an error with checkpoint and the checkpoint was deleted.
   bool checkpointDeleted_{false};

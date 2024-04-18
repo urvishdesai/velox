@@ -16,11 +16,13 @@
 
 #pragma once
 
+#include "velox/common/base/RandomUtil.h"
 #include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 #include "velox/dwio/common/TypeWithId.h"
 #include "velox/dwio/dwrf/common/Compression.h"
+#include "velox/dwio/dwrf/common/Decryption.h"
 #include "velox/dwio/dwrf/common/FileMetadata.h"
 #include "velox/dwio/dwrf/common/Statistics.h"
 #include "velox/dwio/dwrf/reader/StripeMetadataCache.h"
@@ -64,11 +66,13 @@ class ReaderBase {
       std::unique_ptr<dwio::common::BufferedInput> input,
       std::shared_ptr<dwio::common::encryption::DecrypterFactory>
           decryptorFactory = nullptr,
-      uint64_t directorySizeGuess =
-          dwio::common::ReaderOptions::kDefaultDirectorySizeGuess,
+      uint64_t footerEstimatedSize =
+          dwio::common::ReaderOptions::kDefaultFooterEstimatedSize,
       uint64_t filePreloadThreshold =
           dwio::common::ReaderOptions::kDefaultFilePreloadThreshold,
-      dwio::common::FileFormat fileFormat = dwio::common::FileFormat::DWRF);
+      dwio::common::FileFormat fileFormat = dwio::common::FileFormat::DWRF,
+      bool fileColumnNamesReadAsLowerCase = false,
+      std::shared_ptr<random::RandomSkipTracker> randomSkip = nullptr);
 
   ReaderBase(
       memory::MemoryPool& pool,
@@ -93,7 +97,6 @@ class ReaderBase {
             std::dynamic_pointer_cast<const RowType>(convertType(*footer_))},
         fileLength_{0},
         psLength_{0} {
-    DWIO_ENSURE(footer_->getDwrfPtr()->GetArena());
     DWIO_ENSURE_NOT_NULL(schema_, "invalid schema");
     if (!handler_) {
       handler_ = encryption::DecryptionHandler::create(*footer);
@@ -117,8 +120,12 @@ class ReaderBase {
     return *footer_;
   }
 
-  const std::shared_ptr<const RowType>& getSchema() const {
+  const RowTypePtr& getSchema() const {
     return schema_;
+  }
+
+  void setSchema(const RowTypePtr& newSchema) {
+    schema_ = newSchema;
   }
 
   const std::shared_ptr<const dwio::common::TypeWithId>& getSchemaWithId()
@@ -141,8 +148,8 @@ class ReaderBase {
     return *handler_;
   }
 
-  uint64_t getDirectorySizeGuess() const {
-    return directorySizeGuess_;
+  uint64_t getFooterEstimatedSize() const {
+    return footerEstimatedSize_;
   }
 
   uint64_t getFileLength() const {
@@ -158,13 +165,13 @@ class ReaderBase {
   uint64_t getCompressionBlockSize() const {
     return postScript_->hasCompressionBlockSize()
         ? postScript_->compressionBlockSize()
-        : dwio::common::DEFAULT_COMPRESSION_BLOCK_SIZE;
+        : common::DEFAULT_COMPRESSION_BLOCK_SIZE;
   }
 
-  dwio::common::CompressionKind getCompressionKind() const {
+  common::CompressionKind getCompressionKind() const {
     return postScript_->hasCompressionBlockSize()
         ? postScript_->compression()
-        : dwio::common::CompressionKind::CompressionKind_NONE;
+        : common::CompressionKind::CompressionKind_NONE;
   }
 
   WriterVersion getWriterVersion() const {
@@ -225,10 +232,15 @@ class ReaderBase {
     return postScript_->format();
   }
 
+  const std::shared_ptr<random::RandomSkipTracker>& randomSkip() const {
+    return randomSkip_;
+  }
+
  private:
   static std::shared_ptr<const Type> convertType(
       const FooterWrapper& footer,
-      uint32_t index = 0);
+      uint32_t index = 0,
+      bool fileColumnNamesReadAsLowerCase = false);
 
   memory::MemoryPool& pool_;
   std::unique_ptr<google::protobuf::Arena> arena_;
@@ -238,12 +250,13 @@ class ReaderBase {
   // Keeps factory alive for possibly async prefetch.
   std::shared_ptr<dwio::common::encryption::DecrypterFactory> decryptorFactory_;
   std::unique_ptr<encryption::DecryptionHandler> handler_;
-  const uint64_t directorySizeGuess_{
-      dwio::common::ReaderOptions::kDefaultDirectorySizeGuess};
+  const uint64_t footerEstimatedSize_{
+      dwio::common::ReaderOptions::kDefaultFooterEstimatedSize};
   const uint64_t filePreloadThreshold_{
       dwio::common::ReaderOptions::kDefaultFilePreloadThreshold};
 
   std::unique_ptr<dwio::common::BufferedInput> input_;
+  const std::shared_ptr<random::RandomSkipTracker> randomSkip_;
   RowTypePtr schema_;
   // Lazily populated
   mutable std::shared_ptr<const dwio::common::TypeWithId> schemaWithId_;

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
+#include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
@@ -31,6 +32,19 @@ TEST_F(AssertQueryBuilderTest, basic) {
 
   AssertQueryBuilder(PlanBuilder().values({data}).planNode())
       .assertResults(data);
+}
+
+TEST_F(AssertQueryBuilderTest, singleThreaded) {
+  auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
+
+  PlanBuilder builder;
+  const auto& plan = builder.values({data}).planNode();
+
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .singleThreaded(true)
+      .assertResults("VALUES (1), (2), (3)");
+
+  AssertQueryBuilder(plan).singleThreaded(true).assertResults(data);
 }
 
 TEST_F(AssertQueryBuilderTest, orderedResults) {
@@ -69,13 +83,13 @@ TEST_F(AssertQueryBuilderTest, hiveSplits) {
   auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
 
   auto file = TempFilePath::create();
-  writeToFile(file->path, {data});
+  writeToFile(file->getPath(), {data});
 
   // Single leaf node.
   AssertQueryBuilder(
       PlanBuilder().tableScan(asRowType(data->type())).planNode(),
       duckDbQueryRunner_)
-      .split(makeHiveConnectorSplit(file->path))
+      .split(makeHiveConnectorSplit(file->getPath()))
       .assertResults("VALUES (1), (2), (3)");
 
   // Split with partition key.
@@ -85,13 +99,14 @@ TEST_F(AssertQueryBuilderTest, hiveSplits) {
 
   AssertQueryBuilder(
       PlanBuilder()
-          .tableScan(
-              ROW({"c0", "ds"}, {INTEGER(), VARCHAR()}),
-              makeTableHandle(),
-              assignments)
+          .startTableScan()
+          .outputType(ROW({"c0", "ds"}, {INTEGER(), VARCHAR()}))
+          .tableHandle(makeTableHandle())
+          .assignments(assignments)
+          .endTableScan()
           .planNode(),
       duckDbQueryRunner_)
-      .split(HiveConnectorSplitBuilder(file->path)
+      .split(HiveConnectorSplitBuilder(file->getPath())
                  .partitionKey("ds", "2022-05-10")
                  .build())
       .assertResults(
@@ -100,7 +115,7 @@ TEST_F(AssertQueryBuilderTest, hiveSplits) {
   // Two leaf nodes.
   auto buildData = makeRowVector({makeFlatVector<int32_t>({2, 3})});
   auto buildFile = TempFilePath::create();
-  writeToFile(buildFile->path, {buildData});
+  writeToFile(buildFile->getPath(), {buildData});
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId probeScanId;
@@ -122,8 +137,8 @@ TEST_F(AssertQueryBuilderTest, hiveSplits) {
                       .planNode();
 
   AssertQueryBuilder(joinPlan, duckDbQueryRunner_)
-      .split(probeScanId, makeHiveConnectorSplit(file->path))
-      .split(buildScanId, makeHiveConnectorSplit(buildFile->path))
+      .split(probeScanId, makeHiveConnectorSplit(file->getPath()))
+      .split(buildScanId, makeHiveConnectorSplit(buildFile->getPath()))
       .assertResults("SELECT 2");
 }
 

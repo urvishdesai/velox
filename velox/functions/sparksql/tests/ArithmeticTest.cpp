@@ -71,6 +71,20 @@ TEST_F(PmodTest, int64) {
   EXPECT_EQ(0, pmod<int64_t>(INT64_MIN, -1));
 }
 
+TEST_F(PmodTest, float) {
+  EXPECT_FLOAT_EQ(0.2, pmod<float>(0.5, 0.3).value());
+  EXPECT_FLOAT_EQ(0.9, pmod<float>(-1.1, 2).value());
+  EXPECT_EQ(std::nullopt, pmod<float>(2.14159, 0.0));
+  EXPECT_DOUBLE_EQ(0.1, pmod<double>(0.7, -0.3).value());
+}
+
+TEST_F(PmodTest, double) {
+  EXPECT_DOUBLE_EQ(0.2, pmod<double>(0.5, 0.3).value());
+  EXPECT_DOUBLE_EQ(0.9, pmod<double>(-1.1, 2).value());
+  EXPECT_EQ(std::nullopt, pmod<double>(2.14159, 0.0));
+  EXPECT_DOUBLE_EQ(0.1, pmod<double>(0.7, -0.3).value());
+}
+
 class RemainderTest : public SparkFunctionBaseTest {
  protected:
   template <typename T>
@@ -133,6 +147,7 @@ class ArithmeticTest : public SparkFunctionBaseTest {
   }
 
   static constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+  static constexpr double kNanDouble = std::numeric_limits<double>::quiet_NaN();
   static constexpr float kInf = std::numeric_limits<float>::infinity();
 };
 
@@ -183,6 +198,95 @@ TEST_F(ArithmeticTest, Divide) {
   EXPECT_TRUE(std::isnan(divide(kInf, -kInf).value_or(0)));
 }
 
+TEST_F(ArithmeticTest, acosh) {
+  const auto acosh = [&](std::optional<double> a) {
+    return evaluateOnce<double>("acosh(c0)", a);
+  };
+
+  EXPECT_EQ(acosh(1), 0);
+  EXPECT_TRUE(std::isnan(acosh(0).value_or(0)));
+  EXPECT_EQ(acosh(kInf), kInf);
+  EXPECT_EQ(acosh(std::nullopt), std::nullopt);
+  EXPECT_TRUE(std::isnan(acosh(kNan).value_or(0)));
+}
+
+TEST_F(ArithmeticTest, asinh) {
+  const auto asinh = [&](std::optional<double> a) {
+    return evaluateOnce<double>("asinh(c0)", a);
+  };
+
+  EXPECT_EQ(asinh(0), 0);
+  EXPECT_EQ(asinh(kInf), kInf);
+  EXPECT_EQ(asinh(-kInf), -kInf);
+  EXPECT_EQ(asinh(std::nullopt), std::nullopt);
+  EXPECT_TRUE(std::isnan(asinh(kNan).value_or(0)));
+}
+
+TEST_F(ArithmeticTest, atanh) {
+  const auto atanh = [&](std::optional<double> a) {
+    return evaluateOnce<double>("atanh(c0)", a);
+  };
+
+  EXPECT_EQ(atanh(0), 0);
+  EXPECT_EQ(atanh(1), kInf);
+  EXPECT_EQ(atanh(-1), -kInf);
+  EXPECT_TRUE(std::isnan(atanh(1.1).value_or(0)));
+  EXPECT_TRUE(std::isnan(atanh(-1.1).value_or(0)));
+  EXPECT_EQ(atanh(std::nullopt), std::nullopt);
+  EXPECT_TRUE(std::isnan(atanh(kNan).value_or(0)));
+}
+
+TEST_F(ArithmeticTest, sec) {
+  const auto sec = [&](std::optional<double> a) {
+    return evaluateOnce<double>("sec(c0)", a);
+  };
+
+  EXPECT_EQ(sec(0), 1);
+  EXPECT_EQ(sec(std::nullopt), std::nullopt);
+  EXPECT_TRUE(std::isnan(sec(kNan).value_or(0)));
+}
+
+TEST_F(ArithmeticTest, csc) {
+  const auto csc = [&](std::optional<double> a) {
+    return evaluateOnce<double>("csc(c0)", a);
+  };
+
+  EXPECT_EQ(csc(0), kInf);
+  EXPECT_EQ(csc(std::nullopt), std::nullopt);
+  EXPECT_TRUE(std::isnan(csc(kNan).value_or(0)));
+}
+
+TEST_F(ArithmeticTest, cosh) {
+  const auto cosh = [&](std::optional<double> a) {
+    return evaluateOnce<double>("cosh(c0)", a);
+  };
+
+  EXPECT_EQ(cosh(0), 1);
+  EXPECT_EQ(cosh(kInf), kInf);
+  EXPECT_EQ(cosh(-kInf), kInf);
+  EXPECT_EQ(cosh(std::nullopt), std::nullopt);
+  EXPECT_TRUE(std::isnan(cosh(kNan).value_or(0)));
+}
+
+TEST_F(ArithmeticTest, unhex) {
+  const auto unhex = [&](std::optional<std::string> a) {
+    return evaluateOnce<std::string>("unhex(c0)", a);
+  };
+
+  EXPECT_EQ(unhex("737472696E67"), "string");
+  EXPECT_EQ(unhex(""), "");
+  EXPECT_EQ(unhex("23"), "#");
+  EXPECT_EQ(unhex("123"), "\x01#");
+  EXPECT_EQ(unhex("b23"), "\x0B#");
+  EXPECT_EQ(unhex("b2323"), "\x0B##");
+  EXPECT_EQ(unhex("F"), "\x0F");
+  EXPECT_EQ(unhex("ff"), "\xFF");
+  EXPECT_EQ(unhex("G"), std::nullopt);
+  EXPECT_EQ(unhex("GG"), std::nullopt);
+  EXPECT_EQ(unhex("G23"), std::nullopt);
+  EXPECT_EQ(unhex("E4B889E9878DE79A84"), "\u4E09\u91CD\u7684");
+}
+
 class CeilFloorTest : public SparkFunctionBaseTest {
  protected:
   template <typename T>
@@ -222,6 +326,169 @@ TEST_F(CeilFloorTest, Limits) {
   EXPECT_EQ(
       std::numeric_limits<int64_t>::min(),
       floor<double>(-std::numeric_limits<double>::infinity()));
+}
+
+TEST_F(ArithmeticTest, sinh) {
+  const auto sinh = [&](std::optional<double> a) {
+    return evaluateOnce<double>("sinh(c0)", a);
+  };
+
+  EXPECT_EQ(sinh(0), 0);
+  EXPECT_EQ(sinh(kInf), kInf);
+  EXPECT_EQ(sinh(-kInf), -kInf);
+  EXPECT_EQ(sinh(std::nullopt), std::nullopt);
+  EXPECT_TRUE(std::isnan(sinh(kNan).value_or(0)));
+}
+
+TEST_F(ArithmeticTest, log1p) {
+  const double kE = std::exp(1);
+
+  static const auto log1p = [&](std::optional<double> a) {
+    return evaluateOnce<double>("log1p(c0)", a);
+  };
+
+  EXPECT_EQ(log1p(0), 0);
+  EXPECT_EQ(log1p(kE - 1), 1);
+  EXPECT_EQ(log1p(kInf), kInf);
+  EXPECT_TRUE(std::isnan(log1p(kNan).value_or(0)));
+}
+
+class BinTest : public SparkFunctionBaseTest {
+ protected:
+  std::optional<std::string> bin(std::optional<std::int64_t> arg) {
+    return evaluateOnce<std::string, int64_t>("bin(c0)", {arg}, {BIGINT()});
+  }
+};
+
+TEST_F(BinTest, bin) {
+  EXPECT_EQ(bin(std::nullopt), std::nullopt);
+  EXPECT_EQ(bin(13), "1101");
+  EXPECT_EQ(
+      bin(-13),
+      "1111111111111111111111111111111111111111111111111111111111110011");
+  EXPECT_EQ(
+      bin(std::numeric_limits<int64_t>::max()),
+      "111111111111111111111111111111111111111111111111111111111111111");
+  EXPECT_EQ(bin(0), "0");
+  auto result = evaluateOnce<std::string, int64_t>(
+      "bin(row_constructor(c0).c1)", {13}, {BIGINT()});
+  EXPECT_EQ(result, "1101");
+}
+
+TEST_F(ArithmeticTest, hypot) {
+  const auto hypot = [&](std::optional<double> a, std::optional<double> b) {
+    return evaluateOnce<double>("hypot(c0, c1)", a, b);
+  };
+
+  EXPECT_EQ(hypot(3, 4), 5);
+  EXPECT_EQ(hypot(-3, -4), 5);
+  EXPECT_EQ(hypot(3.0, -4.0), 5.0);
+  EXPECT_DOUBLE_EQ(5.70087712549569, hypot(3.5, 4.5).value());
+  EXPECT_DOUBLE_EQ(5.70087712549569, hypot(3.5, -4.5).value());
+}
+
+TEST_F(ArithmeticTest, cot) {
+  const auto cot = [&](std::optional<double> a) {
+    return evaluateOnce<double>("cot(c0)", a);
+  };
+
+  EXPECT_EQ(cot(0), kInf);
+  EXPECT_TRUE(std::isnan(cot(kNan).value_or(0)));
+  EXPECT_EQ(cot(1), 1 / std::tan(1));
+  EXPECT_EQ(cot(-1), 1 / std::tan(-1));
+  EXPECT_EQ(cot(0), 1 / std::tan(0));
+}
+
+TEST_F(ArithmeticTest, atan2) {
+  const auto atan2 = [&](std::optional<double> y, std::optional<double> x) {
+    return evaluateOnce<double>("atan2(c0, c1)", y, x);
+  };
+
+  EXPECT_EQ(atan2(0.0, 0.0), 0.0);
+  EXPECT_EQ(atan2(-0.0, -0.0), 0.0);
+  EXPECT_EQ(atan2(0.0, -0.0), 0.0);
+  EXPECT_EQ(atan2(-0.0, 0.0), 0.0);
+  EXPECT_EQ(atan2(-1.0, 1.0), std::atan2(-1.0, 1.0));
+  EXPECT_EQ(atan2(1.0, 1.0), std::atan2(1.0, 1.0));
+  EXPECT_EQ(atan2(1.0, -1.0), std::atan2(1.0, -1.0));
+  EXPECT_EQ(atan2(-1.0, -1.0), std::atan2(-1.0, -1.0));
+}
+
+TEST_F(ArithmeticTest, isNanFloat) {
+  const auto isNan = [&](std::optional<float> a) {
+    return evaluateOnce<bool>("isnan(c0)", a);
+  };
+
+  EXPECT_EQ(false, isNan(0.0f));
+  EXPECT_EQ(true, isNan(kNan));
+  EXPECT_EQ(true, isNan(0.0f / 0.0f));
+  EXPECT_EQ(false, isNan(std::nullopt));
+}
+
+TEST_F(ArithmeticTest, isNanDouble) {
+  const auto isNan = [&](std::optional<double> a) {
+    return evaluateOnce<bool>("isnan(c0)", a);
+  };
+
+  EXPECT_EQ(false, isNan(0.0));
+  EXPECT_EQ(true, isNan(kNanDouble));
+  EXPECT_EQ(true, isNan(0.0 / 0.0));
+  EXPECT_EQ(false, isNan(std::nullopt));
+}
+
+TEST_F(ArithmeticTest, hexWithBigint) {
+  const auto toHex = [&](std::optional<int64_t> value) {
+    return evaluateOnce<std::string>("hex(c0)", value);
+  };
+  EXPECT_EQ("11", toHex(17));
+  EXPECT_EQ("FFFFFFFFFFFFFFEF", toHex(-17));
+  EXPECT_EQ("0", toHex(0));
+  EXPECT_EQ("FFFFFFFFFFFFFFFF", toHex(-1));
+  EXPECT_EQ("7FFFFFFFFFFFFFFF", toHex(INT64_MAX));
+  EXPECT_EQ("8000000000000000", toHex(INT64_MIN));
+}
+
+TEST_F(ArithmeticTest, hexWithVarbinaryAndVarchar) {
+  const auto toHex = [&](std::optional<std::string> value) {
+    auto varbinaryResult =
+        evaluateOnce<std::string>("hex(cast(c0 as varbinary))", value);
+    auto varcharResult = evaluateOnce<std::string>("hex(c0)", value);
+
+    EXPECT_TRUE(varbinaryResult.has_value());
+    EXPECT_TRUE(varcharResult.has_value());
+    EXPECT_EQ(varbinaryResult.value(), varcharResult.value());
+
+    return varcharResult.value();
+  };
+  ASSERT_EQ(toHex(""), "");
+  ASSERT_EQ(toHex("Spark SQL"), "537061726B2053514C");
+  ASSERT_EQ(toHex("Spark\x65\x21SQL"), "537061726B652153514C");
+  ASSERT_EQ(toHex("Spark\u6570\u636ESQL"), "537061726BE695B0E68DAE53514C");
+}
+
+class LogNTest : public SparkFunctionBaseTest {
+ protected:
+  static constexpr float kInf = std::numeric_limits<double>::infinity();
+};
+
+TEST_F(LogNTest, log2) {
+  const auto log2 = [&](std::optional<double> a) {
+    return evaluateOnce<double>("log2(c0)", a);
+  };
+  EXPECT_EQ(log2(8), 3.0);
+  EXPECT_EQ(log2(-1.0), std::nullopt);
+  EXPECT_EQ(log2(0.0), std::nullopt);
+  EXPECT_EQ(log2(kInf), kInf);
+}
+
+TEST_F(LogNTest, log10) {
+  const auto log10 = [&](std::optional<double> a) {
+    return evaluateOnce<double>("log10(c0)", a);
+  };
+  EXPECT_EQ(log10(100), 2.0);
+  EXPECT_EQ(log10(0.0), std::nullopt);
+  EXPECT_EQ(log10(-1.0), std::nullopt);
+  EXPECT_EQ(log10(kInf), kInf);
 }
 
 } // namespace

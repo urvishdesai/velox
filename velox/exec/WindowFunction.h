@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/core/QueryConfig.h"
 #include "velox/exec/WindowPartition.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/vector/BaseVector.h"
@@ -41,6 +42,10 @@ class WindowFunction {
         stringAllocator_(stringAllocator) {}
 
   virtual ~WindowFunction() = default;
+
+  // Row number to use in WindowPartition::extractColumn to request a NULL
+  // value.
+  static constexpr vector_size_t kNullRow = -1;
 
   const TypePtr& resultType() const {
     return resultType_;
@@ -100,15 +105,20 @@ class WindowFunction {
       const std::string& name,
       const std::vector<WindowFunctionArg>& args,
       const TypePtr& resultType,
+      bool ignoreNulls,
       memory::MemoryPool* pool,
-      HashStringAllocator* stringAllocator);
+      HashStringAllocator* stringAllocator,
+      const core::QueryConfig& config);
 
  protected:
-  // This utility function can be used across WindowFunctions to set NULL for
-  // rows with invalid frames in the input.
-  void setNullEmptyFramesResults(
+  // defaultResult is a vector of size 1 containing the default value to be
+  // returned for rows with empty frames. For aggregate window functions,
+  // defaultResult contains the value returned by the aggregate when there are
+  // no input rows.
+  void setEmptyFramesResult(
       const SelectivityVector& validRows,
       vector_size_t resultOffset,
+      const VectorPtr& defaultResult,
       const VectorPtr& result);
 
   const TypePtr resultType_;
@@ -128,8 +138,10 @@ class WindowFunction {
 using WindowFunctionFactory = std::function<std::unique_ptr<WindowFunction>(
     const std::vector<WindowFunctionArg>& args,
     const TypePtr& resultType,
+    bool ignoreNulls,
     memory::MemoryPool* pool,
-    HashStringAllocator* stringAllocator)>;
+    HashStringAllocator* stringAllocator,
+    const core::QueryConfig& config)>;
 
 /// Register a window function with the specified name and signatures.
 /// Registering a function with the same name a second time overrides the first

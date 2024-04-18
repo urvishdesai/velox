@@ -15,8 +15,16 @@
  */
 #include "velox/parse/QueryPlanner.h"
 #include "velox/duckdb/conversion/DuckConversion.h"
-#include "velox/external/duckdb/duckdb.hpp"
 #include "velox/parse/DuckLogicalOperator.h"
+
+#include <duckdb.hpp> // @manual
+#include <duckdb/main/connection.hpp> // @manual
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp> // @manual
+#include <duckdb/planner/expression/bound_cast_expression.hpp> // @manual
+#include <duckdb/planner/expression/bound_comparison_expression.hpp> // @manual
+#include <duckdb/planner/expression/bound_constant_expression.hpp> // @manual
+#include <duckdb/planner/expression/bound_function_expression.hpp> // @manual
+#include <duckdb/planner/expression/bound_reference_expression.hpp> // @manual
 
 namespace facebook::velox::core {
 
@@ -291,7 +299,7 @@ PlanNodePtr toVeloxPlan(
     memory::MemoryPool* pool,
     std::vector<PlanNodePtr> sources,
     QueryContext& queryContext) {
-  std::vector<CallTypedExprPtr> aggregates;
+  std::vector<AggregationNode::Aggregate> aggregates;
 
   std::vector<std::string> projectNames;
   std::vector<TypedExprPtr> projections;
@@ -301,9 +309,11 @@ PlanNodePtr toVeloxPlan(
     auto call = std::dynamic_pointer_cast<const CallTypedExpr>(
         toVeloxExpression(*expression, sources[0]->outputType()));
     std::vector<TypedExprPtr> fieldInputs;
+    std::vector<TypePtr> rawInputTypes;
 
     for (auto& input : call->inputs()) {
       projections.push_back(input);
+      rawInputTypes.push_back(input->type());
 
       if (auto field =
               std::dynamic_pointer_cast<const FieldAccessTypedExpr>(input)) {
@@ -317,8 +327,14 @@ PlanNodePtr toVeloxPlan(
       }
     }
 
-    aggregates.push_back(std::make_shared<CallTypedExpr>(
-        call->type(), fieldInputs, call->name()));
+    aggregates.push_back({
+        std::make_shared<CallTypedExpr>(
+            call->type(), fieldInputs, call->name()),
+        rawInputTypes,
+        nullptr, // mask
+        {}, // sortingKeys
+        {} // sortingOrders
+    });
   }
 
   std::vector<FieldAccessTypedExprPtr> groupingKeys;
@@ -359,8 +375,7 @@ PlanNodePtr toVeloxPlan(
       groupingKeys,
       std::vector<FieldAccessTypedExprPtr>{}, // preGroupedKeys
       names,
-      aggregates,
-      std::vector<FieldAccessTypedExprPtr>{}, // aggregateMasks
+      std::move(aggregates),
       false, // ignoreNullKeys
       source);
 }
@@ -386,7 +401,7 @@ PlanNodePtr toVeloxPlan(
     types.push_back(rightInputType.childAt(i));
   }
 
-  return std::make_shared<CrossJoinNode>(
+  return std::make_shared<NestedLoopJoinNode>(
       queryContext.nextNodeId(),
       std::move(sources[0]),
       std::move(sources[1]),
@@ -509,7 +524,8 @@ void DuckDbQueryPlanner::registerTable(
   auto createTableSql =
       duckdb::makeCreateTableSql(name, *asRowType(data[0]->type()));
   auto res = conn_.Query(createTableSql);
-  VELOX_CHECK(res->success, "Failed to create DuckDB table: {}", res->error);
+  VELOX_CHECK(
+      !res->HasError(), "Failed to create DuckDB table: {}", res->GetError());
 
   tables_.insert({name, data});
 }
@@ -518,7 +534,7 @@ void DuckDbQueryPlanner::registerScalarFunction(
     const std::string& name,
     const std::vector<TypePtr>& argTypes,
     const TypePtr& returnType) {
-  std::vector<::duckdb::LogicalType> argDuckTypes;
+  ::duckdb::vector<::duckdb::LogicalType> argDuckTypes;
   for (auto& type : argTypes) {
     argDuckTypes.push_back(duckdb::fromVeloxType(type));
   }
@@ -534,7 +550,7 @@ void DuckDbQueryPlanner::registerAggregateFunction(
     const std::string& name,
     const std::vector<TypePtr>& argTypes,
     const TypePtr& returnType) {
-  std::vector<::duckdb::LogicalType> argDuckTypes;
+  ::duckdb::vector<::duckdb::LogicalType> argDuckTypes;
   for (auto& type : argTypes) {
     argDuckTypes.push_back(duckdb::fromVeloxType(type));
   }

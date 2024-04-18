@@ -1,6 +1,119 @@
 =====================================
-Date and Time Functions
+Date and Time Functions and Operators
 =====================================
+
+Date and Time Operators
+-----------------------
+
+.. list-table::
+   :widths: 15 60 25
+   :header-rows: 1
+
+   * - Operator
+     - Example
+     - Result
+   * - ``+``
+     - ``interval '1' second + interval '1' hour``
+     - ``0 01:00:01.000``
+   * - ``+``
+     - ``timestamp '1970-01-01 00:00:00.000' + interval '1' second``
+     - ``1970-01-01 00:00:01.000``
+   * - ``-``
+     - ``interval '1' hour - interval '1' second``
+     - ``0 00:59:59.000``
+   * - ``-``
+     - ``timestamp '1970-01-01 00:00:00.000' - interval '1' second``
+     - ``1969-12-31 23:59:59.000``
+   * - ``*``
+     - ``interval '1' second * 2``
+     - ``0 00:00:02.000``
+   * - ``*``
+     - ``2 * interval '1' second``
+     - ``0 00:00:02.000``
+   * - ``*``
+     - ``interval '1' second * 0.001``
+     - ``0 00:00:00.001``
+   * - ``*``
+     - ``0.001 * interval '1' second``
+     - ``0 00:00:00.001``
+   * - ``/``
+     - ``interval '15' second / 1.5``
+     - ``0 00:00:10.000``
+
+.. function:: plus(x, y) -> [same as x]
+
+    Returns the sum of ``x`` and ``y``. Both ``x`` and ``y`` are intervals day
+    to second or one of them can be timestamp. For addition of two intervals day to
+    second, returns ``-106751991167 07:12:55.808`` when the addition overflows
+    in positive and returns ``106751991167 07:12:55.807`` when the addition
+    overflows in negative. When addition of a timestamp with an interval day to
+    second, overflowed results are wrapped around.
+
+.. function:: minus(x, y) -> [same as x]
+
+    Returns the result of subtracting ``y`` from ``x``. Both ``x`` and ``y``
+    are intervals day to second or ``x`` can be timestamp. For subtraction of
+    two intervals day to second, returns ``-106751991167 07:12:55.808`` when
+    the subtraction overflows in positive and returns ``106751991167 07:12:55.807``
+    when the subtraction overflows in negative. For subtraction of an interval
+    day to second from a timestamp, overflowed results are wrapped around.
+
+.. function:: multiply(interval day to second, x) -> interval day to second
+
+    Returns the result of multiplying ``interval day to second`` by ``x``.
+    ``x`` can be a bigint or double. Returns ``0`` when ``x`` is NaN. Returns
+    ``106751991167 07:12:55.807`` when ``x`` is infinity or when the
+    multiplication overflow in positive. Returns ``-106751991167 07:12:55.808``
+    when ``x`` is -infinity or when the multiplication overflow in negiative.
+
+.. function:: multiply(x, interval day to second) -> interval day to second
+
+    Returns the result of multiplying ``x`` by ``interval day to second``.
+    Same as ``multiply(interval day to second, x)``.
+
+.. function:: divide(interval day to second, x) -> interval day to second
+
+    Returns the result of ``interval day to second`` divided by ``x``. ``x`` is
+    a double. Returns ``0`` when ``x`` is NaN or is infinity. Returns
+    ``106751991167 07:12:55.807`` when ``x`` is ``0.0`` and
+    ``interval day to second`` is not ``0``, or when the division overflows in
+    positive. Returns ``-106751991167 07:12:55.808`` when ``x`` is ``-0.0`` and
+    ``interval day to second`` is not ``0``, or when the division overflows in
+    negiative.
+
+Date and Time Functions
+-----------------------
+
+.. function:: current_date() -> date
+
+    Returns the current date.
+
+.. function:: date(x) -> date
+
+    This is an alias for ``CAST(x AS date)``.
+
+.. function:: from_iso8601_date(string) -> date
+
+    Parses the ISO 8601 formatted ``string`` into a ``date``.
+    ISO 8601 ``string`` can be formatted as any of the following:
+    ``[+-][Y]Y*``
+
+    ``[+-][Y]Y*-[M]M*``
+
+    ``[+-][Y]Y*-[M]M*-[D]D*``
+
+    ``[+-][Y]Y*-[M]M*-[D]D* *``
+
+    Year value must contain at least one digit, and may contain up to six digits.
+    Month and day values are optional and may each contain one or two digits.
+
+    Examples of supported input strings:
+    "2012",
+    "2012-4",
+    "2012-04",
+    "2012-4-7",
+    "2012-04-07",
+    "2012-04-07  ”
 
 .. function:: from_unixtime(unixtime) -> timestamp
 
@@ -11,6 +124,10 @@ Date and Time Functions
 
     Returns the UNIX timestamp ``unixtime`` as a timestamp with time zone
     using ``string`` for the time zone.
+
+.. function:: to_iso8601(x) -> varchar
+
+    Formats ``x`` as an ISO 8601 string. Supported types for ``x`` are: DATE.
 
 .. function:: to_unixtime(timestamp) -> double
 
@@ -28,6 +145,7 @@ Unit        Example Truncated Value
 ``minute``  ``2001-08-22 03:04:00.000``
 ``hour``    ``2001-08-22 03:00:00.000``
 ``day``     ``2001-08-22 00:00:00.000``
+``week``    ``2001-08-20 00:00:00.000``
 ``month``   ``2001-08-01 00:00:00.000``
 ``quarter`` ``2001-07-01 00:00:00.000``
 ``year``    ``2001-01-01 00:00:00.000``
@@ -59,7 +177,7 @@ Unit            Description
 
 .. function:: date_add(unit, value, x) -> x
 
-    Adds an interval ``value`` of type ``unit`` to ``x``. The supported types for ``x`` are TIMESTAMP and DATE.
+    Adds an interval ``value`` of type ``unit`` to ``x``. The supported types for ``x`` are TIMESTAMP, DATE, and TIMESTAMP WITH TIME ZONE.
     Subtraction can be performed by using a negative value.
 
 .. function:: date_diff(unit, x1, x2) -> bigint
@@ -132,7 +250,12 @@ The functions in this section leverage a native cpp implementation that follows
 a format string compatible with JodaTime’s `DateTimeFormat
 <http://joda-time.sourceforge.net/apidocs/org/joda/time/format/DateTimeFormat.html>`_
 pattern format. The symbols currently supported are ``y``, ``Y``, ``M`` , ``d``,
-``H``, ``m``, ``s``, ``S``, and ``Z``.
+``H``, ``m``, ``s``, ``S``, ``z`` and ``Z``.
+
+``z`` represents a timezone name (3-letter format), and ``Z`` a timezone offset
+specified using the format ``+00``, ``+00:00`` or ``+0000`` (or ``-``). ``Z``
+also accepts ``UTC``,  ``UCT``, ``GMT``, and ``GMT0`` as valid representations
+of GMT.
 
 .. function:: parse_datetime(string, format) -> timestamp with time zone
 
@@ -143,14 +266,16 @@ Convenience Extraction Functions
 
 These functions support TIMESTAMP, DATE, and TIMESTAMP WITH TIME ZONE input types.
 
-These functions are implemented using
-`std::gmtime <https://en.cppreference.com/w/c/chrono/gmtime>`_ which raises an
-error when input timestamp is too large (for example, > 100'000'000'000'000'000).
-This behavior is different from Presto Java that allows arbitrary large timestamps.
+For these functions, the input timestamp has range limitations on seconds and nanoseconds.
+Seconds should be in the range [INT64_MIN/1000 - 1, INT64_MAX/1000], nanoseconds should
+be in the range [0, 999999999]. This behavior is different from Presto Java that allows
+arbitrary large timestamps.
 
 .. function:: day(x) -> bigint
 
     Returns the day of the month from ``x``.
+
+    The supported types for ``x`` are DATE, TIMESTAMP, TIMESTAMP WITH TIME ZONE, INTERVAL DAY TO SECOND.
 
 .. function:: day_of_month(x) -> bigint
 
@@ -178,6 +303,10 @@ This behavior is different from Presto Java that allows arbitrary large timestam
 
     Returns the hour of the day from ``x``. The value ranges from 0 to 23.
 
+.. function:: last_day_of_month(x) -> date
+
+    Returns the last day of the month.
+
 .. function:: millisecond(x) -> int64
 
     Returns the millisecond of the second from ``x``.
@@ -197,6 +326,14 @@ This behavior is different from Presto Java that allows arbitrary large timestam
 .. function:: second(x) -> bigint
 
     Returns the second of the minute from ``x``.
+
+.. function:: timezone_hour(timestamp) -> bigint
+
+    Returns the hour of the time zone offset from ``timestamp``.
+
+.. function:: timezone_minute(timestamp) -> bigint
+
+    Returns the minute of the time zone offset from ``timestamp``.
 
 .. function:: week(x) -> bigint
 
@@ -219,3 +356,52 @@ This behavior is different from Presto Java that allows arbitrary large timestam
 .. function:: yow(x) -> bigint
 
     This is an alias for :func:`year_of_week`.
+
+.. _presto-time-zones:
+
+Time Zones
+----------
+
+Velox has full support for time zone rules, which are needed to perform date/time
+calculations correctly. Typically, the session time zone is used for temporal
+calculations. This is the time zone of the client computer that submits the query, if
+available. Otherwise, it is the time zone of the server running the Presto coordinator.
+
+Queries that operate with time zones that follow daylight saving can produce unexpected
+results. For example, if we run the following query in the `America/Los Angeles` time
+zone: ::
+
+        SELECT date_add('hour', 24, cast('2014-03-08 09:00:00' as timestamp));
+        -- 2014-03-09 10:00:00.000
+
+The timestamp appears to only advance 23 hours. This is because on March 9th clocks in
+`America/Los Angeles` are turned forward 1 hour, so March 9th only has 23 hours. To
+advance the day part of the timestamp, use the `day` unit instead: ::
+
+        SELECT date_add('day', 1, cast('2014-03-08 09:00:00' as timestamp));
+        -- 2014-03-09 09:00:00.000
+
+This works because the :func:`date_add` function treats the timestamp as list of fields, adds
+the value to the specified field and then rolls any overflow into the next higher field.
+
+Time zones are also necessary for parsing and printing timestamps. Queries that use this
+functionality can also produce unexpected results. For example, on the same machine: ::
+
+        SELECT cast('2014-03-09 02:30:00' as timestamp);
+
+The above query causes an error because there was no 2:30 AM on March 9th in
+`America/Los_Angeles` due to a daylight saving time transition.
+
+Similarly, the following query has two possible outcomes due to a daylight saving time
+transition: ::
+
+        SELECT cast('2014-11-02 01:30:00' as timestamp);
+        -- 2014-11-02 08:30:00.000
+
+It can be interpreted as `2014-11-02 01:30:00 PDT`, or `2014-11-02 01:30:00 PST`, which are
+`2014-11-02 08:30:00 UTC` or `2014-11-02 09:30:00 UTC` respectively. The former one is
+picked to be consistent with Presto.
+
+**Timezone Name Parsing**: When parsing strings that contain timezone names, the
+list of supported timezones follow the definition `here
+<https://en.wikipedia.org/wiki/List_of_tz_database_time_zones>`_.

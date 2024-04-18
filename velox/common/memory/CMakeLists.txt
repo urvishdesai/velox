@@ -21,19 +21,25 @@ add_library(
   AllocationPool.cpp
   ByteStream.cpp
   HashStringAllocator.cpp
+  MallocAllocator.cpp
   Memory.cpp
   MemoryAllocator.cpp
+  MemoryArbitrator.cpp
   MemoryPool.cpp
-  MemoryUsage.cpp
   MmapAllocator.cpp
   MmapArena.cpp
-  MemoryUsageTracker.cpp
+  SharedArbitrator.cpp
   StreamArena.cpp)
 
 target_link_libraries(
-  velox_memory velox_flag_definitions velox_common_base velox_exception
-  velox_test_util ${FOLLY_WITH_DEPENDENCIES})
-
-if(NOT VELOX_DISABLE_GOOGLETEST)
-  target_link_libraries(velox_memory gtest)
-endif()
+  velox_memory
+  PUBLIC velox_common_base
+         velox_exception
+         velox_flag_definitions
+         velox_time
+         velox_type
+         Folly::folly
+         fmt::fmt
+         gflags::gflags
+         glog::glog
+  PRIVATE velox_test_util re2::re2)

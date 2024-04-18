@@ -12,17 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_library(velox_hive_config OBJECT HiveConfig.cpp)
+target_link_libraries(velox_hive_config velox_core velox_exception)
+
+add_subdirectory(iceberg)
+
 add_library(
   velox_hive_connector OBJECT
-  HiveConfig.cpp HiveConnector.cpp HiveDataSink.cpp HivePartitionUtil.cpp
-  FileHandle.cpp PartitionIdGenerator.cpp)
+  FileHandle.cpp
+  HiveConfig.cpp
+  HiveConnector.cpp
+  HiveConnectorUtil.cpp
+  HiveDataSink.cpp
+  HiveDataSource.cpp
+  HivePartitionUtil.cpp
+  PartitionIdGenerator.cpp
+  SplitReader.cpp
+  TableHandle.cpp)
 
-target_link_libraries(velox_hive_connector velox_connector
-                      velox_dwio_dwrf_reader velox_dwio_dwrf_writer velox_file)
+target_link_libraries(
+  velox_hive_connector
+  PUBLIC velox_hive_iceberg_splitreader
+  PRIVATE velox_common_io
+          velox_connector
+          velox_dwio_catalog_fbhive
+          velox_dwio_dwrf_reader
+          velox_dwio_dwrf_writer
+          velox_dwio_parquet_reader
+          velox_dwio_parquet_writer
+          velox_file
+          velox_hive_partition_function
+          velox_s3fs
+          velox_hdfs
+          velox_gcs
+          velox_abfs)
 
 add_library(velox_hive_partition_function HivePartitionFunction.cpp)
 
-target_link_libraries(velox_hive_partition_function velox_core)
+target_link_libraries(velox_hive_partition_function velox_core velox_exec)
 
 add_subdirectory(storage_adapters)
 

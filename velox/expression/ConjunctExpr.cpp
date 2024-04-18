@@ -15,6 +15,7 @@
  */
 #include "velox/expression/ConjunctExpr.h"
 #include "velox/expression/BooleanMix.h"
+#include "velox/expression/FieldReference.h"
 #include "velox/expression/ScopedVarSetter.h"
 
 namespace facebook::velox::exec {
@@ -75,17 +76,19 @@ void finalizeErrors(
   }
   // Pre-existing errors outside of initial active rows are preserved. Errors in
   // the initial active rows but not in the final active rows are cleared.
-  int32_t numWords = bits::nwords(errors->size());
-  auto errorNulls = errors->mutableNulls(errors->size())->asMutable<uint64_t>();
-  for (int32_t i = 0; i < numWords; ++i) {
-    errorNulls[i] &= ~rows.asRange().bits()[i] | activeRows.asRange().bits()[i];
-    if (throwOnError && errorNulls[i]) {
-      int32_t errorIndex = i * 64 + __builtin_ctzll(errorNulls[i]);
-      if (errorIndex < errors->size() && errorIndex < rows.end()) {
-        auto exceptionPtr = std::static_pointer_cast<std::exception_ptr>(
-            errors->valueAt(errorIndex));
-        std::rethrow_exception(*exceptionPtr);
-      }
+  auto size =
+      std::min(std::min(rows.size(), activeRows.size()), errors->size());
+  for (auto i = 0; i < size; ++i) {
+    if (errors->isNullAt(i)) {
+      continue;
+    }
+    if (rows.isValid(i) && !activeRows.isValid(i)) {
+      errors->setNull(i, true);
+    }
+    if (throwOnError && !errors->isNullAt(i)) {
+      auto exceptionPtr =
+          std::static_pointer_cast<std::exception_ptr>(errors->valueAt(i));
+      std::rethrow_exception(*exceptionPtr);
     }
   }
 }
@@ -102,7 +105,7 @@ void ConjunctExpr::evalSpecialForm(
   auto flatResult = result->asFlatVector<bool>();
   // clear nulls from the result for the active rows.
   if (flatResult->mayHaveNulls()) {
-    auto nulls = flatResult->mutableNulls(rows.end());
+    auto& nulls = flatResult->mutableNulls(rows.end());
     rows.clearNulls(nulls);
   }
   // Initialize result to all true for AND and all false for OR.
@@ -133,6 +136,14 @@ void ConjunctExpr::evalSpecialForm(
     }
 
     SelectivityTimer timer(selectivity_[inputOrder_[i]], numActive);
+    if (evaluatesArgumentsOnNonIncreasingSelection()) {
+      // Exclude loading rows that we know for sure will have a false result.
+      for (auto* field : inputs_[inputOrder_[i]]->distinctFields()) {
+        if (multiplyReferencedFields_.count(field) > 0) {
+          context.ensureFieldLoaded(field->index(context), *activeRows);
+        }
+      }
+    }
     inputs_[inputOrder_[i]]->eval(*activeRows, context, inputResult);
     if (context.errors()) {
       handleErrors = true;
@@ -191,6 +202,59 @@ void ConjunctExpr::maybeReorderInputs() {
   }
 }
 
+namespace {
+// helper functions for conjuncts operating on values, nulls and active rows a
+// word at a time.
+inline void setFalseForOne(uint64_t active, uint64_t source, uint64_t& target) {
+  target &= ~active | ~source;
+}
+
+inline void setTrueForOne(uint64_t active, uint64_t source, uint64_t& target) {
+  target |= active & source;
+}
+
+inline void
+setPresentForOne(uint64_t active, uint64_t source, uint64_t& target) {
+  target |= active & source;
+}
+
+inline void
+setNonPresentForOne(uint64_t active, uint64_t source, uint64_t& target) {
+  target &= ~active | ~source;
+}
+
+inline void updateAnd(
+    uint64_t& resultValue,
+    uint64_t& resultPresent,
+    uint64_t& active,
+    uint64_t testValue,
+    uint64_t testPresent) {
+  auto testFalse = ~testValue & testPresent;
+  setFalseForOne(active, testFalse, resultValue);
+  setPresentForOne(active, testFalse, resultPresent);
+  auto resultTrue = resultValue & resultPresent;
+  setNonPresentForOne(
+      active, resultPresent & resultTrue & ~testPresent, resultPresent);
+  active &= ~testFalse;
+}
+
+inline void updateOr(
+    uint64_t& resultValue,
+    uint64_t& resultPresent,
+    uint64_t& active,
+    uint64_t testValue,
+    uint64_t testPresent) {
+  auto testTrue = testValue & testPresent;
+  setTrueForOne(active, testTrue, resultValue);
+  setPresentForOne(active, testTrue, resultPresent);
+  auto resultFalse = ~resultValue & resultPresent;
+  setNonPresentForOne(
+      active, resultPresent & resultFalse & ~testPresent, resultPresent);
+  active &= ~testTrue;
+}
+
+} // namespace
+
 void ConjunctExpr::updateResult(
     BaseVector* inputResult,
     EvalCtx& context,
@@ -209,7 +273,7 @@ void ConjunctExpr::updateResult(
       &values,
       &nulls)) {
     case BooleanMix::kAllNull:
-      result->addNulls(nullptr, *activeRows);
+      result->addNulls(*activeRows);
       return;
     case BooleanMix::kAllFalse:
       if (isAnd_) {
@@ -244,24 +308,77 @@ void ConjunctExpr::updateResult(
       }
       return;
     default: {
-      bits::forEachSetBit(
-          activeRows->asRange().bits(),
-          activeRows->begin(),
-          activeRows->end(),
-          [&](int32_t row) {
-            if (nulls && bits::isBitNull(nulls, row)) {
-              result->setNull(row, true);
-            } else {
-              bool isTrue = bits::isBitSet(values, row);
-              if (isAnd_ && !isTrue) {
-                result->set(row, false);
-                activeRows->setValid(row, false);
-              } else if (!isAnd_ && isTrue) {
-                result->set(row, true);
-                activeRows->setValid(row, false);
+      uint64_t* resultValues = result->mutableRawValues<uint64_t>();
+      uint64_t* resultNulls = nullptr;
+      if (nulls || result->mayHaveNulls()) {
+        resultNulls = result->mutableRawNulls();
+      }
+      auto* activeBits = activeRows->asMutableRange().bits();
+      if (isAnd_) {
+        bits::forEachWord(
+            activeRows->begin(),
+            activeRows->end(),
+            [&](int32_t index, uint64_t mask) {
+              uint64_t nullWord =
+                  resultNulls ? resultNulls[index] : bits::kNotNull64;
+              uint64_t activeWord = activeBits[index] & mask;
+              updateAnd(
+                  resultValues[index],
+                  nullWord,
+                  activeWord,
+                  values[index],
+                  nulls ? nulls[index] : bits::kNotNull64);
+              if (resultNulls) {
+                resultNulls[index] = nullWord;
               }
-            }
-          });
+              activeBits[index] &= ~mask | activeWord;
+            },
+            [&](int32_t index) {
+              uint64_t nullWord =
+                  resultNulls ? resultNulls[index] : bits::kNotNull64;
+              updateAnd(
+                  resultValues[index],
+                  nullWord,
+                  activeBits[index],
+                  values[index],
+                  nulls ? nulls[index] : bits::kNotNull64);
+              if (resultNulls) {
+                resultNulls[index] = nullWord;
+              }
+            });
+      } else {
+        bits::forEachWord(
+            activeRows->begin(),
+            activeRows->end(),
+            [&](int32_t index, uint64_t mask) {
+              uint64_t nullWord =
+                  resultNulls ? resultNulls[index] : bits::kNotNull64;
+              uint64_t activeWord = activeBits[index] & mask;
+              updateOr(
+                  resultValues[index],
+                  nullWord,
+                  activeWord,
+                  values[index],
+                  nulls ? nulls[index] : bits::kNotNull64);
+              if (resultNulls) {
+                resultNulls[index] = nullWord;
+              }
+              activeBits[index] &= ~mask | activeWord;
+            },
+            [&](int32_t index) {
+              uint64_t nullWord =
+                  resultNulls ? resultNulls[index] : bits::kNotNull64;
+              updateOr(
+                  resultValues[index],
+                  nullWord,
+                  activeBits[index],
+                  values[index],
+                  nulls ? nulls[index] : bits::kNotNull64);
+              if (resultNulls) {
+                resultNulls[index] = nullWord;
+              }
+            });
+      }
       activeRows->updateBounds();
     }
   }
@@ -272,8 +389,8 @@ std::string ConjunctExpr::toSql(
   std::stringstream out;
   out << "(" << inputs_[0]->toSql(complexConstants) << ")";
   for (auto i = 1; i < inputs_.size(); ++i) {
-    out << " " << name_ << " "
-        << "(" << inputs_[i]->toSql(complexConstants) << ")";
+    out << " " << name_ << " " << "(" << inputs_[i]->toSql(complexConstants)
+        << ")";
   }
   return out.str();
 }
@@ -305,7 +422,8 @@ TypePtr ConjunctCallToSpecialForm::resolveType(
 ExprPtr ConjunctCallToSpecialForm::constructSpecialForm(
     const TypePtr& type,
     std::vector<ExprPtr>&& compiledChildren,
-    bool /* trackCpuUsage */) {
+    bool /* trackCpuUsage */,
+    const core::QueryConfig& /*config*/) {
   bool inputsSupportFlatNoNullsFastPath =
       Expr::allSupportFlatNoNullsFastPath(compiledChildren);
 

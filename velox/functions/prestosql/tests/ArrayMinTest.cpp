@@ -15,6 +15,7 @@
  */
 
 #include <optional>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
 
 using namespace facebook::velox;
@@ -36,11 +37,25 @@ class ArrayMinTest : public FunctionBaseTest {
   }
 
   void testDocExample() {
-    auto arrayVector = makeNullableArrayVector<int64_t>(
+    auto input1 = makeNullableArrayVector<int64_t>(
         {{1, 2, 3}, {-1, -2, -2}, {-1, -2, std::nullopt}, {}});
-    auto expected =
+    auto expected1 =
         makeNullableFlatVector<int64_t>({1, -2, std::nullopt, std::nullopt});
-    testExpr<int64_t>(expected, "array_min(C0)", {arrayVector});
+    testExpr<int64_t>(expected1, "array_min(C0)", {input1});
+
+    auto input2 = makeNullableArrayVector<float>(
+        {{std::nullopt, std::numeric_limits<double>::quiet_NaN()},
+         {-1, -2, -3, std::numeric_limits<float>::quiet_NaN()},
+         {-0.0001,
+          std::nullopt,
+          -0.0003,
+          std::numeric_limits<float>::quiet_NaN()}});
+    auto expected2 = makeNullableFlatVector<float>(
+        {std::numeric_limits<float>::quiet_NaN(),
+         std::numeric_limits<float>::quiet_NaN(),
+         std::numeric_limits<float>::quiet_NaN()});
+
+    testExpr<float>(expected2, "array_min(C0)", {input2});
   }
 
   template <typename T>
@@ -145,7 +160,7 @@ class ArrayMinTest : public FunctionBaseTest {
 };
 
 } // namespace
-TEST_F(ArrayMinTest, docArrays) {
+TEST_F(ArrayMinTest, docs) {
   testDocExample();
 }
 
@@ -168,4 +183,86 @@ TEST_F(ArrayMinTest, varcharArrays) {
 TEST_F(ArrayMinTest, boolArrays) {
   testBoolNullable();
   testBool();
+}
+
+TEST_F(ArrayMinTest, complexTypeElements) {
+  auto elements = makeRowVector({
+      makeFlatVector<int32_t>({1, 2, 3, 3, 2, 1}),
+      makeFlatVector<int32_t>({1, 2, 3, 4, 5, 6}),
+  });
+
+  auto arrayVector = makeArrayVector({0}, elements);
+  auto result = evaluate("array_min(c0)", makeRowVector({arrayVector}));
+
+  auto expected = makeRowVector({
+      makeFlatVector(std::vector<int32_t>{1}),
+      makeFlatVector(std::vector<int32_t>{1}),
+  });
+  assertEqualVectors(expected, result);
+
+  result = evaluate("array_max(c0)", makeRowVector({arrayVector}));
+
+  expected = makeRowVector({
+      makeFlatVector(std::vector<int32_t>{3}),
+      makeFlatVector(std::vector<int32_t>{4}),
+  });
+  assertEqualVectors(expected, result);
+
+  // Array with null element.
+  elements->setNull(5, true);
+  result = evaluate("array_min(c0)", makeRowVector({arrayVector}));
+
+  ASSERT_EQ(1, result->size());
+  ASSERT_TRUE(result->isNullAt(0));
+
+  elements->clearAllNulls();
+  elements->setNull(0, true);
+  result = evaluate("array_min(c0)", makeRowVector({arrayVector}));
+
+  ASSERT_EQ(1, result->size());
+  ASSERT_TRUE(result->isNullAt(0));
+
+  // Empty array.
+  arrayVector->setOffsetAndSize(0, 0, 0);
+  result = evaluate("array_min(c0)", makeRowVector({arrayVector}));
+
+  ASSERT_EQ(1, result->size());
+  ASSERT_TRUE(result->isNullAt(0));
+
+  // Arrays with elements that contain nulls may or may not be orderable
+  // (depending on whether it would be necessary to compare nulls to decide the
+  // order).
+  elements = makeRowVector({
+      makeNullableFlatVector<int32_t>({1, std::nullopt, 3, 3, 2, 1}),
+      makeNullableFlatVector<int32_t>({1, 2, 3, 4, 5, 6}),
+  });
+  arrayVector = makeArrayVector({0}, elements);
+
+  VELOX_ASSERT_THROW(
+      evaluate("array_min(c0)", makeRowVector({arrayVector})),
+      "Ordering nulls is not supported");
+
+  VELOX_ASSERT_THROW(
+      evaluate("array_max(c0)", makeRowVector({arrayVector})),
+      "Ordering nulls is not supported");
+
+  elements = makeRowVector({
+      makeNullableFlatVector<int32_t>({1, 2, 3, 3, 2, 1}),
+      makeNullableFlatVector<int32_t>({1, std::nullopt, 3, 4, 5, 6}),
+  });
+  arrayVector = makeArrayVector({0}, elements);
+
+  result = evaluate("array_min(c0)", makeRowVector({arrayVector}));
+  expected = makeRowVector({
+      makeFlatVector(std::vector<int32_t>{1}),
+      makeFlatVector(std::vector<int32_t>{1}),
+  });
+  assertEqualVectors(expected, result);
+
+  result = evaluate("array_max(c0)", makeRowVector({arrayVector}));
+  expected = makeRowVector({
+      makeFlatVector(std::vector<int32_t>{3}),
+      makeFlatVector(std::vector<int32_t>{4}),
+  });
+  assertEqualVectors(expected, result);
 }

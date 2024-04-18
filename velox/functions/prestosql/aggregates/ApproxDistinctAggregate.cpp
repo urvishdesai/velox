@@ -63,6 +63,12 @@ struct HllAccumulator {
     if (SparseHll::canDeserialize(input)) {
       if (isSparse_) {
         sparseHll_.mergeWith(input);
+        if (indexBitLength_ < 0) {
+          setIndexBitLength(DenseHll::deserializeIndexBitLength(input));
+        }
+        if (sparseHll_.overLimit()) {
+          toDense();
+        }
       } else {
         SparseHll other{input, allocator};
         other.toDense(denseHll_);
@@ -84,11 +90,12 @@ struct HllAccumulator {
     return isSparse_ ? sparseHll_.serializedSize() : denseHll_.serializedSize();
   }
 
-  void serialize(int8_t indexBitLength, char* outputBuffer) {
-    return isSparse_ ? sparseHll_.serialize(indexBitLength, outputBuffer)
+  void serialize(char* outputBuffer) {
+    return isSparse_ ? sparseHll_.serialize(indexBitLength_, outputBuffer)
                      : denseHll_.serialize(outputBuffer);
   }
 
+ private:
   void toDense() {
     isSparse_ = false;
     denseHll_.initialize(indexBitLength_);
@@ -107,6 +114,12 @@ inline uint64_t hashOne(T value) {
   return XXH64(&value, sizeof(T), 0);
 }
 
+// Use timestamp.toMillis() to compute hash value.
+template <>
+inline uint64_t hashOne<Timestamp>(Timestamp value) {
+  return hashOne(value.toMillis());
+}
+
 template <>
 inline uint64_t hashOne<StringView>(StringView value) {
   return XXH64(value.data(), value.size(), 0);
@@ -118,27 +131,34 @@ class ApproxDistinctAggregate : public exec::Aggregate {
   explicit ApproxDistinctAggregate(
       const TypePtr& resultType,
       bool hllAsFinalResult,
-      bool hllAsRawInput)
+      bool hllAsRawInput,
+      double defaultError)
       : exec::Aggregate(resultType),
         hllAsFinalResult_{hllAsFinalResult},
-        hllAsRawInput_{hllAsRawInput} {}
+        hllAsRawInput_{hllAsRawInput},
+        indexBitLength_{common::hll::toIndexBitLength(defaultError)} {}
 
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(HllAccumulator);
+  }
+
+  int32_t accumulatorAlignmentSize() const override {
+    return alignof(HllAccumulator);
   }
 
   bool isFixedSize() const override {
     return false;
   }
 
-  void initializeNewGroups(
-      char** groups,
-      folly::Range<const vector_size_t*> indices) override {
-    setAllNulls(groups, indices);
-    for (auto i : indices) {
-      auto group = groups[i];
-      new (group + offset_) HllAccumulator(allocator_);
-    }
+  bool supportsToIntermediate() const final {
+    return hllAsRawInput_;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const final {
+    singleInputAsIntermediate(rows, args, result);
   }
 
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
@@ -177,20 +197,16 @@ class ApproxDistinctAggregate : public exec::Aggregate {
           StringView serialized;
           if (StringView::isInline(size)) {
             std::string buffer(size, '\0');
-            accumulator->serialize(indexBitLength_, buffer.data());
+            accumulator->serialize(buffer.data());
             serialized = StringView::makeInline(buffer);
           } else {
-            Buffer* buffer = flatResult->getBufferWithSpace(size);
-            char* ptr = buffer->asMutable<char>() + buffer->size();
-            accumulator->serialize(indexBitLength_, ptr);
-            buffer->setSize(buffer->size() + size);
-            serialized = StringView(ptr, size);
+            char* rawBuffer = flatResult->getRawStringBufferWithSpace(size);
+            accumulator->serialize(rawBuffer);
+            serialized = StringView(rawBuffer, size);
           }
           result->setNoCopy(index, serialized);
         });
   }
-
-  void destroy(folly::Range<char**> /*groups*/) override {}
 
   void addRawInput(
       char** groups,
@@ -290,6 +306,21 @@ class ApproxDistinctAggregate : public exec::Aggregate {
     });
   }
 
+ protected:
+  void initializeNewGroupsInternal(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) override {
+    setAllNulls(groups, indices);
+    for (auto i : indices) {
+      auto group = groups[i];
+      new (group + offset_) HllAccumulator(allocator_);
+    }
+  }
+
+  void destroyInternal(folly::Range<char**> groups) override {
+    destroyAccumulators<HllAccumulator>(groups);
+  }
+
  private:
   template <
       bool convertNullToZero,
@@ -305,7 +336,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
 
     uint64_t* rawNulls = nullptr;
     if (result->mayHaveNulls()) {
-      BufferPtr nulls = result->mutableNulls(result->size());
+      BufferPtr& nulls = result->mutableNulls(result->size());
       rawNulls = nulls->asMutable<uint64_t>();
     }
 
@@ -337,17 +368,32 @@ class ApproxDistinctAggregate : public exec::Aggregate {
     decodedValue_.decode(*args[0], rows, true);
     if (args.size() > 1) {
       decodedMaxStandardError_.decode(*args[1], rows, true);
-      checkSetMaxStandardError();
+      checkSetMaxStandardError(rows);
     }
   }
 
-  void checkSetMaxStandardError() {
-    VELOX_USER_CHECK(
-        decodedMaxStandardError_.isConstantMapping(),
-        "Max standard error argument must be constant for all input rows");
+  void checkSetMaxStandardError(const SelectivityVector& rows) {
+    if (decodedMaxStandardError_.isConstantMapping()) {
+      const auto maxStandardError = decodedMaxStandardError_.valueAt<double>(0);
+      checkSetMaxStandardError(maxStandardError);
+      return;
+    }
 
-    auto maxStandardError = decodedMaxStandardError_.valueAt<double>(0);
-    checkSetMaxStandardError(maxStandardError);
+    rows.applyToSelected([&](auto row) {
+      VELOX_USER_CHECK(
+          !decodedMaxStandardError_.isNullAt(row),
+          "Max standard error cannot be null");
+      const auto maxStandardError =
+          decodedMaxStandardError_.valueAt<double>(row);
+      if (maxStandardError_ == -1) {
+        checkSetMaxStandardError(maxStandardError);
+      } else {
+        VELOX_USER_CHECK_EQ(
+            maxStandardError,
+            maxStandardError_,
+            "Max standard error argument must be constant for all input rows");
+      }
+    });
   }
 
   void checkSetMaxStandardError(double error) {
@@ -372,8 +418,7 @@ class ApproxDistinctAggregate : public exec::Aggregate {
   /// serialized HLLs.
   const bool hllAsRawInput_;
 
-  int8_t indexBitLength_{
-      common::hll::toIndexBitLength(common::hll::kDefaultStandardError)};
+  int8_t indexBitLength_;
   double maxStandardError_{-1};
   DecodedVector decodedValue_;
   DecodedVector decodedMaxStandardError_;
@@ -384,24 +429,29 @@ template <TypeKind kind>
 std::unique_ptr<exec::Aggregate> createApproxDistinct(
     const TypePtr& resultType,
     bool hllAsFinalResult,
-    bool hllAsRawInput) {
+    bool hllAsRawInput,
+    double defaultError) {
   using T = typename TypeTraits<kind>::NativeType;
   return std::make_unique<ApproxDistinctAggregate<T>>(
-      resultType, hllAsFinalResult, hllAsRawInput);
+      resultType, hllAsFinalResult, hllAsRawInput, defaultError);
 }
 
-bool registerApproxDistinct(
+exec::AggregateRegistrationResult registerApproxDistinct(
     const std::string& name,
     bool hllAsFinalResult,
-    bool hllAsRawInput) {
+    bool hllAsRawInput,
+    bool withCompanionFunctions,
+    bool overwrite,
+    double defaultError) {
+  auto returnType = hllAsFinalResult ? "hyperloglog" : "bigint";
+
   std::vector<std::shared_ptr<exec::AggregateFunctionSignature>> signatures;
   if (hllAsRawInput) {
-    signatures.push_back(
-        exec::AggregateFunctionSignatureBuilder()
-            .returnType(hllAsFinalResult ? "hyperloglog" : "bigint")
-            .intermediateType("varbinary")
-            .argumentType("varbinary")
-            .build());
+    signatures.push_back(exec::AggregateFunctionSignatureBuilder()
+                             .returnType(returnType)
+                             .intermediateType("varbinary")
+                             .argumentType("hyperloglog")
+                             .build());
   } else {
     for (const auto& inputType :
          {"boolean",
@@ -409,55 +459,96 @@ bool registerApproxDistinct(
           "smallint",
           "integer",
           "bigint",
+          "hugeint",
           "real",
           "double",
           "varchar",
           "timestamp",
           "date"}) {
-      signatures.push_back(
-          exec::AggregateFunctionSignatureBuilder()
-              .returnType(hllAsFinalResult ? "hyperloglog" : "bigint")
-              .intermediateType("varbinary")
-              .argumentType(inputType)
-              .build());
+      signatures.push_back(exec::AggregateFunctionSignatureBuilder()
+                               .returnType(returnType)
+                               .intermediateType("varbinary")
+                               .argumentType(inputType)
+                               .build());
 
-      signatures.push_back(
-          exec::AggregateFunctionSignatureBuilder()
-              .returnType(hllAsFinalResult ? "hyperloglog" : "bigint")
-              .intermediateType("varbinary")
-              .argumentType(inputType)
-              .argumentType("double")
-              .build());
+      signatures.push_back(exec::AggregateFunctionSignatureBuilder()
+                               .returnType(returnType)
+                               .intermediateType("varbinary")
+                               .argumentType(inputType)
+                               .argumentType("double")
+                               .build());
     }
+    signatures.push_back(exec::AggregateFunctionSignatureBuilder()
+                             .integerVariable("a_precision")
+                             .integerVariable("a_scale")
+                             .returnType(returnType)
+                             .intermediateType("varbinary")
+                             .argumentType("DECIMAL(a_precision, a_scale)")
+                             .build());
+    signatures.push_back(exec::AggregateFunctionSignatureBuilder()
+                             .integerVariable("a_precision")
+                             .integerVariable("a_scale")
+                             .returnType(returnType)
+                             .intermediateType("varbinary")
+                             .argumentType("DECIMAL(a_precision, a_scale)")
+                             .argumentType("double")
+                             .build());
   }
 
-  exec::registerAggregateFunction(
+  return exec::registerAggregateFunction(
       name,
       std::move(signatures),
-      [name, hllAsFinalResult, hllAsRawInput](
+      [name, hllAsFinalResult, hllAsRawInput, defaultError](
           core::AggregationNode::Step /*step*/,
           const std::vector<TypePtr>& argTypes,
-          const TypePtr& resultType) -> std::unique_ptr<exec::Aggregate> {
+          const TypePtr& resultType,
+          const core::QueryConfig& /*config*/)
+          -> std::unique_ptr<exec::Aggregate> {
         TypePtr type = argTypes[0]->isVarbinary() ? BIGINT() : argTypes[0];
         return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
             createApproxDistinct,
             type->kind(),
             resultType,
             hllAsFinalResult,
-            hllAsRawInput);
-      });
-  return true;
+            hllAsRawInput,
+            defaultError);
+      },
+      withCompanionFunctions,
+      overwrite);
 }
 
 } // namespace
 
-void registerApproxDistinctAggregates(const std::string& prefix) {
+void registerApproxDistinctAggregates(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite) {
   registerCustomType(
       prefix + "hyperloglog",
       std::make_unique<const HyperLogLogTypeFactories>());
-  registerApproxDistinct(prefix + kApproxDistinct, false, false);
-  registerApproxDistinct(prefix + kApproxSet, true, false);
-  registerApproxDistinct(prefix + kMerge, true, true);
+  registerApproxDistinct(
+      prefix + kApproxDistinct,
+      false,
+      false,
+      withCompanionFunctions,
+      overwrite,
+      common::hll::kDefaultApproxDistinctStandardError);
+  // approx_set and merge are already companion functions themselves. Don't
+  // register companion functions for them.
+  registerApproxDistinct(
+      prefix + kApproxSet,
+      true,
+      false,
+      false,
+      overwrite,
+      common::hll::kDefaultApproxSetStandardError);
+  registerApproxDistinct(
+      prefix + kMerge,
+      true,
+      true,
+      false,
+      overwrite,
+      common::hll::kDefaultApproxSetStandardError);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

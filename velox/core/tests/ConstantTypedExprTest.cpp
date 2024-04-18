@@ -47,20 +47,20 @@ TEST(ConstantTypedExprTest, null) {
   EXPECT_FALSE(*makeNull(HYPERLOGLOG()) == *makeNull(VARBINARY()));
   EXPECT_FALSE(*makeNull(VARBINARY()) == *makeNull(HYPERLOGLOG()));
 
-  EXPECT_FALSE(
-      *makeNull(TIMESTAMP_WITH_TIME_ZONE()) ==
-      *makeNull(ROW({BIGINT(), SMALLINT()})));
-  EXPECT_FALSE(
-      *makeNull(ROW({BIGINT(), SMALLINT()})) ==
-      *makeNull(TIMESTAMP_WITH_TIME_ZONE()));
+  EXPECT_FALSE(*makeNull(TIMESTAMP_WITH_TIME_ZONE()) == *makeNull(BIGINT()));
+  EXPECT_FALSE(*makeNull(BIGINT()) == *makeNull(TIMESTAMP_WITH_TIME_ZONE()));
 
   EXPECT_TRUE(*makeNull(DOUBLE()) == *makeNull(DOUBLE()));
   EXPECT_TRUE(*makeNull(ARRAY(DOUBLE())) == *makeNull(ARRAY(DOUBLE())));
-  EXPECT_TRUE(
-      *makeNull(ROW({"a", "b"}, {INTEGER(), REAL()})) ==
-      *makeNull(ROW({"x", "y"}, {INTEGER(), REAL()})));
+
   EXPECT_TRUE(*makeNull(JSON()) == *makeNull(JSON()));
   EXPECT_TRUE(
       *makeNull(MAP(VARCHAR(), JSON())) == *makeNull(MAP(VARCHAR(), JSON())));
+
+  EXPECT_FALSE(*makeNull(JSON()) == *makeNull(VARCHAR()));
+  EXPECT_FALSE(
+      *makeNull(ROW({"a", "b"}, {INTEGER(), REAL()})) ==
+      *makeNull(ROW({"x", "y"}, {INTEGER(), REAL()})));
 }
+
 } // namespace facebook::velox::core::test

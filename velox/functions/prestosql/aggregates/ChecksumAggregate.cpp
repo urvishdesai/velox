@@ -40,15 +40,6 @@ class ChecksumAggregate : public exec::Aggregate {
     return sizeof(int64_t);
   }
 
-  void initializeNewGroups(
-      char** groups,
-      folly::Range<const vector_size_t*> indices) override {
-    setAllNulls(groups, indices);
-    for (auto i : indices) {
-      *value<int64_t>(groups[i]) = 0;
-    }
-  }
-
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
       override {
     auto* vector = (*result)->asUnchecked<FlatVector<StringView>>();
@@ -91,6 +82,17 @@ class ChecksumAggregate : public exec::Aggregate {
       const std::vector<VectorPtr>& args,
       bool /*mayPushDown*/) override {
     const auto& arg = args[0];
+
+    if (arg->type()->isUnKnown()) {
+      rows.applyToSelected([&](auto row) {
+        auto group = groups[row];
+        clearNull(group);
+        computeHashForNull(group);
+      });
+
+      return;
+    }
+
     auto hasher = getPrestoHasher(arg->type());
     auto hashes = getHashBuffer(rows.end(), arg->pool());
     hasher->hash(arg, rows, hashes);
@@ -137,6 +139,16 @@ class ChecksumAggregate : public exec::Aggregate {
       const std::vector<VectorPtr>& args,
       bool /*mayPushDown*/) override {
     const auto& arg = args[0];
+
+    if (arg->type()->isUnKnown()) {
+      rows.applyToSelected([&](auto row) {
+        clearNull(group);
+        computeHashForNull(group);
+      });
+
+      return;
+    }
+
     auto hasher = getPrestoHasher(arg->type());
     auto hashes = getHashBuffer(rows.end(), arg->pool());
     hasher->hash(arg, rows, hashes);
@@ -173,6 +185,16 @@ class ChecksumAggregate : public exec::Aggregate {
     safeAdd(*value<int64_t>(group), result);
   }
 
+ protected:
+  void initializeNewGroupsInternal(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) override {
+    setAllNulls(groups, indices);
+    for (auto i : indices) {
+      *value<int64_t>(groups[i]) = 0;
+    }
+  }
+
  private:
   FOLLY_ALWAYS_INLINE void computeHash(char* group, const int64_t hash) {
     *value<int64_t>(group) += hash * XXH_PRIME64_1;
@@ -207,7 +229,12 @@ class ChecksumAggregate : public exec::Aggregate {
   DecodedVector decodedIntermediate_;
 };
 
-bool registerChecksum(const std::string& name) {
+} // namespace
+
+void registerChecksumAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite) {
   std::vector<std::shared_ptr<exec::AggregateFunctionSignature>> signatures{
       exec::AggregateFunctionSignatureBuilder()
           .typeVariable("T")
@@ -217,13 +244,16 @@ bool registerChecksum(const std::string& name) {
           .build(),
   };
 
+  auto name = prefix + kChecksum;
   exec::registerAggregateFunction(
       name,
       std::move(signatures),
       [&name](
           core::AggregationNode::Step step,
           const std::vector<TypePtr>& argTypes,
-          const TypePtr& /*resultType*/) -> std::unique_ptr<exec::Aggregate> {
+          const TypePtr& /*resultType*/,
+          const core::QueryConfig& /*config*/)
+          -> std::unique_ptr<exec::Aggregate> {
         VELOX_CHECK_EQ(argTypes.size(), 1, "{} takes one argument", name);
 
         if (exec::isPartialOutput(step)) {
@@ -231,15 +261,10 @@ bool registerChecksum(const std::string& name) {
         }
 
         return std::make_unique<ChecksumAggregate>(VARBINARY());
-      });
-
-  return true;
-}
-
-} // namespace
-
-void registerChecksumAggregate(const std::string& prefix) {
-  registerChecksum(prefix + kChecksum);
+      },
+      {false /*orderSensitive*/},
+      withCompanionFunctions,
+      overwrite);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

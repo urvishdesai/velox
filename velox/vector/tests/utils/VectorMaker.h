@@ -22,17 +22,70 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/SequenceVector.h"
 #include "velox/vector/SimpleVector.h"
+#include "velox/vector/tests/utils/VectorMakerStats.h"
 
 namespace facebook::velox::test {
+
+namespace detail {
+
+template <typename T>
+T jsonValue(const folly::dynamic& jsonValue) {
+  if constexpr (
+      std::is_same_v<int8_t, T> || std::is_same_v<int16_t, T> ||
+      std::is_same_v<int32_t, T> || std::is_same_v<int64_t, T>) {
+    return jsonValue.asInt();
+  }
+
+  if constexpr (std::is_same_v<float, T> || std::is_same_v<double, T>) {
+    return jsonValue.asDouble();
+  }
+
+  if constexpr (std::is_same_v<std::string, T>) {
+    return jsonValue.asString();
+  }
+
+  if constexpr (std::is_same_v<bool, T>) {
+    return jsonValue.asBool();
+  }
+
+  VELOX_UNSUPPORTED();
+}
+
+template <typename T>
+void appendVariant(std::vector<variant>& values, const T& x) {
+  values.push_back(x);
+};
+
+template <typename TupleT, std::size_t... Is>
+variant toVariantRow(const TupleT& tp, std::index_sequence<Is...>) {
+  std::vector<variant> values;
+  (appendVariant(values, std::get<Is>(tp)), ...);
+  return variant::row(values);
+}
+
+template <typename TupleT, std::size_t TupleSize = std::tuple_size_v<TupleT>>
+variant toVariantRow(const TupleT& tp) {
+  return toVariantRow(tp, std::make_index_sequence<TupleSize>{});
+}
+
+} // namespace detail
 
 class SimpleVectorLoader : public VectorLoader {
  public:
   explicit SimpleVectorLoader(std::function<VectorPtr(RowSet)> loader)
       : loader_(loader) {}
 
-  void loadInternal(RowSet rows, ValueHook* hook, VectorPtr* result) override {
+  void loadInternal(
+      RowSet rows,
+      ValueHook* hook,
+      vector_size_t resultSize,
+      VectorPtr* result) override {
     VELOX_CHECK(!hook, "SimpleVectorLoader doesn't support ValueHook");
-    *result = loader_(rows);
+    auto& resultRef = *result;
+    resultRef = loader_(rows);
+    if (resultRef->size() < resultSize) {
+      resultRef->resize(resultSize);
+    }
   }
 
  private:
@@ -65,20 +118,19 @@ class VectorMaker {
       vector_size_t size);
 
   template <typename T>
-  using EvalType = typename CppToType<T>::NativeType;
-
-  template <typename T>
-  FlatVectorPtr<T> flatVector(
+  FlatVectorPtr<EvalType<T>> flatVector(
       vector_size_t size,
       std::function<T(vector_size_t /*row*/)> valueAt,
       std::function<bool(vector_size_t /*row*/)> isNullAt = nullptr,
       const TypePtr& type = CppToType<T>::create()) {
-    auto flatVector = BaseVector::create<FlatVector<T>>(type, size, pool_);
+    auto flatVector =
+        BaseVector::create<FlatVector<EvalType<T>>>(type, size, pool_);
     for (vector_size_t i = 0; i < size; i++) {
       if (isNullAt && isNullAt(i)) {
         flatVector->setNull(i, true);
       } else {
-        flatVector->set(i, valueAt(i));
+        auto v = valueAt(i);
+        flatVector->set(i, EvalType<T>(v));
       }
     }
     return flatVector;
@@ -113,7 +165,8 @@ class VectorMaker {
             };
           }
 
-          return flatVector<T>(size, selectiveValueAt, selectiveIsNullAt);
+          return flatVector<T>(
+              rowSet.back() + 1, selectiveValueAt, selectiveIsNullAt);
         }));
   }
 
@@ -195,52 +248,6 @@ class VectorMaker {
     }
     return flatVector;
   }
-
-  /// Create a UnscaledShortDecimal FlatVector from unscaled values, type.
-  ///
-  /// Elements are not nullable.
-  ///
-  /// Examples:
-  ///  auto flatVector = shortDecimalFlatVector({1, 2, 3}, DECIMAL(8, 1));
-  template <typename T>
-  FlatVectorPtr<UnscaledShortDecimal> shortDecimalFlatVector(
-      const std::vector<T>& unscaledValues,
-      const TypePtr& ptr);
-
-  /// Create a UnscaledLongDecimal FlatVector from unscaled values, type.
-  ///
-  /// Elements are not nullable.
-  ///
-  /// Examples:
-  ///  auto flatVector = longDecimalFlatVector({1, 2, 3}, DECIMAL(20, 4));
-  template <typename T>
-  FlatVectorPtr<UnscaledLongDecimal> longDecimalFlatVector(
-      const std::vector<T>& unscaledValues,
-      const TypePtr& ptr);
-
-  /// Create a UnscaledShortDecimal FlatVector from values, type.
-  ///
-  /// Elements are nullable.
-  ///
-  /// Examples:
-  ///  auto flatVector = shortDecimalFlatVectorNullable({1, std::nullopt, 3},
-  ///  DECIMAL(8, 1));
-  template <typename T>
-  FlatVectorPtr<UnscaledShortDecimal> shortDecimalFlatVectorNullable(
-      const std::vector<std::optional<T>>& data,
-      const TypePtr& ptr);
-
-  /// Create a UnscaledLongDecimal FlatVector from values, type.
-  ///
-  /// Elements are nullable.
-  ///
-  /// Examples:
-  ///  auto flatVector = longDecimalFlatVectorNullable({1, std::nullopt, 3},
-  ///  DECIMAL(20, 4));
-  template <typename T>
-  FlatVectorPtr<UnscaledLongDecimal> longDecimalFlatVectorNullable(
-      const std::vector<std::optional<T>>& data,
-      const TypePtr& ptr);
 
   /// Create a BiasVector<T>
   /// creates a BiasVector (vector encoded using bias encoding) based on a flat
@@ -328,7 +335,8 @@ class VectorMaker {
       std::function<vector_size_t(vector_size_t /* row */)> sizeAt,
       std::function<T(vector_size_t /* idx */)> valueAt,
       std::function<bool(vector_size_t /*row */)> isNullAt = nullptr,
-      std::function<bool(vector_size_t /* idx */)> valueIsNullAt = nullptr) {
+      std::function<bool(vector_size_t /* idx */)> valueIsNullAt = nullptr,
+      const TypePtr& arrayType = ARRAY(CppToType<T>::create())) {
     BufferPtr nulls;
     BufferPtr offsets;
     BufferPtr sizes;
@@ -337,7 +345,7 @@ class VectorMaker {
 
     return std::make_shared<ArrayVector>(
         pool_,
-        ARRAY(CppToType<T>::create()),
+        arrayType,
         nulls,
         size,
         offsets,
@@ -359,16 +367,16 @@ class VectorMaker {
     auto numElements =
         createOffsetsAndSizes(size, sizeAt, isNullAt, &nulls, &offsets, &sizes);
 
-    auto flatVector =
-        BaseVector::create<FlatVector<T>>(type->childAt(0), numElements, pool_);
+    auto flatVector = BaseVector::create<FlatVector<EvalType<T>>>(
+        type->childAt(0), numElements, pool_);
     vector_size_t currentIndex = 0;
     for (vector_size_t i = 0; i < size; ++i) {
       if (isNullAt && isNullAt(i)) {
         continue;
       }
       for (vector_size_t j = 0; j < sizeAt(i); ++j) {
-        auto ret = valueAt(i, j);
-        flatVector->set(currentIndex, valueAt(i, j));
+        auto value = valueAt(i, j);
+        flatVector->set(currentIndex, EvalType<T>(value));
         currentIndex++;
       }
     }
@@ -393,9 +401,9 @@ class VectorMaker {
       std::function<vector_size_t(vector_size_t /* row */)> sizeAt,
       std::function<T(vector_size_t /* row */, vector_size_t /* idx */)>
           valueAt,
-      std::function<bool(vector_size_t /*row */)> isNullAt = nullptr) {
-    return arrayVectorImpl(
-        ARRAY(CppToType<T>::create()), size, sizeAt, valueAt, isNullAt);
+      std::function<bool(vector_size_t /*row */)> isNullAt = nullptr,
+      const TypePtr& arrayType = ARRAY(CppToType<T>::create())) {
+    return arrayVectorImpl(arrayType, size, sizeAt, valueAt, isNullAt);
   }
 
   template <typename T>
@@ -403,8 +411,8 @@ class VectorMaker {
       const TypePtr& type,
       const std::vector<std::vector<T>>& data) {
     vector_size_t size = data.size();
-    BufferPtr offsets = AlignedBuffer::allocate<vector_size_t>(size, pool_);
-    BufferPtr sizes = AlignedBuffer::allocate<vector_size_t>(size, pool_);
+    BufferPtr offsets = allocateOffsets(size, pool_);
+    BufferPtr sizes = allocateSizes(size, pool_);
 
     auto rawOffsets = offsets->asMutable<vector_size_t>();
     auto rawSizes = sizes->asMutable<vector_size_t>();
@@ -416,8 +424,8 @@ class VectorMaker {
     }
 
     // Create the underlying flat vector.
-    auto flatVector =
-        BaseVector::create<FlatVector<T>>(type->childAt(0), numElements, pool_);
+    auto flatVector = BaseVector::create<FlatVector<EvalType<T>>>(
+        type->childAt(0), numElements, pool_);
 
     vector_size_t currentIdx = 0;
     for (const auto& arrayValue : data) {
@@ -425,7 +433,7 @@ class VectorMaker {
       *rawOffsets++ = currentIdx;
 
       for (auto arrayElement : arrayValue) {
-        flatVector->set(currentIdx++, arrayElement);
+        flatVector->set(currentIdx++, EvalType<T>(arrayElement));
       }
     }
 
@@ -437,14 +445,53 @@ class VectorMaker {
   /// array elements are created based on input std::vectors and are
   /// non-nullable.
   template <typename T>
-  ArrayVectorPtr arrayVector(const std::vector<std::vector<T>>& data) {
-    return arrayVectorImpl(ARRAY(CppToType<T>::create()), data);
+  ArrayVectorPtr arrayVector(
+      const std::vector<std::vector<T>>& data,
+      const TypePtr& elementType = CppToType<T>::create()) {
+    return arrayVectorImpl(ARRAY(elementType), data);
   }
 
   /// Create an ArrayVector<ROW> from nested std::vectors of Variants.
   ArrayVectorPtr arrayOfRowVector(
       const RowTypePtr& rowType,
       const std::vector<std::vector<variant>>& data);
+
+  /// Creates an ARRAY(ROW(...)) vector from a list of lists of optional tuples.
+  ///
+  /// Allows to create arrays with null elements, but arrays themselves cannot
+  /// be null. Members of the structs cannot be null either.
+  ///
+  /// Example:
+  ///
+  ///  std::vector<std::vector<std::optional<std::tuple<int32_t, std::string>>>>
+  ///      data = {
+  ///          {{{1, "red"}}, {{2, "blue"}}, {{3, "green"}}},
+  ///          {},
+  ///          {std::nullopt},
+  ///          {{{4, "green"}}, {{5, "purple"}}},
+  ///  };
+  ///
+  ///  auto arrayVector = maker_.arrayOfRowVector(data, ROW({INTEGER(),
+  ///  VARCHAR()}));
+  template <typename TupleT>
+  ArrayVectorPtr arrayOfRowVector(
+      const std::vector<std::vector<std::optional<TupleT>>>& data,
+      const RowTypePtr& rowType) {
+    std::vector<std::vector<variant>> arrays;
+    for (const auto& tuples : data) {
+      std::vector<variant> elements;
+      for (const auto& t : tuples) {
+        if (t.has_value()) {
+          elements.push_back(detail::toVariantRow(t.value()));
+        } else {
+          elements.push_back(variant::null(TypeKind::ROW));
+        }
+      }
+      arrays.push_back(elements);
+    }
+
+    return arrayOfRowVector(rowType, arrays);
+  }
 
   template <typename T>
   ArrayVectorPtr arrayVectorNullableImpl(
@@ -510,6 +557,93 @@ class VectorMaker {
       const std::vector<std::optional<std::vector<std::optional<T>>>>& data,
       const TypePtr& type = ARRAY(CppToType<T>::create())) {
     return arrayVectorNullableImpl(type, data);
+  }
+
+  /// Creates an ArrayVector from a list of JSON arrays.
+  ///
+  /// JSON arrays can represent a null array, an empty array or array with null
+  /// elements.
+  ///
+  /// Examples:
+  ///  [1, 2, 3]
+  ///  [1, 2, null, 4]
+  ///  [null, null]
+  ///  [] - empty array
+  ///  null - null array
+  ///
+  /// @tparam T Type of array elements.
+  /// @param jsonArrays A list of JSON arrays. JSON array cannot be an empty
+  /// string.
+  template <typename T>
+  ArrayVectorPtr arrayVectorFromJson(
+      const std::vector<std::string>& jsonArrays,
+      const TypePtr& arrayType = ARRAY(CppToType<T>::create())) {
+    std::vector<std::optional<std::vector<std::optional<T>>>> arrays;
+    for (const auto& jsonArray : jsonArrays) {
+      VELOX_CHECK(!jsonArray.empty());
+
+      const folly::dynamic arrayObject = folly::parseJson(jsonArray);
+      if (arrayObject.isNull()) {
+        // Null array.
+        arrays.push_back(std::nullopt);
+        continue;
+      }
+      std::vector<std::optional<T>> elements;
+      appendElementsFromJsonArray(arrayObject, elements);
+      arrays.push_back(elements);
+    }
+    return arrayVectorNullable<T>(arrays, arrayType);
+  }
+
+  /// Creates an ArrayVector from a list of JSON arrays of arrays.
+  ///
+  /// JSON array of arrays can represent a null array, an empty array or array
+  /// with null elements.
+  ///
+  /// Examples:
+  /// [[1, 2], [2, 3, 4], [null, 7]]
+  /// [[1, 3, 7, 9], []]
+  /// [] - empty array of arrays
+  /// null - null array of arrays
+  /// [null] - array of null array
+  /// [[]]
+  ///
+  /// @tparam T Type of array elements.
+  /// @param jsonArrays A list of JSON arrays. JSON array cannot be an empty
+  /// string.
+  template <typename T>
+  ArrayVectorPtr nestedArrayVectorFromJson(
+      const std::vector<std::string>& jsonArrays,
+      const TypePtr& arrayType = ARRAY(CppToType<T>::create())) {
+    std::vector<std::optional<std::vector<std::optional<T>>>> baseVector;
+    std::vector<vector_size_t> offsets;
+    std::vector<vector_size_t> nulls;
+    const std::vector<std::optional<T>> empty;
+    int offset = 0;
+    for (auto i = 0; i < jsonArrays.size(); i++) {
+      const auto& jsonArray = jsonArrays.at(i);
+      VELOX_CHECK(!jsonArray.empty());
+      const folly::dynamic arraysObject = folly::parseJson(jsonArray);
+      offsets.push_back(offset);
+      if (arraysObject.isNull()) {
+        // Null array.
+        nulls.push_back(i);
+        continue;
+      }
+      for (const auto& nestedArray : arraysObject) {
+        if (nestedArray.isNull()) {
+          // Null nested array
+          baseVector.push_back(std::nullopt);
+        } else {
+          std::vector<std::optional<T>> elements;
+          appendElementsFromJsonArray(nestedArray, elements);
+          baseVector.push_back(elements);
+        }
+      }
+      offset += arraysObject.size();
+    }
+    auto baseArrayVector = arrayVectorNullable<T>(baseVector, arrayType);
+    return arrayVector(offsets, baseArrayVector, nulls);
   }
 
   ArrayVectorPtr allNullArrayVector(
@@ -593,6 +727,126 @@ class VectorMaker {
         flatVector(values));
   }
 
+  template <typename TKey, typename TValue>
+  MapVectorPtr mapVector(
+      const std::vector<std::vector<std::pair<TKey, std::optional<TValue>>>>&
+          maps,
+      const TypePtr& mapType =
+          MAP(CppToType<TKey>::create(), CppToType<TValue>::create())) {
+    std::vector<
+        std::optional<std::vector<std::pair<TKey, std::optional<TValue>>>>>
+        nullableMaps;
+    nullableMaps.reserve(maps.size());
+    for (const auto& m : maps) {
+      nullableMaps.push_back(m);
+    }
+
+    return mapVector<TKey, TValue>(nullableMaps, mapType, false);
+  }
+
+  template <typename TKey, typename TValue>
+  MapVectorPtr mapVector(
+      const std::vector<std::optional<
+          std::vector<std::pair<TKey, std::optional<TValue>>>>>& maps,
+      const TypePtr& mapType =
+          MAP(CppToType<TKey>::create(), CppToType<TValue>::create()),
+      bool hasNulls = true) {
+    std::vector<TKey> keys;
+    std::vector<TValue> values;
+    std::vector<bool> nullValues;
+
+    for (const auto& map : maps) {
+      if (map.has_value()) {
+        for (const auto& [key, value] : map.value()) {
+          keys.push_back(key);
+          values.push_back(value.value_or(TValue()));
+          nullValues.push_back(!value.has_value());
+        }
+      }
+    }
+
+    std::function<bool(vector_size_t)> isNullAt = nullptr;
+    if (hasNulls) {
+      isNullAt = [&](vector_size_t row) { return !maps[row].has_value(); };
+    }
+
+    return mapVector<TKey, TValue>(
+        maps.size(),
+        [&](vector_size_t row) {
+          return maps[row].has_value() ? maps[row]->size() : 0;
+        },
+        [&](vector_size_t idx) { return keys[idx]; },
+        [&](vector_size_t idx) { return values[idx]; },
+        isNullAt,
+        [&](vector_size_t idx) { return nullValues[idx]; },
+        mapType);
+  }
+
+  /// Creates a MapVector from a list of JSON maps.
+  ///
+  /// JSON maps can represent a null map, an empty map or a map with null
+  /// values. Null keys are not allowed.
+  ///
+  /// Note that order of map keys in the MapVector is not guaranteed to match
+  /// the order of map keys in the JSON.
+  ///
+  /// Examples:
+  ///  {1: 10, 2: 20, 3: 30}
+  ///  {1: 10, 2: 20, 3: null, 4: 40}
+  ///  {1: null, 2: null}
+  ///  {} - empty map
+  ///  null - null map
+  ///
+  /// @tparam K Type of map keys. Must be a std::string or an integer: int8_t,
+  /// int16_t, int32_t, int64_t.
+  /// @tparam V Type of map value. Can be an integer or a floating point
+  /// number.
+  /// @param jsonMaps A list of JSON maps. JSON map cannot be an empty
+  /// string.
+  template <typename K, typename V>
+  MapVectorPtr mapVectorFromJson(
+      const std::vector<std::string>& jsonMaps,
+      const TypePtr& mapType =
+          MAP(CppToType<K>::create(), CppToType<V>::create())) {
+    static_assert(
+        std::is_same_v<K, int8_t> || std::is_same_v<K, int16_t> ||
+        std::is_same_v<K, int32_t> || std::is_same_v<K, int64_t> ||
+        std::is_same_v<K, float> || std::is_same_v<K, double> ||
+        std::is_same_v<K, std::string>);
+
+    std::vector<std::optional<std::vector<std::pair<K, std::optional<V>>>>>
+        maps;
+    for (const auto& jsonMap : jsonMaps) {
+      VELOX_CHECK(!jsonMap.empty());
+
+      folly::json::serialization_opts options;
+      options.convert_int_keys = true;
+      options.allow_non_string_keys = true;
+      folly::dynamic mapObject = folly::parseJson(jsonMap, options);
+      if (mapObject.isNull()) {
+        // Null map.
+        maps.push_back(std::nullopt);
+        continue;
+      }
+
+      std::vector<std::pair<K, std::optional<V>>> pairs;
+      for (const auto& item : mapObject.items()) {
+        auto key = detail::jsonValue<K>(item.first);
+
+        if (item.second.isNull()) {
+          // Null value.
+          pairs.push_back({key, std::nullopt});
+        } else {
+          pairs.push_back({key, detail::jsonValue<V>(item.second)});
+        }
+      }
+
+      maps.push_back(pairs);
+    }
+
+    return mapVector<K, V>(maps, mapType);
+  }
+
   MapVectorPtr allNullMapVector(
       vector_size_t size,
       const TypePtr& keyType,
@@ -636,9 +890,9 @@ class VectorMaker {
     return flatVector;
   }
 
-  /// Create an ArrayVector from a vector of offsets and a base element vector.
-  /// The size of the arrays is computed from the difference of offsets.
-  /// An optional vector of nulls can be passed to specify null rows.
+  /// Create an ArrayVector from a vector of offsets and a base element
+  /// vector. The size of the arrays is computed from the difference of
+  /// offsets. An optional vector of nulls can be passed to specify null rows.
   /// The offset for a null value must match previous offset
   /// i.e size computed should be zero.
   /// E.g arrayVector({0, 2 ,2}, elements, {1}) creates an array vector
@@ -670,6 +924,19 @@ class VectorMaker {
       BufferPtr* nulls,
       BufferPtr* offsets,
       BufferPtr* sizes);
+
+  template <typename T>
+  void appendElementsFromJsonArray(
+      const folly::dynamic& arrayObject,
+      std::vector<std::optional<T>>& elements) {
+    for (const auto& element : arrayObject) {
+      if (element.isNull()) {
+        elements.push_back(std::nullopt);
+      } else {
+        elements.push_back(detail::jsonValue<T>(element));
+      }
+    }
+  }
 
   memory::MemoryPool* pool_;
 };

@@ -19,103 +19,30 @@
 #include <iterator>
 #include <limits>
 
-#include "velox/common/base/GTestMacros.h"
+#include "velox/dwio/common/Writer.h"
+#include "velox/dwio/common/WriterFactory.h"
 #include "velox/dwio/dwrf/common/Encryption.h"
-#include "velox/dwio/dwrf/common/wrap/dwrf-proto-wrapper.h"
 #include "velox/dwio/dwrf/writer/ColumnWriter.h"
 #include "velox/dwio/dwrf/writer/FlushPolicy.h"
 #include "velox/dwio/dwrf/writer/LayoutPlanner.h"
 #include "velox/dwio/dwrf/writer/WriterBase.h"
+#include "velox/exec/MemoryReclaimer.h"
 
 namespace facebook::velox::dwrf {
-
-class EncodingIter {
- public:
-  using value_type = const proto::ColumnEncoding;
-  using reference = const proto::ColumnEncoding&;
-  using pointer = const proto::ColumnEncoding*;
-  using iterator_category = std::forward_iterator_tag;
-  using difference_type = int64_t;
-
-  static EncodingIter begin(
-      const proto::StripeFooter& footer,
-      const std::vector<proto::StripeEncryptionGroup>& encryptionGroups);
-
-  static EncodingIter end(
-      const proto::StripeFooter& footer,
-      const std::vector<proto::StripeEncryptionGroup>& encryptionGroups);
-
-  EncodingIter& operator++();
-  EncodingIter operator++(int);
-  bool operator==(const EncodingIter& other) const;
-  bool operator!=(const EncodingIter& other) const;
-  reference operator*() const;
-  pointer operator->() const;
-
- private:
-  EncodingIter(
-      const proto::StripeFooter& footer,
-      const std::vector<proto::StripeEncryptionGroup>& encryptionGroups,
-      int32_t encryptionGroupIndex,
-      google::protobuf::RepeatedPtrField<proto::ColumnEncoding>::const_iterator
-          current,
-      google::protobuf::RepeatedPtrField<proto::ColumnEncoding>::const_iterator
-          currentEnd);
-
-  void next();
-
-  VELOX_FRIEND_TEST(TestEncodingIter, Ctor);
-  VELOX_FRIEND_TEST(TestEncodingIter, EncodingIterBeginAndEnd);
-  bool emptyEncryptionGroups() const;
-
-  const proto::StripeFooter& footer_;
-  const std::vector<proto::StripeEncryptionGroup>& encryptionGroups_;
-  int32_t encryptionGroupIndex_{-1};
-  google::protobuf::RepeatedPtrField<proto::ColumnEncoding>::const_iterator
-      current_;
-  google::protobuf::RepeatedPtrField<proto::ColumnEncoding>::const_iterator
-      currentEnd_;
-};
-
-class EncodingContainer {
- public:
-  virtual ~EncodingContainer() = default;
-  virtual EncodingIter begin() const = 0;
-  virtual EncodingIter end() const = 0;
-};
-
-class EncodingManager : public EncodingContainer {
- public:
-  explicit EncodingManager(
-      const encryption::EncryptionHandler& encryptionHandler);
-  virtual ~EncodingManager() override = default;
-
-  proto::ColumnEncoding& addEncodingToFooter(uint32_t nodeId);
-  proto::Stream* addStreamToFooter(uint32_t nodeId, uint32_t& currentIndex);
-  std::string* addEncryptionGroupToFooter();
-  proto::StripeEncryptionGroup getEncryptionGroup(uint32_t i);
-  const proto::StripeFooter& getFooter() const;
-
-  EncodingIter begin() const override;
-  EncodingIter end() const override;
-
- private:
-  void initEncryptionGroups();
-
-  const encryption::EncryptionHandler& encryptionHandler_;
-  proto::StripeFooter footer_;
-  std::vector<proto::StripeEncryptionGroup> encryptionGroups_;
-};
 
 struct WriterOptions {
   std::shared_ptr<const Config> config = std::make_shared<Config>();
   std::shared_ptr<const Type> schema;
-  // The default factory allows the writer to construct the default flush
-  // policy with the configs in its ctor.
+  velox::memory::MemoryPool* memoryPool;
+  const velox::common::SpillConfig* spillConfig{nullptr};
+  // If not null, used by memory arbitration to track if a file writer is under
+  // memory reclaimable section or not.
+  tsan_atomic<bool>* nonReclaimableSection{nullptr};
+  /// The default factory allows the writer to construct the default flush
+  /// policy with the configs in its ctor.
   std::function<std::unique_ptr<DWRFFlushPolicy>()> flushPolicyFactory;
-  // Change the interface to stream list and encoding iter.
-  std::function<
-      std::unique_ptr<LayoutPlanner>(StreamList, const EncodingContainer&)>
+  /// Changes the interface to stream list and encoding iter.
+  std::function<std::unique_ptr<LayoutPlanner>(const dwio::common::TypeWithId&)>
       layoutPlannerFactory;
   std::shared_ptr<encryption::EncryptionSpecification> encryptionSpec;
   std::shared_ptr<dwio::common::encryption::EncrypterFactory> encrypterFactory;
@@ -126,67 +53,39 @@ struct WriterOptions {
       columnWriterFactory;
 };
 
-class Writer : public WriterBase {
+class Writer : public dwio::common::Writer {
  public:
   Writer(
       const WriterOptions& options,
-      std::unique_ptr<dwio::common::DataSink> sink,
-      std::shared_ptr<memory::MemoryPool> pool)
-      : WriterBase{std::move(sink)},
-        schema_{dwio::common::TypeWithId::create(options.schema)},
-        layoutPlannerFactory_{options.layoutPlannerFactory} {
-    auto handler =
-        (options.encryptionSpec ? encryption::EncryptionHandler::create(
-                                      schema_,
-                                      *options.encryptionSpec,
-                                      options.encrypterFactory.get())
-                                : nullptr);
-    initContext(options.config, std::move(pool), std::move(handler));
-    auto& context = getContext();
-    context.buildPhysicalSizeAggregators(*schema_);
-    if (!options.flushPolicyFactory) {
-      flushPolicy_ = std::make_unique<DefaultFlushPolicy>(
-          context.stripeSizeFlushThreshold,
-          context.dictionarySizeFlushThreshold);
-    } else {
-      flushPolicy_ = options.flushPolicyFactory();
-    }
-
-    if (!layoutPlannerFactory_) {
-      layoutPlannerFactory_ = [](StreamList streams,
-                                 const EncodingContainer& /* unused */) {
-        return std::make_unique<LayoutPlanner>(std::move(streams));
-      };
-    }
-
-    if (!options.columnWriterFactory) {
-      writer_ = BaseColumnWriter::create(getContext(), *schema_);
-    } else {
-      writer_ = options.columnWriterFactory(getContext(), *schema_);
-    }
-  }
-
-  Writer(
-      const WriterOptions& options,
-      std::unique_ptr<dwio::common::DataSink> sink,
+      std::unique_ptr<dwio::common::FileSink> sink,
       memory::MemoryPool& parentPool)
       : Writer{
-            options,
             std::move(sink),
-            parentPool.addChild(
-                fmt::format(
-                    "writer_node_{}",
-                    folly::to<std::string>(folly::Random::rand64())),
-                memory::MemoryPool::Kind::kAggregate)} {}
+            options,
+            parentPool.addAggregateChild(fmt::format(
+                "{}.dwrf_{}",
+                parentPool.name(),
+                folly::to<std::string>(folly::Random::rand64())))} {}
+
+  Writer(
+      std::unique_ptr<dwio::common::FileSink> sink,
+      const WriterOptions& options,
+      std::shared_ptr<memory::MemoryPool> pool);
+
+  Writer(
+      std::unique_ptr<dwio::common::FileSink> sink,
+      const WriterOptions& options);
 
   ~Writer() override = default;
 
-  void write(const VectorPtr& slice);
+  virtual void write(const VectorPtr& input) override;
 
   // Forces the writer to flush, does not close the writer.
-  void flush();
+  virtual void flush() override;
 
-  void close() override;
+  virtual void close() override;
+
+  virtual void abort() override;
 
   void setLowMemoryMode();
 
@@ -194,18 +93,104 @@ class Writer : public WriterBase {
       const WriterContext& context,
       size_t nextWriteSize) const;
 
-  // protected:
-  bool overMemoryBudget(const WriterContext& context, size_t writeLength) const;
+  bool overMemoryBudget(const WriterContext& context, size_t numRows) const;
 
-  bool shouldFlush(const WriterContext& context, size_t nextWriteLength);
+  /// Writer will flush to make more memory if the incoming input would make
+  /// it exceed memory budget with the default flush policy. Other policies
+  /// can intentionally throw and expect the application to retry.
+  ///
+  /// The current approach is to assume that the customer passes in slices of
+  /// similar sizes, perhaps even bounded by a configurable amount. We then
+  /// compute the soft_cap = hard_budget - expected_increment_per_slice, and
+  /// compare that against a dynamically determined flush_overhead +
+  /// current_total_usage and try to flush preemptively after writing each
+  /// slice/stride to bring the current memory usage below the soft_cap again.
+  ///
+  /// Using less memory than the soft_cap ensures being able to
+  /// write a new slice/stride, unless the slice/stride is drastically bigger
+  /// than the previous ones.
+  bool shouldFlush(const WriterContext& context, size_t nextWriteRows);
 
+  /// Low memory allows for the writer to write the same data with a lower
+  /// memory budget. Currently this method is only called locally to switch
+  /// encoding if we couldn't meet flush criteria without exceeding memory
+  /// budget.
+  ///
+  /// NOTE: switching encoding is not a good mitigation for immediate memory
+  /// pressure because the switch consumes even more memory than a flush.
   void enterLowMemoryMode();
 
   void abandonDictionaries() {
     writer_->tryAbandonDictionaries(true);
   }
 
+  void addUserMetadata(const std::string& key, const std::string& value) {
+    writerBase_->addUserMetadata(key, value);
+  }
+
+  WriterContext& getContext() const {
+    return writerBase_->getContext();
+  }
+
+  WriterSink& getSink() {
+    return writerBase_->getSink();
+  }
+
+  /// True if we can reclaim memory from this writer by memory arbitration.
+  bool canReclaim() const;
+
+  tsan_atomic<bool>& testingNonReclaimableSection() {
+    return *nonReclaimableSection_;
+  }
+
+ protected:
+  std::shared_ptr<WriterBase> writerBase_;
+
  private:
+  class MemoryReclaimer : public exec::MemoryReclaimer {
+   public:
+    static std::unique_ptr<memory::MemoryReclaimer> create(Writer* writer);
+
+    bool reclaimableBytes(
+        const memory::MemoryPool& pool,
+        uint64_t& reclaimableBytes) const override;
+
+    uint64_t reclaim(
+        memory::MemoryPool* pool,
+        uint64_t targetBytes,
+        uint64_t maxWaitMs,
+        memory::MemoryReclaimer::Stats& stats) override;
+
+   private:
+    explicit MemoryReclaimer(Writer* writer) : writer_(writer) {
+      VELOX_CHECK_NOT_NULL(writer_);
+    }
+
+    Writer* const writer_;
+  };
+
+  // Sets the memory reclaimers for all the memory pools used by this writer.
+  void setMemoryReclaimers(const std::shared_ptr<memory::MemoryPool>& pool);
+
+  // Invoked to ensure sufficient memory to process the given size of input by
+  // reserving memory from each of the leaf memory pool. This only applies if we
+  // support memory reclaim on this writer. The memory reservation might trigger
+  // stripe flush by memory arbitration if the query root memory pool doesn't
+  // enough memory capacity.
+  void ensureWriteFits(size_t appendBytes, size_t appendRows);
+
+  // Similar to 'ensureWriteFits' above to ensure sufficient memory to flush
+  // the buffered stripe data to disk.
+  void ensureStripeFlushFits();
+
+  // Grows a memory pool size by the specified ratio.
+  bool maybeReserveMemory(
+      MemoryUsageCategory memoryUsageCategory,
+      double estimatedMemoryGrowthRatio);
+
+  // Releases the unused memory reservations after we flush a stripe.
+  void releaseMemory();
+
   // Create a new stripe. No-op if there is no data written.
   void flushInternal(bool close = false);
 
@@ -213,17 +198,31 @@ class Writer : public WriterBase {
 
   void createRowIndexEntry() {
     writer_->createIndexEntry();
-    getContext().indexRowCount = 0;
+    writerBase_->getContext().resetIndexRowCount();
   }
 
   const std::shared_ptr<const dwio::common::TypeWithId> schema_;
-  std::unique_ptr<DWRFFlushPolicy> flushPolicy_;
-  std::function<
-      std::unique_ptr<LayoutPlanner>(StreamList, const EncodingContainer&)>
-      layoutPlannerFactory_;
-  std::unique_ptr<ColumnWriter> writer_;
+  const common::SpillConfig* const spillConfig_;
+  // If not null, used by memory arbitration to track if this file writer is
+  // under memory reclaimable section or not.
+  tsan_atomic<bool>* const nonReclaimableSection_{nullptr};
 
-  friend class WriterTestHelper;
+  std::unique_ptr<DWRFFlushPolicy> flushPolicy_;
+  std::unique_ptr<LayoutPlanner> layoutPlanner_;
+  std::unique_ptr<ColumnWriter> writer_;
 };
+
+class DwrfWriterFactory : public dwio::common::WriterFactory {
+ public:
+  DwrfWriterFactory() : WriterFactory(dwio::common::FileFormat::DWRF) {}
+
+  std::unique_ptr<dwio::common::Writer> createWriter(
+      std::unique_ptr<dwio::common::FileSink> sink,
+      const dwio::common::WriterOptions& options) override;
+};
+
+void registerDwrfWriterFactory();
+
+void unregisterDwrfWriterFactory();
 
 } // namespace facebook::velox::dwrf

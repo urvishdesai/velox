@@ -48,14 +48,14 @@ class SwitchExpr : public SpecialForm {
       EvalCtx& context,
       VectorPtr& result) override;
 
-  bool propagatesNulls() const override;
-
   bool isConditional() const override {
     return true;
   }
 
  private:
   static TypePtr resolveType(const std::vector<TypePtr>& argTypes);
+
+  void computePropagatesNulls() override;
 
   const size_t numCases_;
   const bool hasElseClause_;
@@ -71,7 +71,8 @@ class SwitchCallToSpecialForm : public FunctionCallToSpecialForm {
   ExprPtr constructSpecialForm(
       const TypePtr& type,
       std::vector<ExprPtr>&& compiledChildren,
-      bool trackCpuUsage) override;
+      bool trackCpuUsage,
+      const core::QueryConfig& config) override;
 };
 
 class IfCallToSpecialForm : public SwitchCallToSpecialForm {

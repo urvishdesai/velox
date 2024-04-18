@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/type/SimpleFunctionApi.h"
 #include "velox/type/Type.h"
 
 namespace facebook::velox {
@@ -30,18 +31,22 @@ class CastOperator;
 // OpaqueCustomTypeRegister<T, "type"> wont compile.
 // but static constexpr char* type = "type", OpaqueCustomTypeRegister<T, type>
 // works.
-template <typename T, const char* name>
+template <typename T, const char* customTypeName>
 class OpaqueCustomTypeRegister {
  public:
-  static void registerType() {
-    facebook::velox::registerCustomType(
-        name, std::make_unique<const TypeFactory>());
+  static bool registerType() {
+    return facebook::velox::registerCustomType(
+        customTypeName, std::make_unique<const TypeFactory>());
+  }
+
+  static bool unregisterType() {
+    return facebook::velox::unregisterCustomType(customTypeName);
   }
 
   // Type used in the simple function interface as CustomType<TypeT>.
   struct TypeT {
     using type = std::shared_ptr<T>;
-    static constexpr const char* typeName = name;
+    static constexpr const char* typeName = customTypeName;
   };
 
   using SimpleType = CustomType<TypeT>;
@@ -64,8 +69,12 @@ class OpaqueCustomTypeRegister {
       return this == &other;
     }
 
+    const char* name() const override {
+      return customTypeName;
+    }
+
     std::string toString() const override {
-      return name;
+      return customTypeName;
     }
   };
 

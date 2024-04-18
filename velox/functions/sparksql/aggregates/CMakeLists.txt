@@ -11,9 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-add_library(velox_functions_spark_aggregates LastAggregate.cpp Register.cpp)
+add_library(
+  velox_functions_spark_aggregates
+  AverageAggregate.cpp
+  BitwiseXorAggregate.cpp
+  BloomFilterAggAggregate.cpp
+  CentralMomentsAggregate.cpp
+  CollectListAggregate.cpp
+  FirstLastAggregate.cpp
+  MinMaxByAggregate.cpp
+  Register.cpp
+  RegrReplacementAggregate.cpp
+  SumAggregate.cpp)
 
-target_link_libraries(velox_functions_spark_aggregates ${FMT} velox_exec
+target_link_libraries(velox_functions_spark_aggregates fmt::fmt velox_exec
                       velox_expression_functions velox_aggregates velox_vector)
 
 if(${VELOX_BUILD_TESTING})

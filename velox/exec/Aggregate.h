@@ -15,9 +15,18 @@
  */
 #pragma once
 
+#include <folly/Synchronized.h>
+
 #include "velox/common/memory/HashStringAllocator.h"
 #include "velox/core/PlanNode.h"
+#include "velox/core/QueryConfig.h"
+#include "velox/exec/AggregateUtil.h"
+#include "velox/expression/FunctionSignature.h"
 #include "velox/vector/BaseVector.h"
+
+namespace facebook::velox::core {
+class ExpressionEvaluator;
+}
 
 namespace facebook::velox::exec {
 
@@ -33,12 +42,12 @@ bool isPartialOutput(core::AggregationNode::Step step);
 
 class Aggregate {
  protected:
-  explicit Aggregate(TypePtr resultType) : resultType_(resultType) {}
+  explicit Aggregate(TypePtr resultType) : resultType_(std::move(resultType)) {}
 
  public:
   virtual ~Aggregate() {}
 
-  TypePtr resultType() const {
+  const TypePtr& resultType() const {
     return resultType_;
   }
 
@@ -52,10 +61,6 @@ class Aggregate {
   virtual int32_t accumulatorAlignmentSize() const {
     return 1;
   }
-
-  /// Return an alignment that satisfies both the accumulator alignment
-  /// requirement of this function and the alignment passed in.
-  int32_t combineAlignment(int32_t alignment) const;
 
   // Return true if accumulator is allocated from external memory, e.g. memory
   // not managed by Velox.
@@ -75,14 +80,35 @@ class Aggregate {
     return true;
   }
 
-  void setAllocator(HashStringAllocator* allocator) {
-    allocator_ = allocator;
+  /// Returns true if toIntermediate() is supported.
+  virtual bool supportsToIntermediate() const {
+    return false;
   }
+
+  void setAllocator(HashStringAllocator* allocator) {
+    setAllocatorInternal(allocator);
+  }
+
+  /// Called for functions that take one or more lambda expression as input.
+  /// These expressions must appear after all non-lambda inputs.
+  /// These expressions cannot use captures.
+  ///
+  /// @param lambdaExpressions A list of lambda inputs (in the order they appear
+  /// in function call).
+  /// @param expressionEvaluator An instance of ExpressionEvaluator to use for
+  /// evaluating lambda expressions.
+  void setLambdaExpressions(
+      std::vector<core::LambdaTypedExprPtr> lambdaExpressions,
+      std::shared_ptr<core::ExpressionEvaluator> expressionEvaluator);
 
   // Sets the offset and null indicator position of 'this'.
   // @param offset Offset in bytes from the start of the row of the accumulator
   // @param nullByte Offset in bytes from the start of the row of the null flag
   // @param nullMask The specific bit in the nullByte that stores the null flag
+  // @param initializedByte Offset in bytes from the start of the row of the
+  // initialized flag
+  // @param initializedMask The specific bit in the initializedByte that stores
+  // the initialized flag
   // @param rowSizeOffset The offset of a uint32_t row size from the start of
   // the row. Only applies to accumulators that store variable size data out of
   // line. Fixed length accumulators do not use this. 0 if the row does not have
@@ -91,11 +117,16 @@ class Aggregate {
       int32_t offset,
       int32_t nullByte,
       uint8_t nullMask,
+      int32_t initializedByte,
+      int8_t initializedMask,
       int32_t rowSizeOffset) {
-    nullByte_ = nullByte;
-    nullMask_ = nullMask;
-    offset_ = offset;
-    rowSizeOffset_ = rowSizeOffset;
+    setOffsetsInternal(
+        offset,
+        nullByte,
+        nullMask,
+        initializedByte,
+        initializedMask,
+        rowSizeOffset);
   }
 
   // Initializes null flags and accumulators for newly encountered groups.  This
@@ -105,7 +136,13 @@ class Aggregate {
   // @param indices Indices into 'groups' of the new entries.
   virtual void initializeNewGroups(
       char** groups,
-      folly::Range<const vector_size_t*> indices) = 0;
+      folly::Range<const vector_size_t*> indices) {
+    initializeNewGroupsInternal(groups, indices);
+
+    for (auto index : indices) {
+      groups[index][initializedByte_] |= initializedMask_;
+    }
+  }
 
   // Single Aggregate instance is able to take both raw data and
   // intermediate result as input based on the assumption that Partial
@@ -188,7 +225,11 @@ class Aggregate {
   //
   // 'result' and its parts are expected to be singly referenced. If
   // other threads or operators hold references that they would use
-  // after 'result' has been updated by this, effects will b unpredictable.
+  // after 'result' has been updated by this, effects will be unpredictable.
+  // This method should not have side effects, i.e., calling this method
+  // doesn't change the content of the accumulators. This is needed for an
+  // optimization in Window operator where aggregations for expanding frames are
+  // computed incrementally.
   virtual void
   extractValues(char** groups, int32_t numGroups, VectorPtr* result) = 0;
 
@@ -197,26 +238,72 @@ class Aggregate {
   // @param numGroups Number of groups to extract results from.
   // @param result The result vector to store the results in.
   //
-  // See comment on 'result' in extractValues().
+  // See comment on 'result' and side effects in extractValues().
   virtual void
   extractAccumulators(char** groups, int32_t numGroups, VectorPtr* result) = 0;
 
+  /// Produces an accumulator initialized from a single value for each
+  /// row in 'rows'. The raw arguments of the aggregate are in 'args',
+  /// which have the same meaning as in addRawInput. The result is
+  /// placed in 'result'. 'result' is expected to be a writable flat vector of
+  /// the right type.
+  ///
+  /// @param rows A set of rows to produce intermediate results for. The
+  /// 'result' is expected to have rows.size() rows. Invalid rows represent rows
+  /// that were masked out, these need to have correct intermediate results as
+  /// well. It is possible that all entries in 'rows' are invalid (masked out).
+  virtual void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const {
+    VELOX_NYI("toIntermediate not supported");
+  }
+
   // Frees any out of line storage for the accumulator in
-  // 'groups'. No-op for fixed length accumulators.
-  virtual void destroy(folly::Range<char**> /*groups*/) {}
+  // 'groups' and marks the aggregate as uninitialized.
+  virtual void destroy(folly::Range<char**> groups) {
+    destroyInternal(groups);
+
+    for (auto* group : groups) {
+      group[initializedByte_] &= ~initializedMask_;
+    }
+  }
 
   // Clears state between reuses, e.g. this is called before reusing
   // the aggregation operator's state after flushing a partial
   // aggregation.
   void clear() {
-    numNulls_ = 0;
+    clearInternal();
   }
 
+  void enableValidateIntermediateInputs() {
+    validateIntermediateInputs_ = true;
+  }
+
+  /// Creates an instance of aggregate function to accumulate a mix of raw input
+  /// and intermediate results and produce either intermediate or final result.
+  ///
+  /// The caller will call setAllocator and setOffsets before starting to add
+  /// data via initializeNewGroups, addRawInput, addIntermediateResults, etc.
+  ///
+  /// @param name Function name, e.g. min, max, sum, avg.
+  /// @param step Either kPartial or kSingle. Determines the type of result:
+  /// intermediate if kPartial, final if kSingle. Partial and intermediate
+  /// aggregations create functions using kPartial. Single and final
+  /// aggregations create functions using kSingle.
+  /// @param argTypes Raw input types. Combined with the function name, uniquely
+  /// identifies the function.
+  /// @param resultType Intermediate result type if step is kPartial. Final
+  /// result type is step is kFinal. This parameter is redundant since it can be
+  /// derived from rawInput types and step. Present for legacy reasons.
+  /// @param config Query config.
+  /// @return An instance of the aggregate function.
   static std::unique_ptr<Aggregate> create(
       const std::string& name,
       core::AggregationNode::Step step,
       const std::vector<TypePtr>& argTypes,
-      const TypePtr& resultType);
+      const TypePtr& resultType,
+      const core::QueryConfig& config);
 
   // Returns the intermediate type for 'name' with signature
   // 'argTypes'. Throws if cannot resolve.
@@ -225,15 +312,52 @@ class Aggregate {
       const std::vector<TypePtr>& argTypes);
 
  protected:
+  virtual void setAllocatorInternal(HashStringAllocator* allocator);
+
+  virtual void setOffsetsInternal(
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t initializedByte,
+      uint8_t initializedMask,
+      int32_t rowSizeOffset);
+
+  virtual void clearInternal();
+
+  // Initializes null flags and accumulators for newly encountered groups.  This
+  // function should be called only once for each group.
+  //
+  // @param groups Pointers to the start of the new group rows.
+  // @param indices Indices into 'groups' of the new entries.
+  virtual void initializeNewGroupsInternal(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) = 0;
+
+  // Frees any out of line storage for the accumulator in
+  // 'groups'. No-op for fixed length accumulators.
+  virtual void destroyInternal(folly::Range<char**> groups) {}
+
+  // Helper function to pass single input argument directly as intermediate
+  // result.
+  void singleInputAsIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const;
+
   // Shorthand for maintaining accumulator variable length size in
   // accumulator update methods. Use like: { auto tracker =
   // trackRowSize(group); update(group); }
   RowSizeTracker<char, uint32_t> trackRowSize(char* group) {
+    VELOX_DCHECK(!isFixedSize());
     return RowSizeTracker<char, uint32_t>(group[rowSizeOffset_], *allocator_);
   }
 
   bool isNull(char* group) const {
     return numNulls_ && (group[nullByte_] & nullMask_);
+  }
+
+  bool isInitialized(char* group) const {
+    return group[initializedByte_] & initializedMask_;
   }
 
   // Sets null flag for all specified groups to true.
@@ -276,9 +400,25 @@ class Aggregate {
   }
 
   template <typename T>
+  void destroyAccumulator(char* group) const {
+    if (isInitialized(group)) {
+      auto accumulator = value<T>(group);
+      std::destroy_at(accumulator);
+      ::memset(accumulator, 0, sizeof(T));
+    }
+  }
+
+  template <typename T>
+  void destroyAccumulators(folly::Range<char**> groups) const {
+    for (auto group : groups) {
+      destroyAccumulator<T>(group);
+    }
+  }
+
+  template <typename T>
   static uint64_t* getRawNulls(T* vector) {
     if (vector->mayHaveNulls()) {
-      BufferPtr nulls = vector->mutableNulls(vector->size());
+      BufferPtr& nulls = vector->mutableNulls(vector->size());
       return nulls->asMutable<uint64_t>();
     } else {
       return nullptr;
@@ -296,6 +436,9 @@ class Aggregate {
   // Byte position of null flag in group row.
   int32_t nullByte_;
   uint8_t nullMask_;
+  // Byte position of the initialized flag in group row.
+  int32_t initializedByte_;
+  uint8_t initializedMask_;
   // Offset of fixed length accumulator state in group row.
   int32_t offset_;
 
@@ -311,45 +454,108 @@ class Aggregate {
   // operator for this aggregate. If 0, clearing the null as part of update
   // is not needed.
   uint64_t numNulls_ = 0;
-  HashStringAllocator* allocator_;
+  HashStringAllocator* allocator_{nullptr};
+  std::shared_ptr<core::ExpressionEvaluator> expressionEvaluator_{nullptr};
+  std::vector<core::LambdaTypedExprPtr> lambdaExpressions_;
 
   // When selectivity vector has holes, in the pushdown, we need to generate a
   // different indices vector as the one we get from the DecodedVector is simply
   // sequential.
   std::vector<vector_size_t> pushdownCustomIndices_;
+
+  bool validateIntermediateInputs_ = false;
 };
 
 using AggregateFunctionFactory = std::function<std::unique_ptr<Aggregate>(
     core::AggregationNode::Step step,
     const std::vector<TypePtr>& argTypes,
-    const TypePtr& resultType)>;
+    const TypePtr& resultType,
+    const core::QueryConfig& config)>;
 
-/// Register an aggregate function with the specified name and signatures.
-bool registerAggregateFunction(
+struct AggregateFunctionMetadata {
+  /// True if results of the aggregation depend on the order of inputs. For
+  /// example, array_agg is order sensitive while count is not.
+  bool orderSensitive{true};
+};
+/// Register an aggregate function with the specified name and signatures. If
+/// registerCompanionFunctions is true, also register companion aggregate and
+/// scalar functions with it. When functions with `name` already exist, if
+/// overwrite is true, existing registration will be replaced. Otherwise, return
+/// false without overwriting the registry.
+AggregateRegistrationResult registerAggregateFunction(
     const std::string& name,
-    std::vector<std::shared_ptr<AggregateFunctionSignature>> signatures,
-    AggregateFunctionFactory factory);
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const AggregateFunctionFactory& factory,
+    bool registerCompanionFunctions,
+    bool overwrite);
+
+AggregateRegistrationResult registerAggregateFunction(
+    const std::string& name,
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const AggregateFunctionFactory& factory,
+    const AggregateFunctionMetadata& metadata,
+    bool registerCompanionFunctions,
+    bool overwrite);
+
+// Register an aggregation function with multiple names. Returns a vector of
+// AggregateRegistrationResult, one for each name at the corresponding index.
+std::vector<AggregateRegistrationResult> registerAggregateFunction(
+    const std::vector<std::string>& names,
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const AggregateFunctionFactory& factory,
+    bool registerCompanionFunctions,
+    bool overwrite);
+
+std::vector<AggregateRegistrationResult> registerAggregateFunction(
+    const std::vector<std::string>& names,
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const AggregateFunctionFactory& factory,
+    const AggregateFunctionMetadata& metadata,
+    bool registerCompanionFunctions,
+    bool overwrite);
 
 /// Returns signatures of the aggregate function with the specified name.
 /// Returns empty std::optional if function with that name is not found.
 std::optional<std::vector<std::shared_ptr<AggregateFunctionSignature>>>
 getAggregateFunctionSignatures(const std::string& name);
 
-using AggregateFunctionSignatureMap = std::unordered_map<
-    std::string,
-    std::vector<std::shared_ptr<AggregateFunctionSignature>>>;
+using AggregateFunctionSignatureMap =
+    std::unordered_map<std::string, std::vector<AggregateFunctionSignaturePtr>>;
 
 /// Returns a mapping of all Aggregate functions in registry.
 /// The mapping is function name -> list of function signatures.
 AggregateFunctionSignatureMap getAggregateFunctionSignatures();
 
 struct AggregateFunctionEntry {
-  std::vector<std::shared_ptr<AggregateFunctionSignature>> signatures;
+  std::vector<AggregateFunctionSignaturePtr> signatures;
   AggregateFunctionFactory factory;
+  AggregateFunctionMetadata metadata;
 };
 
-using AggregateFunctionMap =
-    std::unordered_map<std::string, AggregateFunctionEntry>;
+using AggregateFunctionMap = folly::Synchronized<
+    std::unordered_map<std::string, AggregateFunctionEntry>>;
 
 AggregateFunctionMap& aggregateFunctions();
+
+const AggregateFunctionEntry* FOLLY_NULLABLE
+getAggregateFunctionEntry(const std::string& name);
+
+struct CompanionSignatureEntry {
+  std::string functionName;
+  std::vector<FunctionSignaturePtr> signatures;
+};
+
+struct CompanionFunctionSignatureMap {
+  std::vector<CompanionSignatureEntry> partial;
+  std::vector<CompanionSignatureEntry> merge;
+  std::vector<CompanionSignatureEntry> extract;
+  std::vector<CompanionSignatureEntry> mergeExtract;
+};
+
+// Returns a map of potential companion function signatures the specified
+// aggregation function would have. Notice that the registration of the
+// specified aggregation function needs to register companion functions together
+// for them to be used in queries.
+std::optional<CompanionFunctionSignatureMap> getCompanionFunctionSignatures(
+    const std::string& name);
 } // namespace facebook::velox::exec

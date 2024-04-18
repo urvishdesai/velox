@@ -13,24 +13,26 @@
 # limitations under the License.
 add_executable(
   velox_type_test
-  StringViewTest.cpp
-  TypeTest.cpp
+  ConversionsTest.cpp
   DecimalTest.cpp
   FilterTest.cpp
+  FilterSerDeTest.cpp
+  HugeIntTest.cpp
+  StringViewTest.cpp
   SubfieldTest.cpp
   TimestampConversionTest.cpp
-  VariantTest.cpp
-  TimestampTest.cpp)
+  TimestampTest.cpp
+  TypeTest.cpp
+  VariantTest.cpp)
 
 add_test(velox_type_test velox_type_test)
 
 target_link_libraries(
   velox_type_test
   velox_type
-  velox_serialization
+  velox_common_base
   velox_external_date
-  ${FOLLY}
-  ${DOUBLE_CONVERSION}
+  Folly::folly
   gtest
   gtest_main
   gmock
@@ -43,9 +45,8 @@ target_link_libraries(
   velox_filter_benchmark
   velox_type
   velox_serialization
-  ${FOLLY}
+  Folly::folly
   ${FOLLY_BENCHMARK}
-  ${DOUBLE_CONVERSION}
   gtest
   gtest_main
   gflags::gflags
@@ -58,9 +59,8 @@ target_link_libraries(
   velox_negated_values_filter_benchmark
   velox_type
   velox_serialization
-  ${FOLLY}
+  Folly::folly
   ${FOLLY_BENCHMARK}
-  ${DOUBLE_CONVERSION}
   gtest
   gtest_main
   gflags::gflags
@@ -73,9 +73,8 @@ target_link_libraries(
   velox_negated_bytes_values_benchmark
   velox_type
   velox_serialization
-  ${FOLLY}
+  Folly::folly
   ${FOLLY_BENCHMARK}
-  ${DOUBLE_CONVERSION}
   gtest
   gtest_main
   gflags::gflags
@@ -88,9 +87,8 @@ target_link_libraries(
   velox_negated_bigint_range_benchmark
   velox_type
   velox_serialization
-  ${FOLLY}
+  Folly::folly
   ${FOLLY_BENCHMARK}
-  ${DOUBLE_CONVERSION}
   gtest
   gtest_main
   gflags::gflags
@@ -103,9 +101,8 @@ target_link_libraries(
   velox_negated_bytes_range_benchmark
   velox_type
   velox_serialization
-  ${FOLLY}
+  Folly::folly
   ${FOLLY_BENCHMARK}
-  ${DOUBLE_CONVERSION}
   gtest
   gtest_main
   gflags::gflags
@@ -116,9 +113,8 @@ add_executable(velox_string_view_benchmark StringViewBenchmark.cpp)
 target_link_libraries(
   velox_string_view_benchmark
   velox_type
-  ${FOLLY}
+  Folly::folly
   ${FOLLY_BENCHMARK}
-  ${DOUBLE_CONVERSION}
   gtest
   gtest_main
   gflags::gflags

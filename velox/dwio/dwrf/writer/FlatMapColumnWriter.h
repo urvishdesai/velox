@@ -69,7 +69,7 @@ class ValueStatisticsBuilder {
       WriterContext& context,
       const dwio::common::TypeWithId& type,
       const StatisticsBuilderOptions& options) {
-    auto builder = StatisticsBuilder::create(*type.type, options);
+    auto builder = StatisticsBuilder::create(*type.type(), options);
 
     std::vector<std::unique_ptr<ValueStatisticsBuilder>> children{};
     for (size_t i = 0; i < type.size(); ++i) {
@@ -77,7 +77,7 @@ class ValueStatisticsBuilder {
     }
 
     return std::make_unique<ValueStatisticsBuilder>(
-        context, type.id, std::move(builder), std::move(children));
+        context, type.id(), std::move(builder), std::move(children));
   }
 
   WriterContext& context_;
@@ -101,7 +101,10 @@ class ValueWriter {
       : sequence_{sequence},
         keyInfo_{keyInfo},
         inMap_{createBooleanRleEncoder(context.newStream(
-            {type.id, sequence, type.column, StreamKind::StreamKind_IN_MAP}))},
+            {type.id(),
+             sequence,
+             type.column(),
+             StreamKind::StreamKind_IN_MAP}))},
         columnWriter_{BaseColumnWriter::create(
             context,
             type,
@@ -117,7 +120,13 @@ class ValueWriter {
 
   void addOffset(uint64_t offset, uint64_t inMapIndex) {
     if (UNLIKELY(inMapBuffer_[inMapIndex])) {
-      DWIO_RAISE("Duplicate key in map");
+      std::string duplicatedKey = "<unknown>";
+      if (keyInfo_.has_byteskey()) {
+        duplicatedKey = keyInfo_.byteskey();
+      } else if (keyInfo_.has_intkey()) {
+        duplicatedKey = std::to_string(keyInfo_.intkey());
+      }
+      DWIO_RAISE("Duplicated key in map: ", duplicatedKey);
     }
 
     ranges_.add(offset, offset + 1);
@@ -316,7 +325,7 @@ class FlatMapColumnWriter<TypeKind::INVALID> {
       const uint32_t sequence) {
     DWIO_ENSURE_EQ(type.size(), 2, "Map should have exactly two children");
 
-    auto kind = type.childAt(0)->type->kind();
+    const auto kind = type.childAt(0)->type()->kind();
     switch (kind) {
       case TypeKind::TINYINT:
         return std::make_unique<FlatMapColumnWriter<TypeKind::TINYINT>>(

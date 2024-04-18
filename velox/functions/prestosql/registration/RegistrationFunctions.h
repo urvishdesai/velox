@@ -25,6 +25,8 @@ void registerComparisonFunctions(const std::string& prefix = "");
 
 void registerArrayFunctions(const std::string& prefix = "");
 
+void registerInternalFunctions();
+
 void registerMapFunctions(const std::string& prefix = "");
 
 void registerJsonFunctions(const std::string& prefix = "");
@@ -38,6 +40,8 @@ void registerDateTimeFunctions(const std::string& prefix = "");
 void registerURLFunctions(const std::string& prefix = "");
 
 void registerStringFunctions(const std::string& prefix = "");
+
+void registerBinaryFunctions(const std::string& prefix = "");
 
 void registerBitwiseFunctions(const std::string& prefix = "");
 

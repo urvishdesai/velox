@@ -41,11 +41,11 @@ void findProjectedNodes(
   // if a leaf node is projected, all the intermediate node from root to the
   // node should also be projected. So we can return as soon as seeing node that
   // is not projected
-  if (!isProjected(expected.id)) {
+  if (!isProjected(expected.id())) {
     return;
   }
-  projectedNodes.insert(actual.id);
-  switch (actual.type->kind()) {
+  projectedNodes.insert(actual.id());
+  switch (actual.type()->kind()) {
     case TypeKind::ROW: {
       uint64_t childCount = std::min(expected.size(), actual.size());
       for (uint64_t i = 0; i < childCount; ++i) {
@@ -107,17 +107,26 @@ std::function<BufferPtr()>
 StripeStreamsBase::getIntDictionaryInitializerForNode(
     const EncodingKey& ek,
     uint64_t elementWidth,
+    const StreamLabels& streamLabels,
     uint64_t dictionaryWidth) {
   // Create local copy for manipulation
   EncodingKey localEk{ek};
   auto dictData = localEk.forKind(proto::Stream_Kind_DICTIONARY_DATA);
-  auto dataStream = getStream(dictData, false);
+  auto dataStream = getStream(dictData, streamLabels.label(), false);
   auto dictionarySize = getEncoding(localEk).dictionarysize();
   // Try fetching shared dictionary streams instead.
   if (!dataStream) {
-    localEk = EncodingKey(ek.node, 0);
+    // Get the label of the top level column, since this dictionary is shared by
+    // the entire column
+    auto label = streamLabels.label();
+    // Shouldn't be empty, but just in case
+    if (!label.empty()) {
+      // Ex: "/5/1759392083" -> "/5"
+      label = label.substr(0, label.find('/', 1));
+    }
+    localEk = EncodingKey(ek.node(), 0);
     dictData = localEk.forKind(proto::Stream_Kind_DICTIONARY_DATA);
-    dataStream = getStream(dictData, false);
+    dataStream = getStream(dictData, label, false);
   }
   bool dictVInts = getUseVInts(dictData);
   DWIO_ENSURE(dataStream.get());
@@ -137,7 +146,7 @@ StripeStreamsBase::getIntDictionaryInitializerForNode(
 }
 
 void StripeStreamsImpl::loadStreams() {
-  auto& footer = reader_.getStripeFooter();
+  auto& stripeFooter = *readState_->stripeMetadata->footer;
 
   // HACK!!!
   // Column selector filters based on requested schema (ie, table schema), while
@@ -147,7 +156,7 @@ void StripeStreamsImpl::loadStreams() {
   // schema properly
   BitSet projectedNodes(0);
   auto expected = selector_.getSchemaWithId();
-  auto actual = reader_.getReader().getSchemaWithId();
+  auto actual = readState_->readerBase->getSchemaWithId();
   findProjectedNodes(projectedNodes, *expected, *actual, [&](uint32_t node) {
     return selector_.shouldReadNode(node);
   });
@@ -163,13 +172,13 @@ void StripeStreamsImpl::loadStreams() {
   };
 
   uint64_t streamOffset = 0;
-  for (auto& stream : footer.streams()) {
+  for (auto& stream : stripeFooter.streams()) {
     addStream(stream, streamOffset);
   }
 
   // update column encoding for each stream
-  for (uint32_t i = 0; i < footer.encoding_size(); ++i) {
-    auto& e = footer.encoding(i);
+  for (uint32_t i = 0; i < stripeFooter.encoding_size(); ++i) {
+    auto& e = stripeFooter.encoding(i);
     auto node = e.has_node() ? e.node() : i;
     if (projectedNodes.contains(node)) {
       encodings_[{node, e.has_sequence() ? e.sequence() : 0}] = i;
@@ -177,10 +186,11 @@ void StripeStreamsImpl::loadStreams() {
   }
 
   // handle encrypted columns
-  auto& handler = reader_.getDecryptionHandler();
+  auto& handler = *readState_->stripeMetadata->handler;
   if (handler.isEncrypted()) {
     DWIO_ENSURE_EQ(
-        handler.getEncryptionGroupCount(), footer.encryptiongroups_size());
+        handler.getEncryptionGroupCount(),
+        stripeFooter.encryptiongroups_size());
     folly::F14FastSet<uint32_t> groupIndices;
     bits::forEachSetBit(
         projectedNodes.bits(), 0, projectedNodes.max() + 1, [&](uint32_t node) {
@@ -191,11 +201,12 @@ void StripeStreamsImpl::loadStreams() {
 
     // decrypt encryption groups
     for (auto index : groupIndices) {
-      auto& group = footer.encryptiongroups(index);
+      auto& group = stripeFooter.encryptiongroups(index);
       auto groupProto =
-          reader_.getReader().readProtoFromString<proto::StripeEncryptionGroup>(
-              group,
-              std::addressof(handler.getEncryptionProviderByIndex(index)));
+          readState_->readerBase
+              ->readProtoFromString<proto::StripeEncryptionGroup>(
+                  group,
+                  std::addressof(handler.getEncryptionProviderByIndex(index)));
       streamOffset = 0;
       for (auto& stream : groupProto->streams()) {
         addStream(stream, streamOffset);
@@ -214,7 +225,9 @@ void StripeStreamsImpl::loadStreams() {
 }
 
 std::unique_ptr<dwio::common::SeekableInputStream>
-StripeStreamsImpl::getCompressedStream(const DwrfStreamIdentifier& si) const {
+StripeStreamsImpl::getCompressedStream(
+    const DwrfStreamIdentifier& si,
+    std::string_view label) const {
   const auto& info = getStreamInfo(si);
 
   std::unique_ptr<dwio::common::SeekableInputStream> streamRead;
@@ -223,8 +236,8 @@ StripeStreamsImpl::getCompressedStream(const DwrfStreamIdentifier& si) const {
   }
 
   if (!streamRead) {
-    streamRead = reader_.getStripeInput().enqueue(
-        {info.getOffset() + stripeStart_, info.getLength()}, &si);
+    streamRead = readState_->stripeMetadata->stripeInput->enqueue(
+        {info.getOffset() + stripeStart_, info.getLength(), label}, &si);
   }
 
   DWIO_ENSURE(streamRead != nullptr, " Stream can't be read", si.toString());
@@ -241,7 +254,7 @@ StripeStreamsImpl::getEncodingKeys() const {
   folly::F14FastMap<uint32_t, std::vector<uint32_t>> encodingKeys;
   for (const auto& kv : encodings_) {
     const auto ek = kv.first;
-    encodingKeys[ek.node].push_back(ek.sequence);
+    encodingKeys[ek.node()].push_back(ek.sequence());
   }
 
   return encodingKeys;
@@ -253,7 +266,7 @@ StripeStreamsImpl::getStreamIdentifiers() const {
       nodeToStreamIdMap;
 
   for (const auto& kv : streams_) {
-    nodeToStreamIdMap[kv.first.encodingKey().node].push_back(kv.first);
+    nodeToStreamIdMap[kv.first.encodingKey().node()].push_back(kv.first);
   }
 
   return nodeToStreamIdMap;
@@ -261,6 +274,7 @@ StripeStreamsImpl::getStreamIdentifiers() const {
 
 std::unique_ptr<dwio::common::SeekableInputStream> StripeStreamsImpl::getStream(
     const DwrfStreamIdentifier& si,
+    std::string_view label,
     bool /* throwIfNotFound*/) const {
   // if not found, return an empty {}
   const auto& info = getStreamInfo(si, false /* throwIfNotFound */);
@@ -274,8 +288,8 @@ std::unique_ptr<dwio::common::SeekableInputStream> StripeStreamsImpl::getStream(
   }
 
   if (!streamRead) {
-    streamRead = reader_.getStripeInput().enqueue(
-        {info.getOffset() + stripeStart_, info.getLength()}, &si);
+    streamRead = readState_->stripeMetadata->stripeInput->enqueue(
+        {info.getOffset() + stripeStart_, info.getLength(), label}, &si);
   }
 
   if (!streamRead) {
@@ -284,10 +298,10 @@ std::unique_ptr<dwio::common::SeekableInputStream> StripeStreamsImpl::getStream(
 
   auto streamDebugInfo =
       fmt::format("Stripe {} Stream {}", stripeIndex_, si.toString());
-  return reader_.getReader().createDecompressedStream(
+  return readState_->readerBase->createDecompressedStream(
       std::move(streamRead),
       streamDebugInfo,
-      getDecrypter(si.encodingKey().node));
+      getDecrypter(si.encodingKey().node()));
 }
 
 uint32_t StripeStreamsImpl::visitStreamsOfNode(
@@ -295,7 +309,7 @@ uint32_t StripeStreamsImpl::visitStreamsOfNode(
     std::function<void(const StreamInformation&)> visitor) const {
   uint32_t count = 0;
   for (auto& item : streams_) {
-    if (item.first.encodingKey().node == node) {
+    if (item.first.encodingKey().node() == node) {
       visitor(item.second);
       ++count;
     }
@@ -317,8 +331,7 @@ std::unique_ptr<dwio::common::SeekableInputStream>
 StripeStreamsImpl::getIndexStreamFromCache(
     const StreamInformation& info) const {
   std::unique_ptr<dwio::common::SeekableInputStream> indexStream;
-  auto& reader = reader_.getReader();
-  auto& metadataCache = reader.getMetadataCache();
+  auto& metadataCache = readState_->readerBase->getMetadataCache();
   if (metadataCache) {
     auto indexBase = metadataCache->get(StripeCacheMode::INDEX, stripeIndex_);
     if (indexBase) {
@@ -346,7 +359,7 @@ void StripeStreamsImpl::loadReadPlan() {
     readPlanLoaded_ = true;
   };
 
-  auto& input = reader_.getStripeInput();
+  auto& input = *readState_->stripeMetadata->stripeInput;
   input.load(LogType::STREAM_BUNDLE);
 }
 

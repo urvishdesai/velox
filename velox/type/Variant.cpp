@@ -16,8 +16,10 @@
 
 #include "velox/type/Variant.h"
 #include <cfloat>
-#include "common/encode/Base64.h"
 #include "folly/json.h"
+#include "velox/common/encode/Base64.h"
+#include "velox/type/DecimalUtil.h"
+#include "velox/type/HugeInt.h"
 
 namespace facebook::velox {
 
@@ -63,71 +65,6 @@ struct VariantEquality<TypeKind::TIMESTAMP> {
       return evaluateNullEquality<NullEqualsNull>(a, b);
     } else {
       return a.value<TypeKind::TIMESTAMP>() == b.value<TypeKind::TIMESTAMP>();
-    }
-  }
-};
-
-// date
-template <>
-struct VariantEquality<TypeKind::DATE> {
-  template <bool NullEqualsNull>
-  static bool equals(const variant& a, const variant& b) {
-    if (a.isNull() || b.isNull()) {
-      return evaluateNullEquality<NullEqualsNull>(a, b);
-    } else {
-      return a.value<TypeKind::DATE>() == b.value<TypeKind::DATE>();
-    }
-  }
-};
-
-template <>
-struct VariantEquality<TypeKind::SHORT_DECIMAL> {
-  template <bool NullEqualsNull>
-  static bool equals(const variant& a, const variant& b) {
-    const auto lhs = a.value<TypeKind::SHORT_DECIMAL>();
-    const auto rhs = b.value<TypeKind::SHORT_DECIMAL>();
-    const auto lType = DECIMAL(lhs.precision, lhs.scale);
-    const auto rType = DECIMAL(rhs.precision, rhs.scale);
-    if (!lType->equivalent(*rType)) {
-      return false;
-    }
-    if (a.isNull() || b.isNull()) {
-      return evaluateNullEquality<NullEqualsNull>(a, b);
-    } else {
-      return lhs.value() == rhs.value();
-    }
-  }
-};
-
-template <>
-struct VariantEquality<TypeKind::LONG_DECIMAL> {
-  template <bool NullEqualsNull>
-  static bool equals(const variant& a, const variant& b) {
-    const auto lhs = a.value<TypeKind::LONG_DECIMAL>();
-    const auto rhs = b.value<TypeKind::LONG_DECIMAL>();
-    const auto lType = DECIMAL(lhs.precision, lhs.scale);
-    const auto rType = DECIMAL(rhs.precision, rhs.scale);
-    if (!lType->equivalent(*rType)) {
-      return false;
-    }
-    if (a.isNull() || b.isNull()) {
-      return evaluateNullEquality<NullEqualsNull>(a, b);
-    } else {
-      return lhs.value() == rhs.value();
-    }
-  }
-};
-
-// interval day time
-template <>
-struct VariantEquality<TypeKind::INTERVAL_DAY_TIME> {
-  template <bool NullEqualsNull>
-  static bool equals(const variant& a, const variant& b) {
-    if (a.isNull() || b.isNull()) {
-      return evaluateNullEquality<NullEqualsNull>(a, b);
-    } else {
-      return a.value<TypeKind::INTERVAL_DAY_TIME>() ==
-          b.value<TypeKind::INTERVAL_DAY_TIME>();
     }
   }
 };
@@ -226,6 +163,23 @@ bool dispatchDynamicVariantEquality(
       VariantEquality, equals<false>, a.kind(), a, b);
 }
 
+std::string encloseWithQuote(std::string str) {
+  constexpr auto kDoubleQuote = '"';
+
+  std::stringstream ss;
+  ss << std::quoted(str, kDoubleQuote, kDoubleQuote);
+  return ss.str();
+}
+
+template <typename T>
+std::string stringifyFloatingPointerValue(T val) {
+  if (std::isinf(val) || std::isnan(val)) {
+    return encloseWithQuote(folly::to<std::string>(val));
+  } else {
+    return folly::to<std::string>(val);
+  }
+}
+
 void variant::throwCheckIsKindError(TypeKind kind) const {
   throw std::invalid_argument{fmt::format(
       "wrong kind! {} != {}",
@@ -237,7 +191,7 @@ void variant::throwCheckPtrError() const {
   throw std::invalid_argument{"missing variant value"};
 }
 
-std::string variant::toJson() const {
+std::string variant::toJson(const TypePtr& type) const {
   // todo(youknowjack): consistent story around std::stringifying, converting,
   // and other basic operations. Stringification logic should not be specific
   // to variants; it should be consistent for all map representations
@@ -245,6 +199,10 @@ std::string variant::toJson() const {
   if (isNull()) {
     return "null";
   }
+
+  VELOX_CHECK(type);
+
+  VELOX_CHECK_EQ(this->kind(), type->kind(), "Wrong type in variant::toJson");
 
   switch (kind_) {
     case TypeKind::MAP: {
@@ -257,9 +215,9 @@ std::string variant::toJson() const {
           b += ",";
         }
         b += "{\"key\":";
-        b += pair.first.toJson();
+        b += pair.first.toJson(type->childAt(0));
         b += ",\"value\":";
-        b += pair.second.toJson();
+        b += pair.second.toJson(type->childAt(1));
         b += "}";
         first = false;
       }
@@ -271,11 +229,16 @@ std::string variant::toJson() const {
       std::string b{};
       b += "[";
       bool first = true;
+      uint32_t idx = 0;
+      VELOX_CHECK_EQ(
+          row.size(),
+          type->size(),
+          "Wrong number of fields in a struct in variant::toJson");
       for (auto& v : row) {
         if (!first) {
           b += ",";
         }
-        b += v.toJson();
+        b += v.toJson(type->childAt(idx++));
         first = false;
       }
       b += "]";
@@ -286,11 +249,12 @@ std::string variant::toJson() const {
       std::string b{};
       b += "[";
       bool first = true;
+      auto arrayElementType = type->childAt(0);
       for (auto& v : array) {
         if (!first) {
           b += ",";
         }
-        b += v.toJson();
+        b += v.toJson(arrayElementType);
         first = false;
       }
       b += "]";
@@ -307,10 +271,25 @@ std::string variant::toJson() const {
       folly::json::escapeString(str, target, getOpts());
       return target;
     }
+    case TypeKind::HUGEINT: {
+      VELOX_CHECK(type->isLongDecimal()) {
+        return DecimalUtil::toString(value<TypeKind::HUGEINT>(), type);
+      }
+    }
     case TypeKind::TINYINT:
+      [[fallthrough]];
     case TypeKind::SMALLINT:
+      [[fallthrough]];
     case TypeKind::INTEGER:
+      if (type->isDate()) {
+        return '"' + DATE()->toString(value<TypeKind::INTEGER>()) + '"';
+      }
+      [[fallthrough]];
     case TypeKind::BIGINT:
+      if (type->isShortDecimal()) {
+        return DecimalUtil::toString(value<TypeKind::BIGINT>(), type);
+      }
+      [[fallthrough]];
     case TypeKind::BOOLEAN: {
       auto converted = VariantConverter::convert<TypeKind::VARCHAR>(*this);
       if (converted.isNull()) {
@@ -320,45 +299,152 @@ std::string variant::toJson() const {
       }
     }
     case TypeKind::REAL: {
-      auto val = value<TypeKind::REAL>();
-      if (std::isnormal(val)) {
-        return folly::to<std::string>(val);
-      } else {
-        return '"' + folly::to<std::string>(val) + '"';
-      }
+      return stringifyFloatingPointerValue<float>(value<TypeKind::REAL>());
     }
     case TypeKind::DOUBLE: {
-      auto val = value<TypeKind::DOUBLE>();
-      if (std::isnormal(val)) {
-        return folly::to<std::string>(val);
-      } else {
-        return '"' + folly::to<std::string>(val) + '"';
-      }
+      return stringifyFloatingPointerValue<double>(value<TypeKind::DOUBLE>());
     }
     case TypeKind::TIMESTAMP: {
       auto& timestamp = value<TypeKind::TIMESTAMP>();
       return '"' + timestamp.toString() + '"';
     }
-    case TypeKind::DATE: {
-      auto& date = value<TypeKind::DATE>();
-      return '"' + date.toString() + '"';
+    case TypeKind::OPAQUE: {
+      // Although this is not used for deserialization, we need to include the
+      // real data because commonExpressionEliminationRules uses
+      // CallTypedExpr.toString as key, which ends up using this string.
+      // Opaque types that want to use common expression elimination need to
+      // make their serialization deterministic.
+      const detail::OpaqueCapsule& capsule = value<TypeKind::OPAQUE>();
+      auto serializeFunction = capsule.type->getSerializeFunc();
+      return "Opaque<type:" + capsule.type->toString() + ",value:\"" +
+          serializeFunction(capsule.obj) + "\">";
     }
-    case TypeKind::INTERVAL_DAY_TIME: {
-      auto& interval = value<TypeKind::INTERVAL_DAY_TIME>();
-      return '"' + interval.toString() + '"';
+    case TypeKind::FUNCTION:
+    case TypeKind::UNKNOWN:
+    case TypeKind::INVALID:
+      VELOX_NYI();
+  }
+
+  VELOX_UNSUPPORTED(
+      "Unsupported: given type {} is not json-ready", mapTypeKindToName(kind_));
+}
+
+// This is the unsafe older implementation of toJson. It is kept here for
+// backward compatibility with Meta's internal python bindings.
+std::string variant::toJsonUnsafe(const TypePtr& type) const {
+  if (isNull()) {
+    return "null";
+  }
+
+  switch (kind_) {
+    case TypeKind::MAP: {
+      auto& map = value<TypeKind::MAP>();
+      std::string b{};
+      b += "[";
+      bool first = true;
+      for (auto& pair : map) {
+        if (!first) {
+          b += ",";
+        }
+        b += "{\"key\":";
+        b += pair.first.toJsonUnsafe();
+        b += ",\"value\":";
+        b += pair.second.toJsonUnsafe();
+        b += "}";
+        first = false;
+      }
+      b += "]";
+      return b;
+    }
+    case TypeKind::ROW: {
+      auto& row = value<TypeKind::ROW>();
+      std::string b{};
+      b += "[";
+      bool first = true;
+      for (auto& v : row) {
+        if (!first) {
+          b += ",";
+        }
+        b += v.toJsonUnsafe();
+
+        first = false;
+      }
+      b += "]";
+      return b;
+    }
+    case TypeKind::ARRAY: {
+      auto& array = value<TypeKind::ARRAY>();
+      std::string b{};
+      b += "[";
+      bool first = true;
+      for (auto& v : array) {
+        if (!first) {
+          b += ",";
+        }
+        b += v.toJsonUnsafe();
+        first = false;
+      }
+      b += "]";
+      return b;
+    }
+    case TypeKind::VARBINARY: {
+      auto& str = value<TypeKind::VARBINARY>();
+      auto encoded = encoding::Base64::encode(str);
+      return '"' + encoded + '"';
+    }
+    case TypeKind::VARCHAR: {
+      auto& str = value<TypeKind::VARCHAR>();
+      std::string target;
+      folly::json::escapeString(str, target, getOpts());
+      return target;
+    }
+    case TypeKind::HUGEINT: {
+      VELOX_CHECK(type && type->isLongDecimal()) {
+        return DecimalUtil::toString(value<TypeKind::HUGEINT>(), type);
+      }
+    }
+    case TypeKind::TINYINT:
+      [[fallthrough]];
+    case TypeKind::SMALLINT:
+      [[fallthrough]];
+    case TypeKind::INTEGER:
+      if (type->isDate()) {
+        return '"' + DATE()->toString(value<TypeKind::INTEGER>()) + '"';
+      }
+      [[fallthrough]];
+    case TypeKind::BIGINT:
+      if (type && type->isShortDecimal()) {
+        return DecimalUtil::toString(value<TypeKind::BIGINT>(), type);
+      }
+      [[fallthrough]];
+    case TypeKind::BOOLEAN: {
+      auto converted = VariantConverter::convert<TypeKind::VARCHAR>(*this);
+      if (converted.isNull()) {
+        return "null";
+      } else {
+        return converted.value<TypeKind::VARCHAR>();
+      }
+    }
+    case TypeKind::REAL: {
+      return stringifyFloatingPointerValue<float>(value<TypeKind::REAL>());
+    }
+    case TypeKind::DOUBLE: {
+      return stringifyFloatingPointerValue<double>(value<TypeKind::DOUBLE>());
+    }
+    case TypeKind::TIMESTAMP: {
+      auto& timestamp = value<TypeKind::TIMESTAMP>();
+      return '"' + timestamp.toString() + '"';
     }
     case TypeKind::OPAQUE: {
-      // Return expression that we can't parse back - we use toJson for
-      // debugging only. Variant::serialize should actually serialize the data.
-      return "\"Opaque<" + value<TypeKind::OPAQUE>().type->toString() + ">\"";
-    }
-    case TypeKind::SHORT_DECIMAL: {
-      return DecimalUtil::toString(
-          value<TypeKind::SHORT_DECIMAL>().value(), inferType());
-    }
-    case TypeKind::LONG_DECIMAL: {
-      return DecimalUtil::toString(
-          value<TypeKind::LONG_DECIMAL>().value(), inferType());
+      // Although this is not used for deserialization, we need to include the
+      // real data because commonExpressionEliminationRules uses
+      // CallTypedExpr.toString as key, which ends up using this string.
+      // Opaque types that want to use common expression elimination need to
+      // make their serialization deterministic.
+      const detail::OpaqueCapsule& capsule = value<TypeKind::OPAQUE>();
+      auto serializeFunction = capsule.type->getSerializeFunc();
+      return "Opaque<type:" + capsule.type->toString() + ",value:\"" +
+          serializeFunction(capsule.obj) + "\">";
     }
     case TypeKind::FUNCTION:
     case TypeKind::UNKNOWN:
@@ -372,11 +458,12 @@ std::string variant::toJson() const {
 
 void serializeOpaque(
     folly::dynamic& variantObj,
-    detail::OpaqueCapsule opaqueValue) {
+    const detail::OpaqueCapsule& opaqueValue) {
   try {
     auto serializeFunction = opaqueValue.type->getSerializeFunc();
     variantObj["value"] = serializeFunction(opaqueValue.obj);
-    variantObj["opaque_type"] = folly::toJson(opaqueValue.type->serialize());
+    variantObj["opaque_type"] = folly::json::serialize(
+        opaqueValue.type->serialize(), getSerializationOptions());
   } catch (VeloxRuntimeError& ex) {
     // Re-throw error for backwards compatibility.
     // Want to return error_code::kNotImplemented rather
@@ -441,6 +528,10 @@ folly::dynamic variant::serialize() const {
       objValue = value<TypeKind::BIGINT>();
       break;
     }
+    case TypeKind::HUGEINT: {
+      objValue = value<TypeKind::HUGEINT>();
+      break;
+    }
     case TypeKind::BOOLEAN: {
       objValue = value<TypeKind::BOOLEAN>();
       break;
@@ -455,14 +546,6 @@ folly::dynamic variant::serialize() const {
     }
     case TypeKind::VARCHAR: {
       objValue = value<TypeKind::VARCHAR>();
-      break;
-    }
-    case TypeKind::DATE: {
-      objValue = value<TypeKind::DATE>();
-      break;
-    }
-    case TypeKind::INTERVAL_DAY_TIME: {
-      objValue = value<TypeKind::INTERVAL_DAY_TIME>();
       break;
     }
     case TypeKind::OPAQUE: {
@@ -524,7 +607,7 @@ variant variant::create(const folly::dynamic& variantobj) {
       return variant::map(map);
     }
     case TypeKind::ROW:
-      FOLLY_FALLTHROUGH;
+      [[fallthrough]];
     case TypeKind::ARRAY: {
       VELOX_USER_CHECK(kind == TypeKind::ARRAY || kind == TypeKind::ROW);
       std::vector<variant> values;
@@ -550,6 +633,8 @@ variant variant::create(const folly::dynamic& variantobj) {
       return variant::create<TypeKind::INTEGER>(obj.asInt());
     case TypeKind::BIGINT:
       return variant::create<TypeKind::BIGINT>(obj.asInt());
+    case TypeKind::HUGEINT:
+      return variant::create<TypeKind::HUGEINT>(obj.asInt());
     case TypeKind::BOOLEAN: {
       return variant(obj.asBool());
     }
@@ -571,13 +656,6 @@ variant variant::create(const folly::dynamic& variantobj) {
     case TypeKind::OPAQUE: {
       return deserializeOpaque(variantobj);
     }
-    case TypeKind::DATE: {
-      return variant::create<TypeKind::DATE>(obj.asInt());
-    }
-    case TypeKind::INTERVAL_DAY_TIME: {
-      return variant::create<TypeKind::INTERVAL_DAY_TIME>(
-          IntervalDayTime(obj.asInt()));
-    }
     case TypeKind::TIMESTAMP: {
       return variant::create<TypeKind::TIMESTAMP>(Timestamp(
           variantobj["seconds"].asInt(), variantobj["nanos"].asInt()));
@@ -595,18 +673,14 @@ variant variant::create(const folly::dynamic& variantobj) {
 uint64_t variant::hash() const {
   uint64_t hash = 0;
   if (isNull()) {
-    if (kind_ == TypeKind::SHORT_DECIMAL) {
-      return value<TypeKind::SHORT_DECIMAL>().hash();
-    }
-    if (kind_ == TypeKind::LONG_DECIMAL) {
-      return value<TypeKind::LONG_DECIMAL>().hash();
-    }
     return folly::Hash{}(static_cast<int32_t>(kind_));
   }
 
   switch (kind_) {
     case TypeKind::BIGINT:
       return folly::Hash{}(value<TypeKind::BIGINT>());
+    case TypeKind::HUGEINT:
+      return folly::Hash{}(value<TypeKind::HUGEINT>());
     case TypeKind::INTEGER:
       return folly::Hash{}(value<TypeKind::INTEGER>());
     case TypeKind::SMALLINT:
@@ -641,24 +715,10 @@ uint64_t variant::hash() const {
       }
       return hash;
     }
-    case TypeKind::DATE: {
-      auto dateValue = value<TypeKind::DATE>();
-      return folly::Hash{}(dateValue.days());
-    }
-    case TypeKind::INTERVAL_DAY_TIME: {
-      auto interval = value<TypeKind::INTERVAL_DAY_TIME>();
-      return folly::Hash{}(interval.milliseconds());
-    }
     case TypeKind::TIMESTAMP: {
       auto timestampValue = value<TypeKind::TIMESTAMP>();
       return folly::Hash{}(
           timestampValue.getSeconds(), timestampValue.getNanos());
-    }
-    case TypeKind::SHORT_DECIMAL: {
-      return value<TypeKind::SHORT_DECIMAL>().hash();
-    }
-    case TypeKind::LONG_DECIMAL: {
-      return value<TypeKind::LONG_DECIMAL>().hash();
     }
     case TypeKind::MAP: {
       auto hasher = folly::Hash{};
@@ -692,6 +752,16 @@ template <TypeKind KIND, typename TFloat>
 bool equalsFloatingPointWithEpsilonTyped(const variant& a, const variant& b) {
   TFloat f1 = a.value<KIND>();
   TFloat f2 = b.value<KIND>();
+
+  // Check if the numbers are all NaN value, we need to treat two NaN values to
+  // be equal as well.
+  if (std::isnan(f1) && std::isnan(f2)) {
+    return true;
+  }
+  if (std::isinf(f1)) {
+    // fabs(inf - inf) is indeterminate.
+    return f1 == f2;
+  }
 
   // Check if the numbers are really close -- needed
   // when comparing numbers near zero.
@@ -754,6 +824,29 @@ bool variant::equalsWithEpsilon(const variant& other) const {
   }
 
   return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(equals, kind_, *this, other);
+}
+
+void variant::verifyArrayElements(const std::vector<variant>& inputs) {
+  if (!inputs.empty()) {
+    auto elementTypeKind = TypeKind::UNKNOWN;
+    // Find the typeKind from the first non-null element.
+    int i = 0;
+    for (; i < inputs.size(); ++i) {
+      if (!inputs[i].isNull()) {
+        elementTypeKind = inputs[i].kind();
+        break;
+      }
+    }
+    // Verify that the remaining non-null elements match.
+    for (; i < inputs.size(); ++i) {
+      if (!inputs[i].isNull()) {
+        VELOX_CHECK_EQ(
+            elementTypeKind,
+            inputs[i].kind(),
+            "All array elements must be of the same kind");
+      }
+    }
+  }
 }
 
 } // namespace facebook::velox

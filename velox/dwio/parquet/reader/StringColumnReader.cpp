@@ -15,15 +15,16 @@
  */
 
 #include "velox/dwio/parquet/reader/StringColumnReader.h"
-#include "velox/dwio/common/BufferUtil.h"
+
+#include "velox/dwio/common/SelectiveColumnReaderInternal.h"
 
 namespace facebook::velox::parquet {
 
 StringColumnReader::StringColumnReader(
-    const std::shared_ptr<const dwio::common::TypeWithId>& nodeType,
+    const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
     ParquetParams& params,
     common::ScanSpec& scanSpec)
-    : SelectiveColumnReader(nodeType, params, scanSpec, nodeType->type) {}
+    : SelectiveColumnReader(fileType->type(), fileType, params, scanSpec) {}
 
 uint64_t StringColumnReader::skip(uint64_t numValues) {
   formatData_->skip(numValues);
@@ -39,7 +40,6 @@ void StringColumnReader::readHelper(
       dwio::common::
           ColumnVisitor<folly::StringPiece, TFilter, ExtractValues, isDense>(
               *reinterpret_cast<TFilter*>(filter), this, rows, extractValues));
-  readOffset_ += rows.back() + 1;
 }
 
 template <bool isDense, typename ExtractValues>
@@ -47,7 +47,13 @@ void StringColumnReader::processFilter(
     common::Filter* filter,
     RowSet rows,
     ExtractValues extractValues) {
-  switch (filter ? filter->kind() : common::FilterKind::kAlwaysTrue) {
+  if (filter == nullptr) {
+    readHelper<common::AlwaysTrue, isDense>(
+        &dwio::common::alwaysTrue(), rows, extractValues);
+    return;
+  }
+
+  switch (filter->kind()) {
     case common::FilterKind::kAlwaysTrue:
       readHelper<common::AlwaysTrue, isDense>(filter, rows, extractValues);
       break;
@@ -123,34 +129,29 @@ void StringColumnReader::read(
           scanSpec_->filter(), rows, dwio::common::DropValues());
     }
   }
+  readOffset_ += rows.back() + 1;
 }
 
 void StringColumnReader::getValues(RowSet rows, VectorPtr* result) {
   if (scanState_.dictionary.values) {
     auto dictionaryValues =
-        formatData_->as<ParquetData>().dictionaryValues(type_);
+        formatData_->as<ParquetData>().dictionaryValues(fileType_->type());
     compactScalarValues<int32_t, int32_t>(rows, false);
 
     *result = std::make_shared<DictionaryVector<StringView>>(
-        &memoryPool_,
-        !anyNulls_               ? nullptr
-            : returnReaderNulls_ ? nullsInReadRange_
-                                 : resultNulls_,
-        numValues_,
-        dictionaryValues,
-        values_);
+        &memoryPool_, resultNulls(), numValues_, dictionaryValues, values_);
     return;
   }
   rawStringBuffer_ = nullptr;
   rawStringSize_ = 0;
   rawStringUsed_ = 0;
-  getFlatValues<StringView, StringView>(rows, result, type_);
+  getFlatValues<StringView, StringView>(rows, result, fileType_->type());
 }
 
 void StringColumnReader::dedictionarize() {
   if (scanSpec_->keepValues()) {
     auto dict = formatData_->as<ParquetData>()
-                    .dictionaryValues(type_)
+                    .dictionaryValues(fileType_->type())
                     ->as<FlatVector<StringView>>();
     auto valuesCapacity = values_->capacity();
     auto indices = values_->as<vector_size_t>();

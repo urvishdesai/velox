@@ -21,8 +21,14 @@
 
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
+DECLARE_bool(velox_enable_memory_usage_track_in_default_memory_pool);
+
 DEFINE_int64(fuzzer_seed, 1, "Seed for random input dataset generator");
 DEFINE_int32(slice_size, 512, "Slice size");
+DEFINE_bool(
+    use_thread_safe_memory_usage_track,
+    false,
+    "If true, use thread safe memory usage tracking");
 
 namespace facebook::velox {
 namespace {
@@ -30,7 +36,10 @@ namespace {
 constexpr int kVectorSize = 16 << 10;
 
 struct BenchmarkData {
-  BenchmarkData() : pool_(memory::getDefaultMemoryPool()) {
+  BenchmarkData()
+      : pool_(memory::memoryManager()->addLeafPool(
+            "BenchmarkData",
+            FLAGS_use_thread_safe_memory_usage_track)) {
     VectorFuzzer::Options opts;
     opts.nullRatio = 0.01;
     opts.vectorSize = kVectorSize;
@@ -41,14 +50,20 @@ struct BenchmarkData {
     rowVector = fuzzer.fuzzFlat(ROW({BIGINT(), BIGINT(), BIGINT()}));
   }
 
- private:
-  std::shared_ptr<memory::MemoryPool> pool_;
+  ~BenchmarkData() {
+    flatVector.reset();
+    arrayVector.reset();
+    mapVector.reset();
+    rowVector.reset();
+  }
 
- public:
   VectorPtr flatVector;
   VectorPtr arrayVector;
   VectorPtr mapVector;
   VectorPtr rowVector;
+
+ private:
+  std::shared_ptr<memory::MemoryPool> pool_;
 };
 
 std::unique_ptr<BenchmarkData> data;
@@ -95,10 +110,11 @@ DEFINE_BENCHMARKS(row)
 } // namespace facebook::velox
 
 int main(int argc, char* argv[]) {
-  folly::init(&argc, &argv);
+  folly::Init init{&argc, &argv};
   using namespace facebook::velox;
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   VELOX_CHECK_LE(FLAGS_slice_size, kVectorSize);
+  memory::MemoryManager::initialize({});
   data = std::make_unique<BenchmarkData>();
   folly::runBenchmarks();
   data.reset();

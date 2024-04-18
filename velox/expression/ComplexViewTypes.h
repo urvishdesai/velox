@@ -23,6 +23,7 @@
 #include "velox/common/base/CompareFlags.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/core/CoreTypeSystem.h"
+#include "velox/expression/CastTypeChecker.h"
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/DecodedVector.h"
@@ -238,9 +239,7 @@ class SkipNullsIterator {
   using reference = value_type;
 
  public:
-  SkipNullsIterator<BaseIterator>(
-      const BaseIterator& begin,
-      const BaseIterator& end)
+  SkipNullsIterator(const BaseIterator& begin, const BaseIterator& end)
       : iter_(begin), end_(end) {}
 
   // Given an element, return an iterator to the first not-null element starting
@@ -357,6 +356,7 @@ class OptionalAccessor {
   }
 
   element_t value() const {
+    VELOX_DCHECK(has_value());
     return (*reader_)[index_];
   }
 
@@ -365,6 +365,7 @@ class OptionalAccessor {
   }
 
   element_t operator*() const {
+    VELOX_DCHECK(has_value());
     return value();
   }
 
@@ -491,10 +492,13 @@ template <typename VeloxType, typename T>
 auto materializeElement(const T& element) {
   if constexpr (MaterializeType<VeloxType>::requiresMaterialization) {
     return element.materialize();
-  } else if constexpr (util::is_shared_ptr<VeloxType>::value) {
-    return *element;
   } else {
-    return element;
+    using unwrapped_type = typename UnwrapCustomType<VeloxType>::type;
+    if constexpr (util::is_shared_ptr<unwrapped_type>::value) {
+      return *element;
+    } else {
+      return element;
+    }
   }
 }
 
@@ -504,13 +508,13 @@ auto materializeElement(const T& element) {
 // When returnsOptionalValues is false, the interface is like std::vector<V>.
 template <bool returnsOptionalValues, typename V>
 class ArrayView {
+ public:
   using reader_t = VectorReader<V>;
   using element_t = typename std::conditional<
       returnsOptionalValues,
       typename reader_t::exec_in_t,
       typename reader_t::exec_null_free_in_t>::type;
 
- public:
   ArrayView(const reader_t* reader, vector_size_t offset, vector_size_t size)
       : reader_(reader), offset_(offset), size_(size) {}
 
@@ -668,12 +672,20 @@ class ArrayView {
         "efficient to use the standard iterator interface.");
   }
 
-  const BaseVector* elementsVector() const {
+  const BaseVector* elementsVectorBase() const {
     return reader_->baseVector();
+  }
+
+  bool isFlatElements() const {
+    return reader_->decoded_.isIdentityMapping();
   }
 
   vector_size_t offset() const {
     return offset_;
+  }
+
+  TypeKind elementKind() const {
+    return elementsVectorBase()->typeKind();
   }
 
  private:
@@ -875,6 +887,45 @@ class MapView {
   vector_size_t size_;
 };
 
+class GenericView;
+
+// A view type that is used to represent a row of any size of any children
+// types. Function `at(index)` returns a generic view for the field at `index`.
+template <bool returnsOptionalValues>
+class DynamicRowView {
+  using readers_t = std::vector<std::unique_ptr<VectorReader<Any>>>;
+
+ public:
+  DynamicRowView(const readers_t* childReaders, vector_size_t offset)
+      : childReaders_{*childReaders}, offset_{offset} {}
+
+  vector_size_t offset() const {
+    return offset_;
+  }
+
+  using elem_n_t = typename std::conditional<
+      returnsOptionalValues,
+      OptionalAccessor<Any>,
+      GenericView>::type;
+
+  template <typename IndexT>
+  elem_n_t at(IndexT index) {
+    if constexpr (returnsOptionalValues) {
+      return elem_n_t{childReaders_[index].get(), offset_};
+    } else {
+      return childReaders_[index]->operator[](offset_);
+    }
+  }
+
+  size_t size() const {
+    return childReaders_.size();
+  }
+
+ private:
+  const readers_t& childReaders_;
+  vector_size_t offset_;
+};
+
 template <bool returnsOptionalValues, typename... T>
 class RowView {
   using reader_t = std::tuple<std::unique_ptr<VectorReader<T>>...>;
@@ -888,10 +939,6 @@ class RowView {
           exec_null_free_in_t>::type;
 
   vector_size_t offset() const {
-    return offset_;
-  }
-
-  vector_size_t childVectorAt() const {
     return offset_;
   }
 
@@ -964,8 +1011,8 @@ struct HasGeneric {
   }
 };
 
-template <typename T>
-struct HasGeneric<Generic<T>> {
+template <typename T, bool comparable, bool orderable>
+struct HasGeneric<Generic<T, comparable, orderable>> {
   static constexpr bool value() {
     return true;
   }
@@ -1034,19 +1081,31 @@ class GenericView {
         index_(index) {}
 
   uint64_t hash() const {
-    return decoded_.base()->hashValueAt(index_);
+    return decoded_.base()->hashValueAt(decodedIndex());
+  }
+
+  bool isNull() const {
+    return decoded_.isNullAt(index_);
+  }
+
+  const BaseVector* base() const {
+    return decoded_.base();
   }
 
   bool operator==(const GenericView& other) const {
     return decoded_.base()->equalValueAt(
-        other.decoded_.base(), index_, other.index_);
+        other.decoded_.base(), decodedIndex(), other.decodedIndex());
+  }
+
+  vector_size_t decodedIndex() const {
+    return decoded_.index(index_);
   }
 
   std::optional<int64_t> compare(
       const GenericView& other,
       const CompareFlags flags) const {
     return decoded_.base()->compare(
-        other.decoded_.base(), index_, other.index_, flags);
+        other.decoded_.base(), decodedIndex(), other.decodedIndex(), flags);
   }
 
   TypeKind kind() const {
@@ -1055,6 +1114,10 @@ class GenericView {
 
   const TypePtr& type() const {
     return decoded_.base()->type();
+  }
+
+  std::string toString() const {
+    return decoded_.toString(index_);
   }
 
   // If conversion is invalid, behavior is undefined. However, debug time
@@ -1067,10 +1130,18 @@ class GenericView {
             "castTo type is not compatible with type of vector, vector type is {}",
             type()->toString()));
 
-    // TODO: We can distinguish if this is a null-free or not null-free
-    // generic. And based on that determine if we want to call operator[] or
-    // readNullFree. For now we always return nullable.
-    return ensureReader<ToType>()->operator[](index_);
+    // If its a primitive type, then the casted reader always exists at
+    // castReaders_[0], and is set in Vector readers.
+    if constexpr (SimpleTypeTrait<ToType>::isPrimitiveType) {
+      return reinterpret_cast<VectorReader<ToType>*>(castReaders_[0].get())
+          ->operator[](index_);
+    } else {
+      // TODO: We can distinguish if this is a null-free or not null-free
+      // generic. And based on that determine if we want to call operator[] or
+      // readNullFree. For now we always return nullable.
+      return ensureReader<ToType>()->operator[](
+          index_); // We pass the non-decoded index.
+    }
   }
 
   template <typename ToType>
@@ -1079,10 +1150,10 @@ class GenericView {
       return std::nullopt;
     }
 
-    return ensureReader<ToType>()->operator[](index_);
+    return ensureReader<ToType>()->operator[](
+        index_); // We pass the non-decoded index.
   }
 
- private:
   template <typename B>
   VectorReader<B>* ensureReader() const {
     static_assert(
@@ -1093,7 +1164,6 @@ class GenericView {
     // the user is always casting to the same type.
     // Types are divided into three sets, for 1, and 2 we do not do the check,
     // since no two types can ever refer to the same vector.
-
     if constexpr (!HasGeneric<B>::value()) {
       // Two types with no generic can never represent same vector.
       return ensureReaderImpl<B, 0>();
@@ -1120,6 +1190,7 @@ class GenericView {
     }
   }
 
+ private:
   template <typename B, size_t I>
   VectorReader<B>* ensureReaderImpl() const {
     auto* reader = static_cast<VectorReader<B>*>(castReaders_[I].get());

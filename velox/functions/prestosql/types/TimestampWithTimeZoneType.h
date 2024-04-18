@@ -15,16 +15,48 @@
  */
 #pragma once
 
+#include "velox/expression/CastExpr.h"
+#include "velox/type/SimpleFunctionApi.h"
 #include "velox/type/Type.h"
 #include "velox/vector/VectorTypeUtils.h"
 
 namespace facebook::velox {
 
+class TimestampWithTimeZoneCastOperator : public exec::CastOperator {
+ public:
+  static const std::shared_ptr<const CastOperator>& get() {
+    static const std::shared_ptr<const CastOperator> instance{
+        new TimestampWithTimeZoneCastOperator()};
+
+    return instance;
+  }
+
+  bool isSupportedFromType(const TypePtr& other) const override;
+
+  bool isSupportedToType(const TypePtr& other) const override;
+
+  void castTo(
+      const BaseVector& input,
+      exec::EvalCtx& context,
+      const SelectivityVector& rows,
+      const TypePtr& resultType,
+      VectorPtr& result) const override;
+
+  void castFrom(
+      const BaseVector& input,
+      exec::EvalCtx& context,
+      const SelectivityVector& rows,
+      const TypePtr& resultType,
+      VectorPtr& result) const override;
+
+ private:
+  TimestampWithTimeZoneCastOperator() = default;
+};
+
 /// Represents timestamp with time zone as a number of milliseconds since epoch
 /// and time zone ID.
-class TimestampWithTimeZoneType : public RowType {
-  TimestampWithTimeZoneType()
-      : RowType({"timestamp", "timezone"}, {BIGINT(), SMALLINT()}) {}
+class TimestampWithTimeZoneType : public BigintType {
+  TimestampWithTimeZoneType() = default;
 
  public:
   static const std::shared_ptr<const TimestampWithTimeZoneType>& get() {
@@ -40,14 +72,23 @@ class TimestampWithTimeZoneType : public RowType {
     return this == &other;
   }
 
-  std::string toString() const override {
+  const char* name() const override {
     return "TIMESTAMP WITH TIME ZONE";
+  }
+
+  const std::vector<TypeParameter>& parameters() const override {
+    static const std::vector<TypeParameter> kEmpty = {};
+    return kEmpty;
+  }
+
+  std::string toString() const override {
+    return name();
   }
 
   folly::dynamic serialize() const override {
     folly::dynamic obj = folly::dynamic::object;
     obj["name"] = "Type";
-    obj["type"] = "TIMESTAMP WITH TIME ZONE";
+    obj["type"] = name();
     return obj;
   }
 };
@@ -64,7 +105,7 @@ TIMESTAMP_WITH_TIME_ZONE() {
 
 // Type used for function registration.
 struct TimestampWithTimezoneT {
-  using type = Row<int64_t, int16_t>;
+  using type = int64_t;
   static constexpr const char* typeName = "timestamp with time zone";
 };
 
@@ -78,12 +119,30 @@ class TimestampWithTimeZoneTypeFactories : public CustomTypeFactories {
 
   // Type casting from and to TimestampWithTimezone is not supported yet.
   exec::CastOperatorPtr getCastOperator() const override {
-    VELOX_NYI(
-        "Casting of {} is not implemented yet.",
-        TIMESTAMP_WITH_TIME_ZONE()->toString());
+    return TimestampWithTimeZoneCastOperator::get();
   }
 };
 
 void registerTimestampWithTimeZoneType();
 
+using TimeZoneKey = int16_t;
+
+constexpr int32_t kTimezoneMask = 0xFFF;
+constexpr int32_t kMillisShift = 12;
+
+inline int64_t unpackMillisUtc(int64_t dateTimeWithTimeZone) {
+  return dateTimeWithTimeZone >> kMillisShift;
+}
+
+inline TimeZoneKey unpackZoneKeyId(int64_t dateTimeWithTimeZone) {
+  return dateTimeWithTimeZone & kTimezoneMask;
+}
+
+inline int64_t pack(int64_t millisUtc, int16_t timeZoneKey) {
+  return (millisUtc << kMillisShift) | (timeZoneKey & kTimezoneMask);
+}
+
+inline Timestamp unpackTimestampUtc(int64_t dateTimeWithTimeZone) {
+  return Timestamp::fromMillis(unpackMillisUtc(dateTimeWithTimeZone));
+}
 } // namespace facebook::velox

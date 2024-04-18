@@ -21,23 +21,59 @@
 namespace facebook::velox::functions {
 
 void registerComparisonFunctions(const std::string& prefix) {
+  // Comparison functions also need TimestampWithTimezoneType,
+  // independent of DateTimeFunctions
+  registerTimestampWithTimeZoneType();
+
   registerNonSimdizableScalar<EqFunction, bool>({prefix + "eq"});
   VELOX_REGISTER_VECTOR_FUNCTION(udf_simd_comparison_eq, prefix + "eq");
   registerFunction<EqFunction, bool, Generic<T1>, Generic<T1>>({prefix + "eq"});
+  registerFunction<
+      EqFunctionTimestampWithTimezone,
+      bool,
+      TimestampWithTimezone,
+      TimestampWithTimezone>({prefix + "eq"});
 
   registerNonSimdizableScalar<NeqFunction, bool>({prefix + "neq"});
   VELOX_REGISTER_VECTOR_FUNCTION(udf_simd_comparison_neq, prefix + "neq");
+  registerFunction<NeqFunction, bool, Generic<T1>, Generic<T1>>(
+      {prefix + "neq"});
+  registerFunction<
+      NeqFunctionTimestampWithTimezone,
+      bool,
+      TimestampWithTimezone,
+      TimestampWithTimezone>({prefix + "neq"});
 
   registerNonSimdizableScalar<LtFunction, bool>({prefix + "lt"});
+  registerFunction<
+      LtFunctionTimestampWithTimezone,
+      bool,
+      TimestampWithTimezone,
+      TimestampWithTimezone>({prefix + "lt"});
   VELOX_REGISTER_VECTOR_FUNCTION(udf_simd_comparison_lt, prefix + "lt");
 
   registerNonSimdizableScalar<GtFunction, bool>({prefix + "gt"});
+  registerFunction<
+      GtFunctionTimestampWithTimezone,
+      bool,
+      TimestampWithTimezone,
+      TimestampWithTimezone>({prefix + "gt"});
   VELOX_REGISTER_VECTOR_FUNCTION(udf_simd_comparison_gt, prefix + "gt");
 
   registerNonSimdizableScalar<LteFunction, bool>({prefix + "lte"});
+  registerFunction<
+      LteFunctionTimestampWithTimezone,
+      bool,
+      TimestampWithTimezone,
+      TimestampWithTimezone>({prefix + "lte"});
   VELOX_REGISTER_VECTOR_FUNCTION(udf_simd_comparison_lte, prefix + "lte");
 
   registerNonSimdizableScalar<GteFunction, bool>({prefix + "gte"});
+  registerFunction<
+      GteFunctionTimestampWithTimezone,
+      bool,
+      TimestampWithTimezone,
+      TimestampWithTimezone>({prefix + "gte"});
   VELOX_REGISTER_VECTOR_FUNCTION(udf_simd_comparison_gte, prefix + "gte");
 
   registerBinaryScalar<DistinctFromFunction, bool>({prefix + "distinct_from"});
@@ -58,47 +94,20 @@ void registerComparisonFunctions(const std::string& prefix) {
       {prefix + "between"});
   registerFunction<BetweenFunction, bool, Date, Date, Date>(
       {prefix + "between"});
+  registerFunction<BetweenFunction, bool, Timestamp, Timestamp, Timestamp>(
+      {prefix + "between"});
   registerFunction<
       BetweenFunction,
       bool,
-      UnscaledShortDecimal,
-      UnscaledShortDecimal,
-      UnscaledShortDecimal>({prefix + "between"});
+      LongDecimal<P1, S1>,
+      LongDecimal<P1, S1>,
+      LongDecimal<P1, S1>>({prefix + "between"});
   registerFunction<
       BetweenFunction,
       bool,
-      UnscaledLongDecimal,
-      UnscaledLongDecimal,
-      UnscaledLongDecimal>({prefix + "between"});
-  registerFunction<
-      GtFunction,
-      bool,
-      UnscaledShortDecimal,
-      UnscaledShortDecimal>({prefix + "gt"});
-  registerFunction<GtFunction, bool, UnscaledLongDecimal, UnscaledLongDecimal>(
-      {prefix + "gt"});
-  registerFunction<
-      LtFunction,
-      bool,
-      UnscaledShortDecimal,
-      UnscaledShortDecimal>({prefix + "lt"});
-  registerFunction<LtFunction, bool, UnscaledLongDecimal, UnscaledLongDecimal>(
-      {prefix + "lt"});
-
-  registerFunction<
-      GteFunction,
-      bool,
-      UnscaledShortDecimal,
-      UnscaledShortDecimal>({prefix + "gte"});
-  registerFunction<GteFunction, bool, UnscaledLongDecimal, UnscaledLongDecimal>(
-      {prefix + "gte"});
-  registerFunction<
-      LteFunction,
-      bool,
-      UnscaledShortDecimal,
-      UnscaledShortDecimal>({prefix + "lte"});
-  registerFunction<LteFunction, bool, UnscaledLongDecimal, UnscaledLongDecimal>(
-      {prefix + "lte"});
+      ShortDecimal<P1, S1>,
+      ShortDecimal<P1, S1>,
+      ShortDecimal<P1, S1>>({prefix + "between"});
 }
 
 } // namespace facebook::velox::functions

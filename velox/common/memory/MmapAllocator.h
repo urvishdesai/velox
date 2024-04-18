@@ -24,8 +24,11 @@
 #include <mutex>
 #include <unordered_set>
 
+#include <folly/ThreadCachedInt.h>
+
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/memory/MemoryAllocator.h"
+#include "velox/common/memory/MemoryPool.h"
 #include "velox/common/memory/MmapArena.h"
 
 namespace facebook::velox::memory {
@@ -49,8 +52,8 @@ using ClassPageCount = int32_t;
 class MmapAllocator : public MemoryAllocator {
  public:
   struct Options {
-    ///  Capacity in bytes, default 512MB
-    uint64_t capacity = 1L << 29;
+    ///  Capacity in bytes, default unlimited.
+    uint64_t capacity{kMaxMemory};
 
     /// If set true, allocations larger than largest size class size will be
     /// delegated to ManagedMmapArena. Otherwise a system mmap call will be
@@ -85,47 +88,30 @@ class MmapAllocator : public MemoryAllocator {
     return kind_;
   }
 
-  bool allocateNonContiguous(
-      MachinePageCount numPages,
-      Allocation& out,
-      ReservationCallback reservationCB = nullptr,
-      MachinePageCount minSizeClass = 0) override;
+  void registerCache(const std::shared_ptr<Cache>& cache) override {
+    VELOX_CHECK_NULL(cache_);
+    VELOX_CHECK_NOT_NULL(cache);
+    VELOX_CHECK(cache->allocator() == this);
+    cache_ = cache;
+  }
+
+  Cache* cache() const override {
+    return cache_.get();
+  }
+
+  size_t capacity() const override {
+    return AllocationTraits::pageBytes(capacity_);
+  }
+
+  bool growContiguousWithoutRetry(
+      MachinePageCount increment,
+      ContiguousAllocation& allocation) override;
+
+  void freeContiguous(ContiguousAllocation& allocation) override;
 
   int64_t freeNonContiguous(Allocation& allocation) override;
 
-  bool allocateContiguous(
-      MachinePageCount numPages,
-      Allocation* collateral,
-      ContiguousAllocation& allocation,
-      ReservationCallback reservationCB = nullptr) override {
-    VELOX_CHECK_GT(numPages, 0);
-    bool result;
-    stats_.recordAllocate(numPages * AllocationTraits::kPageSize, 1, [&]() {
-      result = allocateContiguousImpl(
-          numPages, collateral, allocation, reservationCB);
-    });
-    return result;
-  }
-
-  void freeContiguous(ContiguousAllocation& allocation) override {
-    stats_.recordFree(
-        allocation.size(), [&]() { freeContiguousImpl(allocation); });
-  }
-
-  /// Allocates 'bytes' contiguous bytes and returns the pointer to the first
-  /// byte. If 'bytes' is less than 'maxMallocBytes_', delegates the allocation
-  /// to malloc. If the size is above that and below the largest size classes'
-  /// size, allocates one element of the next size classes' size. If 'size' is
-  /// greater than the largest size classes' size, calls allocateContiguous().
-  /// Returns nullptr if there is no space. The amount to allocate is subject to
-  /// the size limit of 'this'. This function is not virtual but calls the
-  /// virtual functions allocateNonContiguous and allocateContiguous, which can
-  /// track sizes and enforce caps etc. If 'alignment' is not kMinAlignment,
-  /// then 'bytes' must be a multiple of 'alignment'.
-  ///
-  /// NOTE: 'alignment' must be power of two and in range of [kMinAlignment,
-  /// kMaxAlignment].
-  void* allocateBytes(uint64_t bytes, uint16_t alignment) override;
+  MachinePageCount unmap(MachinePageCount targetPages) override;
 
   void freeBytes(void* p, uint64_t bytes) noexcept override;
 
@@ -137,16 +123,16 @@ class MmapAllocator : public MemoryAllocator {
   /// the data in the bitmaps in the size classes.
   bool checkConsistency() const override;
 
-  MachinePageCount capacity() const {
-    return capacity_;
-  }
-
   int32_t maxMallocBytes() const {
     return maxMallocBytes_;
   }
 
   size_t mallocReservedBytes() const {
     return mallocReservedBytes_;
+  }
+
+  size_t totalUsedBytes() const override {
+    return numMallocBytes() + AllocationTraits::pageBytes(numAllocated_);
   }
 
   MachinePageCount numAllocated() const override {
@@ -162,7 +148,7 @@ class MmapAllocator : public MemoryAllocator {
   }
 
   uint64_t numMallocBytes() const {
-    return numMallocBytes_;
+    return numMallocBytes_.readFull();
   }
 
   Stats stats() const override {
@@ -293,7 +279,7 @@ class MmapAllocator : public MemoryAllocator {
     const int32_t pageBitmapSize_;
 
     // Serializes access to all data members and private methods.
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 
     // Start of address range.
     uint8_t* address_;
@@ -330,13 +316,38 @@ class MmapAllocator : public MemoryAllocator {
     uint64_t numAdvisedAway_ = 0;
   };
 
+  bool allocateNonContiguousWithoutRetry(
+      const SizeMix& sizeMix,
+      Allocation& out) override;
+
+  bool allocateContiguousWithoutRetry(
+      MachinePageCount numPages,
+      Allocation* collateral,
+      ContiguousAllocation& allocation,
+      MachinePageCount maxPages = 0) override;
+
   bool allocateContiguousImpl(
       MachinePageCount numPages,
       Allocation* collateral,
       ContiguousAllocation& allocation,
-      ReservationCallback reservationCB);
+      MachinePageCount maxPages);
 
   void freeContiguousImpl(ContiguousAllocation& allocation);
+
+  // Allocates 'bytes' contiguous bytes and returns the pointer to the first
+  // byte. If 'bytes' is less than 'maxMallocBytes_', delegates the allocation
+  // to malloc. If the size is above that and below the largest size classes'
+  // size, allocates one element of the next size classes' size. If 'size' is
+  // greater than the largest size classes' size, calls allocateContiguous().
+  // Returns nullptr if there is no space. The amount to allocate is subject to
+  // the size limit of 'this'. This function is not virtual but calls the
+  // virtual functions allocateNonContiguous and allocateContiguous, which can
+  // track sizes and enforce caps etc. If 'alignment' is not kMinAlignment,
+  // then 'bytes' must be a multiple of 'alignment'.
+  //
+  // NOTE: 'alignment' must be power of two and in range of [kMinAlignment,
+  // kMaxAlignment].
+  void* allocateBytesWithoutRetry(uint64_t bytes, uint16_t alignment) override;
 
   // Ensures that there are at least 'newMappedNeeded' pages that are
   // not backing any existing allocation. If capacity_ - numMapped_ <
@@ -349,7 +360,7 @@ class MmapAllocator : public MemoryAllocator {
 
   // Frees 'allocation and returns the number of freed pages. Does not
   // update 'numAllocated'.
-  MachinePageCount freeInternal(Allocation& allocation);
+  MachinePageCount freeNonContiguousInternal(Allocation& allocation);
 
   void markAllMapped(const Allocation& allocation);
 
@@ -401,14 +412,14 @@ class MmapAllocator : public MemoryAllocator {
   std::atomic<uint64_t> numAllocations_ = 0;
   std::atomic<uint64_t> numAllocatedPages_ = 0;
   std::atomic<uint64_t> numAdvisedPages_ = 0;
-  std::atomic<uint64_t> numMallocBytes_ = 0;
+  folly::ThreadCachedInt<int64_t, MmapAllocator> numMallocBytes_;
 
   // Allocations that are larger than largest size classes will be delegated to
   // ManagedMmapArenas, to avoid calling mmap on every allocation.
   std::mutex arenaMutex_;
   std::unique_ptr<ManagedMmapArenas> managedArenas_;
 
-  Stats stats_;
+  std::shared_ptr<Cache> cache_;
 };
 
 } // namespace facebook::velox::memory

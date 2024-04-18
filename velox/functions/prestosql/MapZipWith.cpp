@@ -78,14 +78,6 @@ struct MergeResults {
 // https://prestodb.io/docs/current/functions/map.html#map_zip_with
 class MapZipWithFunction : public exec::VectorFunction {
  public:
-  bool isDefaultNullBehavior() const override {
-    // map_zip_with is null preserving for the map, but since an
-    // expr tree with a lambda depends on all named fields, including
-    // captures, a null in a capture does not automatically make a
-    // null result.
-    return false;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -147,7 +139,9 @@ class MapZipWithFunction : public exec::VectorFunction {
     std::vector<VectorPtr> lambdaArgs = {
         mergedKeys, mergedLeftValues, mergedRightValues};
 
-    const SelectivityVector allElementRows(index);
+    // Make sure already populated entries in newElements do not get
+    // overwritten.
+    const SelectivityVector validRowsInReusedResult(index);
 
     VectorPtr mergedValues;
 
@@ -179,19 +173,22 @@ class MapZipWithFunction : public exec::VectorFunction {
             *entry.rows, index, mergeResults.rawNewSizes, context.pool());
       }
 
-      // Make sure already populated entries in newElements do not get
-      // overwritten.
-      exec::ScopedFinalSelectionSetter(context, &allElementRows, true, true);
-
       entry.callable->apply(
           elementRows,
-          allElementRows,
+          &validRowsInReusedResult,
           wrapCapture,
           &context,
           lambdaArgs,
           elementToTopLevelRows,
           &mergedValues);
     }
+
+    // Set nulls for rows not present in 'rows'.
+    bits::andBits(
+        mergeResults.rawNewNulls,
+        rows.asRange().bits(),
+        rows.begin(),
+        rows.end());
 
     auto localResult = std::make_shared<MapVector>(
         context.pool(),
@@ -486,9 +483,15 @@ class MapZipWithFunction : public exec::VectorFunction {
 };
 } // namespace
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+/// map_zip_with is null preserving for the map, but since an
+/// expr tree with a lambda depends on all named fields, including
+/// captures, a null in a capture does not automatically make a
+/// null result.
+
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_map_zip_with,
     MapZipWithFunction::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<MapZipWithFunction>());
 
 } // namespace facebook::velox::functions

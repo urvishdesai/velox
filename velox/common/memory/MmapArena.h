@@ -36,12 +36,13 @@ class MmapArena {
   /// MmapArena capacity should be multiple of kMinGrainSizeBytes.
   static constexpr uint64_t kMinGrainSizeBytes = 1024 * 1024; // 1M
 
-  MmapArena(size_t capacityBytes);
+  explicit MmapArena(size_t capacityBytes);
   ~MmapArena();
 
-  void* FOLLY_NULLABLE allocate(uint64_t bytes);
-  void free(void* FOLLY_NONNULL address, uint64_t bytes);
-  void* FOLLY_NONNULL address() const {
+  void* allocate(uint64_t bytes);
+  void free(void* address, uint64_t bytes);
+
+  void* address() const {
     return reinterpret_cast<void*>(address_);
   }
 
@@ -49,11 +50,11 @@ class MmapArena {
     return byteSize_;
   }
 
-  const std::map<uint64_t, uint64_t>& freeList() const {
+  const std::map<uintptr_t, uint64_t>& freeList() const {
     return freeList_;
   }
 
-  const std::map<uint64_t, std::unordered_set<uint64_t>>& freeLookup() const {
+  const std::map<uint64_t, std::unordered_set<uintptr_t>>& freeLookup() const {
     return freeLookup_;
   }
 
@@ -66,7 +67,7 @@ class MmapArena {
   }
 
   /// Checks internal consistency of this MmapArena. Returns true if OK. May
-  /// return false if there are concurrent alocations and frees during the
+  /// return false if there are concurrent allocations and frees during the
   /// consistency check. This is a false positive but not dangerous. This is for
   /// test only
   bool checkConsistency() const;
@@ -85,35 +86,37 @@ class MmapArena {
     return lookupStr.str();
   }
 
+  std::string toString() const;
+
  private:
   // Rounds up size to the next power of 2.
   static uint64_t roundBytes(uint64_t bytes);
 
-  std::map<uint64_t, uint64_t>::iterator addFreeBlock(
-      uint64_t addr,
+  std::map<uintptr_t, uint64_t>::iterator addFreeBlock(
+      uintptr_t addr,
       uint64_t bytes);
 
-  void removeFromLookup(uint64_t addr, uint64_t bytes);
+  void removeFromLookup(uintptr_t addr, uint64_t bytes);
 
-  void removeFreeBlock(uint64_t addr, uint64_t bytes);
+  void removeFreeBlock(uintptr_t addr, uint64_t bytes);
 
-  void removeFreeBlock(std::map<uint64_t, uint64_t>::iterator& itr);
+  void removeFreeBlock(std::map<uintptr_t, uint64_t>::iterator& itr);
 
-  // Total capacity size of this arena
+  // Total capacity size of this arena.
   const uint64_t byteSize_;
 
-  // Starting address of this arena
-  uint8_t* FOLLY_NONNULL address_;
+  // Starting address of this arena.
+  uint8_t* address_;
 
   std::atomic<uint64_t> freeBytes_;
 
   // A sorted list with each entry mapping from free block address to size of
   // the free block
-  std::map<uint64_t, uint64_t> freeList_;
+  std::map<uintptr_t, uint64_t> freeList_;
 
-  // A sorted look up structure that stores the block size as key and a set of
+  // A sorted look-up structure that stores the block size as key and a set of
   // addresses of that size as value.
-  std::map<uint64_t, std::unordered_set<uint64_t>> freeLookup_;
+  std::map<uint64_t, std::unordered_set<uintptr_t>> freeLookup_;
 };
 
 /// A class that manages a set of MmapArenas. It is able to adapt itself by
@@ -121,26 +124,26 @@ class MmapArena {
 /// fragmentation happens.
 class ManagedMmapArenas {
  public:
-  ManagedMmapArenas(uint64_t singleArenaCapacity);
+  explicit ManagedMmapArenas(uint64_t singleArenaCapacity);
 
-  void* FOLLY_NULLABLE allocate(uint64_t bytes);
+  void* allocate(uint64_t bytes);
 
-  void free(void* FOLLY_NONNULL address, uint64_t bytes);
+  void free(void* address, uint64_t bytes);
 
-  const std::map<uint64_t, std::shared_ptr<MmapArena>>& arenas() const {
+  const std::map<uintptr_t, std::shared_ptr<MmapArena>>& arenas() const {
     return arenas_;
   }
 
  private:
-  /// A sorted list of MmapArena by its initial address
-  std::map<uint64_t, std::shared_ptr<MmapArena>> arenas_;
-
-  /// All allocations should come from this MmapArena. When it is no longer able
-  /// to handle allocations it will be updated to a newly created MmapArena.
-  std::shared_ptr<MmapArena> currentArena_;
-
-  /// Capacity in bytes for a single MmapArena managed by this.
+  // Capacity in bytes for a single MmapArena managed by this.
   const uint64_t singleArenaCapacity_;
+
+  // A sorted list of MmapArena by its initial address
+  std::map<uintptr_t, std::shared_ptr<MmapArena>> arenas_;
+
+  // All allocations should come from this MmapArena. When it is no longer able
+  // to handle allocations it will be updated to a newly created MmapArena.
+  std::shared_ptr<MmapArena> currentArena_;
 };
 
 } // namespace facebook::velox::memory

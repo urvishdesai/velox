@@ -26,12 +26,10 @@ inline int32_t parquetSizeOfIntKind(TypeKind kind) {
     case TypeKind::TINYINT:
     case TypeKind::SMALLINT:
     case TypeKind::INTEGER:
-    case TypeKind::DATE:
       return 4;
     case TypeKind::BIGINT:
-    case TypeKind::SHORT_DECIMAL:
       return 8;
-    case TypeKind::LONG_DECIMAL:
+    case TypeKind::HUGEINT:
       return 16;
     default:
       VELOX_FAIL("Not an integer TypeKind");
@@ -41,10 +39,11 @@ inline int32_t parquetSizeOfIntKind(TypeKind kind) {
 /// Wrapper for static functions for Parquet columns.
 class ParquetColumnReader {
  public:
-  /// Builds a reader tree producing 'dataType'. The metadata is in 'params'.
+  /// Builds a reader tree producing 'fileType'. The metadata is in 'params'.
   /// The filters and pruning are in 'scanSpec'.
   static std::unique_ptr<dwio::common::SelectiveColumnReader> build(
-      const std::shared_ptr<const dwio::common::TypeWithId>& dataType,
+      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       ParquetParams& params,
       common::ScanSpec& scanSpec);
 };

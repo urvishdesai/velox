@@ -30,14 +30,12 @@ class MergeJoinTest : public HiveConnectorTestBase {
       const std::shared_ptr<const core::PlanNode>& planNode,
       uint32_t preferredOutputBatchSize) {
     auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
-    queryCtx->setConfigOverridesUnsafe(
-        {{core::QueryConfig::kCreateEmptyFiles, "true"}});
 
     CursorParameters params;
     params.planNode = planNode;
     params.queryCtx = queryCtx;
-    params.queryCtx->setConfigOverridesUnsafe(
-        {{core::QueryConfig::kPreferredOutputBatchSize,
+    params.queryCtx->testingOverrideConfigUnsafe(
+        {{core::QueryConfig::kPreferredOutputBatchRows,
           std::to_string(preferredOutputBatchSize)}});
     return params;
   }
@@ -467,11 +465,11 @@ TEST_F(MergeJoinTest, lazyVectors) {
        makeFlatVector<int64_t>(10'000, [](auto row) { return row % 31; })});
 
   auto leftFile = TempFilePath::create();
-  writeToFile(leftFile->path, leftVectors);
+  writeToFile(leftFile->getPath(), leftVectors);
   createDuckDbTable("t", {leftVectors});
 
   auto rightFile = TempFilePath::create();
-  writeToFile(rightFile->path, rightVectors);
+  writeToFile(rightFile->getPath(), rightVectors);
   createDuckDbTable("u", {rightVectors});
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -494,8 +492,8 @@ TEST_F(MergeJoinTest, lazyVectors) {
                 .planNode();
 
   AssertQueryBuilder(op, duckDbQueryRunner_)
-      .split(rightScanId, makeHiveConnectorSplit(rightFile->path))
-      .split(leftScanId, makeHiveConnectorSplit(leftFile->path))
+      .split(rightScanId, makeHiveConnectorSplit(rightFile->getPath()))
+      .split(leftScanId, makeHiveConnectorSplit(leftFile->getPath()))
       .assertResults(
           "SELECT c0, rc0, c1, rc1, c2, c3  FROM t, u WHERE t.c0 = u.rc0 and c1 + rc1 < 30");
 }
@@ -541,3 +539,108 @@ TEST_F(MergeJoinTest, nullKeys) {
   AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT * FROM t LEFT JOIN u ON t.t0 = u.u0");
 }
+
+TEST_F(MergeJoinTest, complexTypedFilter) {
+  constexpr vector_size_t size{1000};
+
+  auto right = makeRowVector(
+      {"u_c0"},
+      {makeFlatVector<int32_t>(size, [](auto row) { return row * 2; })});
+
+  auto testComplexTypedFilter =
+      [&](const std::vector<RowVectorPtr>& left,
+          const std::string& filter,
+          const std::string& queryFilter,
+          const std::vector<std::string>& outputLayout) {
+        createDuckDbTable("t", left);
+        createDuckDbTable("u", {right});
+        auto planNodeIdGenerator =
+            std::make_shared<core::PlanNodeIdGenerator>();
+        auto plan =
+            PlanBuilder(planNodeIdGenerator)
+                .values(left)
+                .mergeJoin(
+                    {"t_c0"},
+                    {"u_c0"},
+                    PlanBuilder(planNodeIdGenerator).values({right}).planNode(),
+                    filter,
+                    outputLayout,
+                    core::JoinType::kLeft)
+                .planNode();
+
+        std::string outputs;
+        for (auto i = 0; i < outputLayout.size(); ++i) {
+          outputs += std::move(outputLayout[i]);
+          if (i + 1 < outputLayout.size()) {
+            outputs += ", ";
+          }
+        }
+
+        assertQuery(
+            plan,
+            fmt::format(
+                "SELECT {} FROM t LEFT JOIN u ON t_c0 = u_c0 AND {}",
+                outputs,
+                queryFilter));
+      };
+
+  std::vector<std::vector<std::string>> outputLayouts{
+      {"t_c0", "u_c0"}, {"t_c0", "u_c0", "t_c1"}};
+
+  {
+    const std::vector<std::vector<int32_t>> pattern{
+        {1},
+        {1, 2},
+        {1, 2, 4},
+        {1, 2, 4, 8},
+        {1, 2, 4, 8, 16},
+    };
+    std::vector<std::vector<int32_t>> arrayVector;
+    arrayVector.reserve(size);
+    for (auto i = 0; i < size / pattern.size(); ++i) {
+      arrayVector.insert(arrayVector.end(), pattern.begin(), pattern.end());
+    }
+    auto left = {
+        makeRowVector(
+            {"t_c0", "t_c1"},
+            {makeFlatVector<int32_t>(size, [](auto row) { return row; }),
+             makeArrayVector<int32_t>(arrayVector)}),
+        makeRowVector(
+            {"t_c0", "t_c1"},
+            {makeFlatVector<int32_t>(
+                 size, [size](auto row) { return size + row * 2; }),
+             makeArrayVector<int32_t>(arrayVector)})};
+
+    for (const auto& outputLayout : outputLayouts) {
+      testComplexTypedFilter(
+          left, "array_max(t_c1) >= 8", "list_max(t_c1) >= 8", outputLayout);
+    }
+  }
+
+  {
+    auto sizeAt = [](vector_size_t row) { return row % 5; };
+    auto keyAt = [](vector_size_t row) { return row % 11; };
+    auto valueAt = [](vector_size_t row) { return row % 13; };
+    auto keys = makeArrayVector<int64_t>(size, sizeAt, keyAt);
+    auto values = makeArrayVector<int32_t>(size, sizeAt, valueAt);
+
+    auto mapVector =
+        makeMapVector<int64_t, int32_t>(size, sizeAt, keyAt, valueAt);
+
+    auto left = {
+        makeRowVector(
+            {"t_c0", "t_c1"},
+            {makeFlatVector<int32_t>(size, [](auto row) { return row; }),
+             mapVector}),
+        makeRowVector(
+            {"t_c0", "t_c1"},
+            {makeFlatVector<int32_t>(
+                 size, [size](auto row) { return size + row * 2; }),
+             mapVector})};
+
+    for (const auto& outputLayout : outputLayouts) {
+      testComplexTypedFilter(
+          left, "cardinality(t_c1) > 4", "cardinality(t_c1) > 4", outputLayout);
+    }
+  }
+};

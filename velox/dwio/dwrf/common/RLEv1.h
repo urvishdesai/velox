@@ -17,7 +17,6 @@
 #pragma once
 
 #include "velox/common/base/GTestMacros.h"
-#include "velox/common/base/Nulls.h"
 #include "velox/dwio/common/Adaptor.h"
 #include "velox/dwio/common/DecoderUtil.h"
 #include "velox/dwio/common/IntDecoder.h"
@@ -26,6 +25,9 @@
 #include <memory>
 
 namespace facebook::velox::dwrf {
+
+using dwio::common::BufferedOutputStream;
+using dwio::common::PositionRecorder;
 
 template <bool isSigned>
 class RleEncoderV1 : public IntEncoder<isSigned> {
@@ -251,40 +253,19 @@ class RleDecoderV1 : public dwio::common::IntDecoder<isSigned> {
   void seekToRowGroup(
       dwio::common::PositionProvider& positionProvider) override;
 
-  void skip(uint64_t numValues) override;
-
   void next(int64_t* data, uint64_t numValues, const uint64_t* nulls) override;
 
   void nextLengths(int32_t* data, int32_t numValues) override;
 
-  template <bool hasNulls>
-  inline void skip(int32_t numValues, int32_t current, const uint64_t* nulls) {
-    if (hasNulls) {
-      numValues = bits::countNonNulls(nulls, current, current + numValues);
-    }
-    while (numValues > 0) {
-      if (remainingValues == 0) {
-        readHeader();
-      }
-      uint64_t count = std::min<int>(numValues, remainingValues);
-      remainingValues -= count;
-      numValues -= count;
-      if (repeating) {
-        value += delta * static_cast<int64_t>(count);
-      } else {
-        dwio::common::IntDecoder<isSigned>::skipLongsFast(count);
-      }
-    }
-  }
-
   template <bool hasNulls, typename Visitor>
   void readWithVisitor(const uint64_t* nulls, Visitor visitor) {
+    skipPending();
     if (dwio::common::useFastPath<Visitor, hasNulls>(visitor)) {
       fastPath<hasNulls>(nulls, visitor);
       return;
     }
     int32_t current = visitor.start();
-    skip<hasNulls>(current, 0, nulls);
+    this->template skip<hasNulls>(current, 0, nulls);
     int32_t toSkip;
     bool atEnd = false;
     const bool allowNulls = hasNulls && visitor.allowNulls();
@@ -295,7 +276,7 @@ class RleDecoderV1 : public dwio::common::IntDecoder<isSigned> {
         if (hasNulls && !allowNulls) {
           toSkip = visitor.checkAndSkipNulls(nulls, current, atEnd);
           if (!Visitor::dense) {
-            skip<false>(toSkip, current, nullptr);
+            this->template skip<false>(toSkip, current, nullptr);
           }
           if (atEnd) {
             return;
@@ -310,14 +291,15 @@ class RleDecoderV1 : public dwio::common::IntDecoder<isSigned> {
           toSkip = visitor.process(value, atEnd);
           value += delta;
         } else {
-          value = dwio::common::IntDecoder<isSigned>::readLong();
+          value =
+              dwio::common::IntDecoder<isSigned>::template readInt<int64_t>();
           toSkip = visitor.process(value, atEnd);
         }
         --remainingValues;
       }
       ++current;
       if (toSkip) {
-        skip<hasNulls>(toSkip, current, nulls);
+        this->template skip<hasNulls>(toSkip, current, nulls);
         current += toSkip;
       }
       if (atEnd) {
@@ -365,13 +347,13 @@ class RleDecoderV1 : public dwio::common::IntDecoder<isSigned> {
           visitor.setHasNulls();
         }
         if (innerVector->empty()) {
-          skip<false>(tailSkip, 0, nullptr);
+          this->template skip<false>(tailSkip, 0, nullptr);
           visitor.setAllNull(hasFilter ? 0 : numRows);
           return;
         }
         bulkScan<hasFilter, hasHook, true>(
             *innerVector, outerVector->data(), visitor);
-        skip<false>(tailSkip, 0, nullptr);
+        this->template skip<false>(tailSkip, 0, nullptr);
       }
     } else {
       bulkScan<hasFilter, hasHook, false>(rowsAsRange, nullptr, visitor);
@@ -487,7 +469,7 @@ class RleDecoderV1 : public dwio::common::IntDecoder<isSigned> {
         }
         if (remainingValues) {
           currentRow += remainingValues;
-          skip<false>(remainingValues, -1, nullptr);
+          this->template skip<false>(remainingValues, -1, nullptr);
         }
       }
       readHeader();
@@ -503,9 +485,11 @@ class RleDecoderV1 : public dwio::common::IntDecoder<isSigned> {
       remainingValues = static_cast<uint64_t>(ch) + RLE_MINIMUM_REPEAT;
       repeating = true;
       delta = dwio::common::IntDecoder<isSigned>::readByte();
-      value = dwio::common::IntDecoder<isSigned>::readLong();
+      value = dwio::common::IntDecoder<isSigned>::template readInt<int64_t>();
     }
   }
+
+  void skipPending() override;
 
   uint64_t remainingValues;
   int64_t value;

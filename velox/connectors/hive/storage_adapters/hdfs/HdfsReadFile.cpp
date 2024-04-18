@@ -23,44 +23,37 @@ namespace facebook::velox {
 HdfsReadFile::HdfsReadFile(hdfsFS hdfs, const std::string_view path)
     : hdfsClient_(hdfs), filePath_(path) {
   fileInfo_ = hdfsGetPathInfo(hdfsClient_, filePath_.data());
-  VELOX_CHECK_NOT_NULL(
-      fileInfo_,
-      "Unable to get file path info for file: {}. got error: {}",
-      filePath_,
-      hdfsGetLastError());
+  if (fileInfo_ == nullptr) {
+    auto error = hdfsGetLastError();
+    auto errMsg = fmt::format(
+        "Unable to get file path info for file: {}. got error: {}",
+        filePath_,
+        error);
+    if (std::strstr(error, "FileNotFoundException") != nullptr) {
+      VELOX_FILE_NOT_FOUND_ERROR(errMsg);
+    }
+    VELOX_FAIL(errMsg);
+  }
+}
+
+HdfsReadFile::~HdfsReadFile() {
+  // should call hdfsFreeFileInfo to avoid memory leak
+  hdfsFreeFileInfo(fileInfo_, 1);
 }
 
 void HdfsReadFile::preadInternal(uint64_t offset, uint64_t length, char* pos)
     const {
   checkFileReadParameters(offset, length);
-  auto file = hdfsOpenFile(hdfsClient_, filePath_.data(), O_RDONLY, 0, 0, 0);
-  VELOX_CHECK_NOT_NULL(
-      file,
-      "Unable to open file {}. got error: {}",
-      filePath_,
-      hdfsGetLastError());
-  seekToPosition(file, offset);
+  if (!file_->handle_) {
+    file_->open(hdfsClient_, filePath_);
+  }
+  file_->seek(offset);
   uint64_t totalBytesRead = 0;
   while (totalBytesRead < length) {
-    auto bytesRead = hdfsRead(hdfsClient_, file, pos, length - totalBytesRead);
-    VELOX_CHECK(bytesRead >= 0, "Read failure in HDFSReadFile::preadInternal.")
+    auto bytesRead = file_->read(pos, length - totalBytesRead);
     totalBytesRead += bytesRead;
     pos += bytesRead;
   }
-
-  if (hdfsCloseFile(hdfsClient_, file) == -1) {
-    LOG(ERROR) << "Unable to close file, errno: " << errno;
-  }
-}
-
-void HdfsReadFile::seekToPosition(hdfsFile file, uint64_t offset) const {
-  auto seekStatus = hdfsSeek(hdfsClient_, file, offset);
-  VELOX_CHECK_EQ(
-      seekStatus,
-      0,
-      "Cannot seek through HDFS file: {}, error: {}",
-      filePath_,
-      std::string(hdfsGetLastError()));
 }
 
 std::string_view

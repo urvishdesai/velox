@@ -4,6 +4,7 @@ import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import HomepageFeatures from '@site/src/components/HomepageFeatures';
+import VeloxConBanner from '@site/src/components/VeloxConBanner';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 
 import styles from './index.module.css';
@@ -52,11 +53,17 @@ export default function Home() {
       description="Description will go into a meta tag in <head />">
       <HomepageHeader />
       <main>
+          <VeloxConBanner />
           <section className={styles.features}>
               <div className="container">
                   <div className="row">
                       <div className={clsx('col')}>
-                          <img src={useBaseUrl("img/stack_transform.png")}/>
+                          <center>
+                          <iframe width="70%" height="504" src="https://www.youtube.com/embed/T9NMWN7vuSc"
+                                  title="YouTube video player" frameBorder="0"
+                                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                                  allowFullScreen></iframe>
+                          </center>
                       </div>
                   </div>
               </div>

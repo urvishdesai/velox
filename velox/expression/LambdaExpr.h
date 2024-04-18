@@ -42,10 +42,10 @@ class LambdaExpr : public SpecialForm {
             trackCpuUsage),
         signature_(std::move(signature)),
         body_(std::move(body)),
-        capture_(std::move(capture)) {
-    for (auto& field : capture_) {
-      distinctFields_.push_back(field.get());
-    }
+        capture_(std::move(capture)) {}
+
+  bool isConstant() const override {
+    return false;
   }
 
   std::string toString(bool recursive = true) const override;
@@ -53,19 +53,26 @@ class LambdaExpr : public SpecialForm {
   std::string toSql(
       std::vector<VectorPtr>* complexConstants = nullptr) const override;
 
-  bool propagatesNulls() const override {
-    // A null capture does not result in a null function.
-    return false;
-  }
-
   void evalSpecialForm(
       const SelectivityVector& rows,
       EvalCtx& context,
       VectorPtr& result) override;
 
+ protected:
+  void computeDistinctFields() override;
+
  private:
   /// Used to initialize captureChannels_ and typeWithCapture_ on first use.
   void makeTypeWithCapture(EvalCtx& context);
+
+  void computePropagatesNulls() override {
+    // A null capture does not result in a null function.
+    propagatesNulls_ = false;
+  }
+
+  void extractSubfieldsImpl(
+      folly::F14FastMap<std::string, int32_t>* shadowedNames,
+      std::vector<common::Subfield>* subfields) const override;
 
   RowTypePtr signature_;
 

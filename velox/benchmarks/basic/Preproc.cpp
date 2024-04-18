@@ -161,7 +161,8 @@ class Addition {
 template <typename Operation>
 std::shared_ptr<exec::VectorFunction> make(
     const std::string& /*name*/,
-    const std::vector<exec::VectorFunctionArg>& inputArgs) {
+    const std::vector<exec::VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& /*config*/) {
   auto typeKind = inputArgs[0].type->kind();
   switch (typeKind) {
     case TypeKind::TINYINT:
@@ -443,8 +444,8 @@ BENCHMARK(allFusedWithNulls) {
 } // namespace
 
 int main(int argc, char** argv) {
-  folly::init(&argc, &argv);
-
+  folly::Init init{&argc, &argv};
+  memory::MemoryManager::initialize({});
   benchmark = std::make_unique<PreprocBenchmark>();
   // Verify that benchmark calculations are correct.
   benchmark->test();

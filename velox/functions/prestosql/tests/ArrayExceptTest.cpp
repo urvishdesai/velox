@@ -257,7 +257,8 @@ TEST_F(ArrayExceptTest, varbinary) {
   auto right = makeNullableArrayVector<StringView>(
       {{"b"_sv, "d"_sv}}, ARRAY(VARBINARY()));
 
-  auto expected = makeNullableArrayVector<StringView>({{}}, ARRAY(VARBINARY()));
+  const std::vector<std::vector<std::optional<StringView>>> data = {{}};
+  auto expected = makeNullableArrayVector<StringView>(data, ARRAY(VARBINARY()));
   testExpr(expected, "array_except(c0, c1)", {left, left});
   testExpr(expected, "array_except(c0, c1)", {right, right});
 
@@ -313,10 +314,7 @@ TEST_F(ArrayExceptTest, constant) {
 }
 
 TEST_F(ArrayExceptTest, dictionaryEncodedElementsInConstant) {
-  exec::registerVectorFunction(
-      "testing_dictionary_array_elements",
-      test::TestingDictionaryArrayElementsFunction::signatures(),
-      std::make_unique<test::TestingDictionaryArrayElementsFunction>());
+  TestingDictionaryArrayElementsFunction::registerFunction();
 
   auto array = makeArrayVector<int64_t>({{1, 3}, {2, 5}, {0, 6}});
   auto expected = makeArrayVector<int64_t>({{}, {5}, {6}});

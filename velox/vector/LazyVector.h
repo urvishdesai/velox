@@ -82,19 +82,34 @@ class VectorLoader {
   // subset of the rows that were intended to be loadable when the
   // loader was created. This may be called once in the lifetime of
   // 'this'.
-  void load(RowSet rows, ValueHook* hook, VectorPtr* result);
+  // Notes: Implementations of this class should ensure:
+  // 1.‘result’ is unique before mutating it.
+  // 2. result’ size is at least resultSize.
+  void load(
+      RowSet rows,
+      ValueHook* hook,
+      vector_size_t resultSize,
+      VectorPtr* result);
 
   // Converts 'rows' into a RowSet and calls load(). Provided for
   // convenience in loading LazyVectors in expression evaluation.
-  void load(const SelectivityVector& rows, ValueHook* hook, VectorPtr* result);
+  void load(
+      const SelectivityVector& rows,
+      ValueHook* hook,
+      vector_size_t resultSize,
+      VectorPtr* result);
 
  protected:
-  virtual void
-  loadInternal(RowSet rows, ValueHook* hook, VectorPtr* result) = 0;
+  virtual void loadInternal(
+      RowSet rows,
+      ValueHook* hook,
+      vector_size_t resultSize,
+      VectorPtr* result) = 0;
 
   virtual void loadInternal(
       const SelectivityVector& rows,
       ValueHook* hook,
+      vector_size_t resultSize,
       VectorPtr* result);
 };
 
@@ -111,23 +126,28 @@ class VectorLoader {
 // top-level vector.
 class LazyVector : public BaseVector {
  public:
+  static constexpr const char* kCpuNanos = "dataSourceLazyCpuNanos";
+  static constexpr const char* kWallNanos = "dataSourceLazyWallNanos";
   LazyVector(
       velox::memory::MemoryPool* pool,
       TypePtr type,
       vector_size_t size,
-      std::unique_ptr<VectorLoader>&& loader)
+      std::unique_ptr<VectorLoader>&& loader,
+      VectorPtr&& vector = nullptr)
       : BaseVector(
             pool,
             std::move(type),
             VectorEncoding::Simple::LAZY,
             BufferPtr(nullptr),
             size),
-        loader_(std::move(loader)) {}
+        loader_(std::move(loader)),
+        vector_(std::move(vector)) {}
 
   void reset(std::unique_ptr<VectorLoader>&& loader, vector_size_t size) {
     BaseVector::length_ = size;
     loader_ = std::move(loader);
     allLoaded_ = false;
+    containsLazyAndIsWrapped_ = false;
   }
 
   inline bool isLoaded() const {
@@ -139,20 +159,7 @@ class LazyVector : public BaseVector {
   // loadedVector is not updated. This method is const because call
   // sites often have a const VaseVector. Lazy construction is
   // logically not a mutation.
-  void load(RowSet rows, ValueHook* hook) const {
-    VELOX_CHECK(!allLoaded_, "A LazyVector can be loaded at most once");
-    allLoaded_ = true;
-    if (rows.empty()) {
-      if (!vector_) {
-        vector_ = BaseVector::create(type_, 0, pool_);
-      }
-      return;
-    }
-    if (!vector_ && type_->kind() == TypeKind::ROW) {
-      vector_ = BaseVector::create(type_, rows.back() + 1, pool_);
-    }
-    loader_->load(rows, hook, &vector_);
-  }
+  void load(RowSet rows, ValueHook* hook) const;
 
   std::optional<int32_t> compare(
       const BaseVector* other,
@@ -181,29 +188,13 @@ class LazyVector : public BaseVector {
   // Returns a shared_ptr to the vector holding the values. If vector is not
   // loaded, loads all the rows, otherwise returns the loaded vector which can
   // have partially loaded rows.
+  VectorPtr& loadedVectorShared() {
+    loadVectorInternal();
+    return vector_;
+  }
+
   const VectorPtr& loadedVectorShared() const {
-    if (!allLoaded_) {
-      if (!vector_) {
-        vector_ = BaseVector::create(type_, 0, pool_);
-      }
-      SelectivityVector allRows(BaseVector::length_);
-      loader_->load(allRows, nullptr, &vector_);
-      VELOX_CHECK(vector_);
-      if (vector_->encoding() == VectorEncoding::Simple::LAZY) {
-        vector_ = vector_->asUnchecked<LazyVector>()->loadedVectorShared();
-      } else {
-        // If the load produced a wrapper, load the wrapped vector.
-        vector_->loadedVector();
-      }
-      allLoaded_ = true;
-      const_cast<LazyVector*>(this)->BaseVector::nulls_ = vector_->nulls_;
-      if (BaseVector::nulls_) {
-        const_cast<LazyVector*>(this)->BaseVector::rawNulls_ =
-            BaseVector::nulls_->as<uint64_t>();
-      }
-    } else {
-      VELOX_CHECK(vector_);
-    }
+    loadVectorInternal();
     return vector_;
   }
 
@@ -235,6 +226,10 @@ class LazyVector : public BaseVector {
     return loadedVector()->isNullAt(index);
   }
 
+  bool containsNullAt(vector_size_t index) const override {
+    return loadedVector()->containsNullAt(index);
+  }
+
   uint64_t retainedSize() const override {
     return isLoaded() ? loadedVector()->retainedSize()
                       : BaseVector::retainedSize();
@@ -254,25 +249,34 @@ class LazyVector : public BaseVector {
   // Loads 'rows' of 'vector'. 'vector' may be an arbitrary wrapping
   // of a LazyVector. 'rows' are translated through the wrappers. If
   // there is no LazyVector inside 'vector', this has no
-  // effect. 'vector' may be replaced by a a new vector with 'rows'
-  // loaded and the rest as after default construction.
+  // effect.
   static void ensureLoadedRows(
-      VectorPtr& vector,
+      const VectorPtr& vector,
       const SelectivityVector& rows);
 
   // as ensureLoadedRows, above, but takes a scratch DecodedVector and
   // SelectivityVector as arguments to enable reuse.
   static void ensureLoadedRows(
-      VectorPtr& vector,
+      const VectorPtr& vector,
       const SelectivityVector& rows,
       DecodedVector& decoded,
       SelectivityVector& baseRows);
 
+  void validate(const VectorValidateOptions& options) const override;
+
  private:
+  static void ensureLoadedRowsImpl(
+      const VectorPtr& vector,
+      DecodedVector& decoded,
+      const SelectivityVector& rows,
+      SelectivityVector& baseRows);
+
+  void loadVectorInternal() const;
+
   std::unique_ptr<VectorLoader> loader_;
 
   // True if all values are loaded.
-  mutable bool allLoaded_ = false;
+  mutable tsan_atomic<bool> allLoaded_{false};
   // Vector to hold loaded values. This may be present before load for
   // reuse. If loading is with ValueHook, this will not be created.
   mutable VectorPtr vector_;

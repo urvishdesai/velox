@@ -72,11 +72,14 @@ reverseUnicode(char* output, const char* input, size_t length) {
   auto outputIdx = length;
   while (inputIdx < length) {
     int size = 1;
-    utf8proc_codepoint(&input[inputIdx], size);
-    // invalid utf8 gets byte sequence with nextCodePoint==-1 and size==1,
+    auto valid = utf8proc_codepoint(&input[inputIdx], input + length, size);
+
+    // if invalid utf8 gets byte sequence with nextCodePoint==-1 and size==1,
     // continue reverse invalid sequence byte by byte.
-    VELOX_USER_CHECK_GT(
-        size, 0, "UNLIKELY: could not get size of invalid utf8 code point");
+    if (valid == -1) {
+      size = 1;
+    }
+
     VELOX_USER_CHECK_GE(outputIdx, size, "access out of bound");
     outputIdx -= size;
 
@@ -125,7 +128,8 @@ FOLLY_ALWAYS_INLINE size_t upperUnicode(
   while (inputIdx < inputLength) {
     utf8proc_int32_t nextCodePoint;
     int size;
-    nextCodePoint = utf8proc_codepoint(&input[inputIdx], size);
+    nextCodePoint =
+        utf8proc_codepoint(&input[inputIdx], input + inputLength, size);
     if (UNLIKELY(nextCodePoint == -1)) {
       // invalid input string, copy the remaining of the input string as is to
       // the output.
@@ -164,7 +168,8 @@ FOLLY_ALWAYS_INLINE size_t lowerUnicode(
   while (inputIdx < inputLength) {
     utf8proc_int32_t nextCodePoint;
     int size;
-    nextCodePoint = utf8proc_codepoint(&input[inputIdx], size);
+    nextCodePoint =
+        utf8proc_codepoint(&input[inputIdx], input + inputLength, size);
     if (UNLIKELY(nextCodePoint == -1)) {
       // invalid input string, copy the remaining of the input string as is to
       // the output.
@@ -207,7 +212,7 @@ applyAppendersRecursive(TOutStr& output, Func appenderFunc, Funcs... funcs) {
 /**
  * Return the length in chars of a utf8 string stored in the input buffer
  * @param inputBuffer input buffer that hold the string
- * @param numBytes size of input buffer
+ * @param bufferLength size of input buffer
  * @return the number of characters represented by the input utf8 string
  */
 FOLLY_ALWAYS_INLINE int64_t
@@ -225,14 +230,72 @@ lengthUnicode(const char* inputBuffer, size_t bufferLength) {
   return size;
 }
 
+/**
+ * Return an capped length(controlled by maxChars) of a unicode string. The
+ * returned length is not greater than maxChars.
+ *
+ * This method is used to tell whether a string is longer or the same length of
+ * another string, in these scenarios we don't need accurate length, by
+ * providing maxChars we can get better performance by avoid calculating whole
+ * length of a string which might be very long.
+ *
+ * @param input input buffer that hold the string
+ * @param size size of input buffer
+ * @param maxChars stop counting characters if the string is longer
+ * than this value
+ * @return the number of characters represented by the input utf8 string
+ */
+FOLLY_ALWAYS_INLINE int64_t
+cappedLengthUnicode(const char* input, size_t size, size_t maxChars) {
+  // First address after the last byte in the input
+  auto end = input + size;
+  auto currentChar = input;
+  int64_t numChars = 0;
+
+  // Use maxChars to early stop to avoid calculating the whole
+  // length of long string.
+  while (currentChar < end && numChars < maxChars) {
+    auto charSize = utf8proc_char_length(currentChar);
+    // Skip bad byte if we get utf length < 0.
+    currentChar += UNLIKELY(charSize < 0) ? 1 : charSize;
+    numChars++;
+  }
+
+  return numChars;
+}
+
+///
+/// Return an capped length in bytes(controlled by maxChars) of a unicode
+/// string. The returned length may be greater than maxCharacters if there are
+/// multi-byte characters present in the input string.
+///
+/// This method is used to help with indexing unicode strings by byte position.
+/// It is used to find the byte position of the Nth character in a string.
+///
+/// @param input input buffer that hold the string
+/// @param size size of input buffer
+/// @param maxChars stop counting characters if the string is longer
+/// than this value
+/// @return the number of bytes represented by the input utf8 string up to
+/// maxChars
+///
+FOLLY_ALWAYS_INLINE int64_t
+cappedByteLengthUnicode(const char* input, size_t size, int64_t maxChars) {
+  size_t utf8Position = 0;
+  size_t numCharacters = 0;
+  while (utf8Position < size && numCharacters < maxChars) {
+    auto charSize = utf8proc_char_length(input + utf8Position);
+    utf8Position += UNLIKELY(charSize < 0) ? 1 : charSize;
+    numCharacters++;
+  }
+  return utf8Position;
+}
+
 /// Returns the start byte index of the Nth instance of subString in
 /// string. Search starts from startPosition. Positions start with 0. If not
-/// found, -1 is returned.
-/// stringPosition for Unicode uses this by first finding the byte index of
-/// substring and then computing the length of substring[0, byteIndex). This is
-/// safe because in UTF8 a char can not be a subset of another char (in bytes
-/// representation).
-static int64_t findNthInstanceByteIndexFromStart(
+/// found, -1 is returned. To facilitate finding overlapping strings, the
+/// nextStartPosition is incremented by 1
+static inline int64_t findNthInstanceByteIndexFromStart(
     const std::string_view& string,
     const std::string_view subString,
     const size_t instance = 1,
@@ -256,12 +319,13 @@ static int64_t findNthInstanceByteIndexFromStart(
 
   // Find next occurrence
   return findNthInstanceByteIndexFromStart(
-      string, subString, instance - 1, byteIndex + subString.size());
+      string, subString, instance - 1, byteIndex + 1);
 }
 
 /// Returns the start byte index of the Nth instance of subString in
 /// string from the end. Search starts from endPosition. Positions start with 0.
-/// If not found, -1 is returned.
+/// If not found, -1 is returned. To facilitate finding overlapping strings, the
+/// nextStartPosition is incremented by 1
 inline int64_t findNthInstanceByteIndexFromEnd(
     const std::string_view string,
     const std::string_view subString,
@@ -290,10 +354,14 @@ inline int64_t findNthInstanceByteIndexFromEnd(
 
 /// Replace replaced with replacement in inputString and write results in
 /// outputString. If inPlace=true inputString and outputString are assumed to
-/// tbe the same. When replaced is empty, replacement is added before and after
-/// each charecter. When inputString is empty results is empty.
+/// tbe the same. When replaced is empty and ignoreEmptyReplaced is false,
+/// replacement is added before and after each charecter. When replaced is
+/// empty and ignoreEmptyReplaced is true, the result is the inputString value.
+/// When inputString is empty results is empty.
 /// replace("", "", "x") = ""
-/// replace("aa", "", "x") = "xaxax"
+/// replace("aa", "", "x") = "xaxax" -- when ignoreEmptyReplaced is false
+/// replace("aa", "", "x") = "aa" -- when ignoreEmptyReplaced is true
+template <bool ignoreEmptyReplaced = false>
 inline static size_t replace(
     char* outputString,
     const std::string_view& inputString,
@@ -302,6 +370,15 @@ inline static size_t replace(
     bool inPlace = false) {
   if (inputString.size() == 0) {
     return 0;
+  }
+
+  if constexpr (ignoreEmptyReplaced) {
+    if (replaced.size() == 0) {
+      if (!inPlace) {
+        std::memcpy(outputString, inputString.data(), inputString.size());
+      }
+      return inputString.size();
+    }
   }
 
   size_t readPosition = 0;
@@ -394,6 +471,8 @@ inline static size_t replace(
 /// Given a utf8 string, a starting position and length returns the
 /// corresponding underlying byte range [startByteIndex, endByteIndex).
 /// Byte indicies starts from 0, UTF8 character positions starts from 1.
+/// If a bad unicode byte is encountered, then we skip that bad byte and
+/// count that as one codepoint.
 template <bool isAscii>
 static inline std::pair<size_t, size_t>
 getByteRange(const char* str, size_t startCharPosition, size_t length) {
@@ -410,14 +489,16 @@ getByteRange(const char* str, size_t startCharPosition, size_t length) {
 
     // Find startByteIndex
     for (auto i = 0; i < startCharPosition - 1; i++) {
-      nextCharOffset += utf8proc_char_length(&str[nextCharOffset]);
+      auto increment = utf8proc_char_length(&str[nextCharOffset]);
+      nextCharOffset += UNLIKELY(increment < 0) ? 1 : increment;
     }
 
     startByteIndex = nextCharOffset;
 
     // Find endByteIndex
     for (auto i = 0; i < length; i++) {
-      nextCharOffset += utf8proc_char_length(&str[nextCharOffset]);
+      auto increment = utf8proc_char_length(&str[nextCharOffset]);
+      nextCharOffset += UNLIKELY(increment < 0) ? 1 : increment;
     }
 
     return std::make_pair(startByteIndex, nextCharOffset);

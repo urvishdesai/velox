@@ -48,7 +48,6 @@ class Expressions {
     return resolverHook_;
   }
 
- private:
   static TypedExprPtr inferTypes(
       const std::shared_ptr<const IExpr>& expr,
       const TypePtr& input,
@@ -56,6 +55,7 @@ class Expressions {
       memory::MemoryPool* pool,
       const VectorPtr& complexConstants = nullptr);
 
+ private:
   static TypedExprPtr resolveLambdaExpr(
       const std::shared_ptr<const core::LambdaExpr>& lambdaExpr,
       const TypePtr& inputRow,
@@ -194,7 +194,7 @@ class ConstantExpr : public IExpr,
         value_{std::move(value)} {}
 
   std::string toString() const override {
-    return appendAliasIfExists(variant{value_}.toJson());
+    return appendAliasIfExists(variant{value_}.toJson(type_));
   }
 
   const variant& value() const {

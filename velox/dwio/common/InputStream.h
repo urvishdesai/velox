@@ -31,24 +31,12 @@
 #include <vector>
 
 #include "velox/common/file/File.h"
-#include "velox/dwio/common/IoStatistics.h"
+#include "velox/common/file/Region.h"
+#include "velox/common/io/IoStatistics.h"
 #include "velox/dwio/common/MetricsLog.h"
 
 namespace facebook::velox::dwio::common {
-
-constexpr uint64_t DEFAULT_AUTO_PRELOAD_SIZE =
-    (static_cast<const uint64_t>((1ul << 20) * 72));
-
-// define a disk region to read
-struct Region {
-  uint64_t offset;
-  uint64_t length;
-
-  Region(uint64_t offset = 0, uint64_t length = 0)
-      : offset{offset}, length{length} {}
-
-  bool operator<(const Region& other) const;
-};
+using namespace facebook::velox::io;
 
 /**
  * An abstract interface for providing readers a stream of bytes.
@@ -58,7 +46,7 @@ class InputStream {
   explicit InputStream(
       const std::string& path,
       const MetricsLogPtr& metricsLog = MetricsLog::voidLog(),
-      IoStatistics* FOLLY_NULLABLE stats = nullptr)
+      IoStatistics* stats = nullptr)
       : path_{path}, metricsLog_{metricsLog}, stats_(stats) {}
 
   virtual ~InputStream() = default;
@@ -66,7 +54,7 @@ class InputStream {
   /**
    * Get the stats object
    */
-  IoStatistics* FOLLY_NULLABLE getStats() const {
+  IoStatistics* getStats() const {
     return stats_;
   }
 
@@ -128,15 +116,13 @@ class InputStream {
   /**
    * Take advantage of vectorized read API provided by some file system.
    * Allow file system to do optimzied reading plan to disk to minimize
-   * total bytes transferred through network
+   * total bytes transferred through network. Stores the result in an IOBuf
+   * range named at `iobufs`, which must have the same size as `regions`.
    */
   virtual void vread(
-      const std::vector<void*>& buffers,
-      const std::vector<Region>& regions,
-      const LogType purpose);
-
-  // case insensitive find
-  static uint32_t ifind(const std::string& src, const std::string& target);
+      folly::Range<const velox::common::Region*> regions,
+      folly::Range<folly::IOBuf*> iobufs,
+      const LogType purpose) = 0;
 
   const std::string& getName() const;
 
@@ -145,7 +131,7 @@ class InputStream {
  protected:
   std::string path_;
   MetricsLogPtr metricsLog_;
-  IoStatistics* FOLLY_NULLABLE stats_;
+  IoStatistics* stats_;
 };
 
 // An input stream that reads from an already opened ReadFile.
@@ -155,15 +141,15 @@ class ReadFileInputStream final : public InputStream {
   explicit ReadFileInputStream(
       std::shared_ptr<velox::ReadFile>,
       const MetricsLogPtr& metricsLog = MetricsLog::voidLog(),
-      IoStatistics* FOLLY_NULLABLE stats = nullptr);
+      IoStatistics* stats = nullptr);
 
-  virtual ~ReadFileInputStream() {}
+  ~ReadFileInputStream() override = default;
 
-  uint64_t getLength() const final {
+  uint64_t getLength() const final override {
     return readFile_->size();
   }
 
-  uint64_t getNaturalReadSize() const final {
+  uint64_t getNaturalReadSize() const final override {
     return readFile_->getNaturalReadSize();
   }
 
@@ -180,6 +166,11 @@ class ReadFileInputStream final : public InputStream {
       LogType logType) override;
 
   bool hasReadAsync() const override;
+
+  void vread(
+      folly::Range<const velox::common::Region*> regions,
+      folly::Range<folly::IOBuf*> iobufs,
+      const LogType purpose) override;
 
   const std::shared_ptr<velox::ReadFile>& getReadFile() const {
     return readFile_;

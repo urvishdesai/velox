@@ -146,27 +146,19 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     return false;
   }
 
-  void initializeNewGroups(
-      char** groups,
-      folly::Range<const vector_size_t*> indices) override {
-    exec::Aggregate::setAllNulls(groups, indices);
-    for (auto i : indices) {
-      auto group = groups[i];
-      new (group + offset_) KllSketchAccumulator<T>(allocator_);
-    }
-  }
-
-  void destroy(folly::Range<char**> groups) override {
-    for (auto group : groups) {
-      value<KllSketchAccumulator<T>>(group)->~KllSketchAccumulator<T>();
-    }
-  }
-
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
       override {
     finalize(groups, numGroups);
 
     VELOX_CHECK(result);
+    // When all inputs are nulls or masked out, percentiles_ can be
+    // uninitialized. The result should be nulls in this case.
+    if (!percentiles_.has_value()) {
+      *result = BaseVector::createNullConstant(
+          (*result)->type(), numGroups, (*result)->pool());
+      return;
+    }
+
     if (percentiles_ && percentiles_->isArray) {
       folly::Range percentiles(
           percentiles_->values.begin(), percentiles_->values.end());
@@ -218,32 +210,43 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     VELOX_CHECK(rowResult);
     auto pool = rowResult->pool();
 
-    if (percentiles_) {
-      auto& values = percentiles_->values;
-      auto size = values.size();
-      auto elements =
-          BaseVector::create<FlatVector<double>>(DOUBLE(), size, pool);
-      std::copy(values.begin(), values.end(), elements->mutableRawValues());
-      auto array = std::make_shared<ArrayVector>(
-          pool,
-          ARRAY(DOUBLE()),
-          nullptr,
-          1,
-          AlignedBuffer::allocate<vector_size_t>(1, pool, 0),
-          AlignedBuffer::allocate<vector_size_t>(1, pool, size),
-          std::move(elements));
-      rowResult->childAt(kPercentiles) =
-          BaseVector::wrapInConstant(numGroups, 0, std::move(array));
-      rowResult->childAt(kPercentilesIsArray) =
-          std::make_shared<ConstantVector<bool>>(
-              pool, numGroups, false, BOOLEAN(), bool(percentiles_->isArray));
-    } else {
+    // percentiles_ can be uninitialized during an intermediate aggregation step
+    // when all input intermediate states are nulls. Result should be nulls in
+    // this case.
+    if (!percentiles_) {
+      rowResult->ensureWritable(SelectivityVector{numGroups});
+      // rowResult->childAt(i) for i = kPercentiles, kPercentilesIsArray, and
+      // kAccuracy are expected to be constant in addIntermediateResults.
       rowResult->childAt(kPercentiles) =
           BaseVector::createNullConstant(ARRAY(DOUBLE()), numGroups, pool);
       rowResult->childAt(kPercentilesIsArray) =
-          std::make_shared<ConstantVector<bool>>(
-              pool, numGroups, true, BOOLEAN(), false);
+          BaseVector::createNullConstant(BOOLEAN(), numGroups, pool);
+      rowResult->childAt(kAccuracy) =
+          BaseVector::createNullConstant(DOUBLE(), numGroups, pool);
+
+      // Set nulls for all rows.
+      auto rawNulls = rowResult->mutableRawNulls();
+      bits::fillBits(rawNulls, 0, rowResult->size(), bits::kNull);
+      return;
     }
+    auto& values = percentiles_->values;
+    auto size = values.size();
+    auto elements =
+        BaseVector::create<FlatVector<double>>(DOUBLE(), size, pool);
+    std::copy(values.begin(), values.end(), elements->mutableRawValues());
+    auto array = std::make_shared<ArrayVector>(
+        pool,
+        ARRAY(DOUBLE()),
+        nullptr,
+        1,
+        AlignedBuffer::allocate<vector_size_t>(1, pool, 0),
+        AlignedBuffer::allocate<vector_size_t>(1, pool, size),
+        std::move(elements));
+    rowResult->childAt(kPercentiles) =
+        BaseVector::wrapInConstant(numGroups, 0, std::move(array));
+    rowResult->childAt(kPercentilesIsArray) =
+        std::make_shared<ConstantVector<bool>>(
+            pool, numGroups, false, BOOLEAN(), bool(percentiles_->isArray));
     rowResult->childAt(kAccuracy) = std::make_shared<ConstantVector<double>>(
         pool,
         numGroups,
@@ -399,6 +402,25 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     addIntermediate<true>(group, rows, args);
   }
 
+ protected:
+  void initializeNewGroupsInternal(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) override {
+    exec::Aggregate::setAllNulls(groups, indices);
+    for (auto i : indices) {
+      auto group = groups[i];
+      new (group + offset_) KllSketchAccumulator<T>(allocator_);
+    }
+  }
+
+  void destroyInternal(folly::Range<char**> groups) override {
+    for (auto group : groups) {
+      if (isInitialized(group)) {
+        value<KllSketchAccumulator<T>>(group)->~KllSketchAccumulator<T>();
+      }
+    }
+  }
+
  private:
   void finalize(char** groups, int32_t numGroups) {
     for (auto i = 0; i < numGroups; ++i) {
@@ -417,7 +439,7 @@ class ApproxPercentileAggregate : public exec::Aggregate {
 
     uint64_t* rawNulls = nullptr;
     if (result->mayHaveNulls()) {
-      BufferPtr nulls = result->mutableNulls(result->size());
+      BufferPtr& nulls = result->mutableNulls(result->size());
       rawNulls = nulls->asMutable<uint64_t>();
     }
 
@@ -446,45 +468,76 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     checkSetPercentile(rows, *args[argIndex++]);
     if (hasAccuracy_) {
       decodedAccuracy_.decode(*args[argIndex++], rows, true);
-      checkSetAccuracy();
+      checkSetAccuracy(rows);
     }
     VELOX_CHECK_EQ(argIndex, args.size());
+  }
+
+  /// Extract percentile info: the raw data, the length and the null-ness from
+  /// top-level ArrayVector.
+  static void extractPercentiles(
+      const ArrayVector* arrays,
+      vector_size_t indexInBaseVector,
+      const double*& data,
+      vector_size_t& len,
+      std::vector<bool>& isNull) {
+    auto elements = arrays->elements()->asFlatVector<double>();
+    auto offset = arrays->offsetAt(indexInBaseVector);
+    data = elements->rawValues() + offset;
+    len = arrays->sizeAt(indexInBaseVector);
+    isNull.resize(len);
+    for (auto index = offset; index < offset + len; index++) {
+      isNull[index - offset] = elements->isNullAt(index);
+    }
   }
 
   void checkSetPercentile(
       const SelectivityVector& rows,
       const BaseVector& vec) {
     DecodedVector decoded(vec, rows);
-    VELOX_USER_CHECK(
-        decoded.isConstantMapping(),
-        "Percentile argument must be constant for all input rows");
+
+    auto* base = decoded.base();
+    auto baseFirstRow = decoded.index(rows.begin());
+    if (!decoded.isConstantMapping()) {
+      rows.applyToSelected([&](vector_size_t row) {
+        VELOX_USER_CHECK(!decoded.isNullAt(row), "Percentile cannot be null")
+        auto baseRow = decoded.index(row);
+        VELOX_USER_CHECK(
+            base->equalValueAt(base, baseRow, baseFirstRow),
+            "Percentile argument must be constant for all input rows: {} vs. {}",
+            base->toString(baseRow),
+            base->toString(baseFirstRow));
+      });
+    }
+
     bool isArray;
     const double* data;
     vector_size_t len;
-    auto i = decoded.index(0);
-    if (decoded.base()->typeKind() == TypeKind::DOUBLE) {
+    std::vector<bool> isNull;
+    if (base->typeKind() == TypeKind::DOUBLE) {
       isArray = false;
-      data =
-          decoded.base()->asUnchecked<ConstantVector<double>>()->rawValues() +
-          i;
+      data = decoded.data<double>() + baseFirstRow;
       len = 1;
-    } else if (decoded.base()->typeKind() == TypeKind::ARRAY) {
+      isNull = {decoded.isNullAt(rows.begin())};
+    } else if (base->typeKind() == TypeKind::ARRAY) {
       isArray = true;
-      auto arrays = decoded.base()->asUnchecked<ArrayVector>();
+      auto arrays = base->asUnchecked<ArrayVector>();
       VELOX_USER_CHECK(
           arrays->elements()->isFlatEncoding(),
           "Only flat encoding is allowed for percentile array elements");
-      auto elements = arrays->elements()->asFlatVector<double>();
-      data = elements->rawValues() + arrays->offsetAt(i);
-      len = arrays->sizeAt(i);
+      extractPercentiles(arrays, baseFirstRow, data, len, isNull);
     } else {
       VELOX_USER_FAIL(
-          "Incorrect type for percentile: {}", decoded.base()->typeKind());
+          "Incorrect type for percentile: {}", base->type()->toString());
     }
-    checkSetPercentile(isArray, data, len);
+    checkSetPercentile(isArray, data, len, isNull);
   }
 
-  void checkSetPercentile(bool isArray, const double* data, vector_size_t len) {
+  void checkSetPercentile(
+      bool isArray,
+      const double* data,
+      vector_size_t len,
+      const std::vector<bool>& isNull) {
     if (!percentiles_) {
       VELOX_USER_CHECK_GT(len, 0, "Percentile cannot be empty");
       percentiles_ = {
@@ -492,6 +545,7 @@ class ApproxPercentileAggregate : public exec::Aggregate {
           .isArray = isArray,
       };
       for (vector_size_t i = 0; i < len; ++i) {
+        VELOX_USER_CHECK(!isNull[i], "Percentile cannot be null");
         VELOX_USER_CHECK_GE(data[i], 0, "Percentile must be between 0 and 1");
         VELOX_USER_CHECK_LE(data[i], 1, "Percentile must be between 0 and 1");
         percentiles_->values[i] = data[i];
@@ -514,14 +568,29 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     }
   }
 
-  void checkSetAccuracy() {
+  void checkSetAccuracy(const SelectivityVector& rows) {
     if (!hasAccuracy_) {
       return;
     }
-    VELOX_USER_CHECK(
-        decodedAccuracy_.isConstantMapping(),
-        "Accuracy argument must be constant for all input rows");
-    checkSetAccuracy(decodedAccuracy_.valueAt<double>(0));
+
+    if (decodedAccuracy_.isConstantMapping()) {
+      VELOX_USER_CHECK(
+          !decodedAccuracy_.isNullAt(0), "Accuracy cannot be null");
+      checkSetAccuracy(decodedAccuracy_.valueAt<double>(0));
+    } else {
+      rows.applyToSelected([&](auto row) {
+        VELOX_USER_CHECK(
+            !decodedAccuracy_.isNullAt(row), "Accuracy cannot be null");
+        const auto accuracy = decodedAccuracy_.valueAt<double>(row);
+        if (accuracy_ == kMissingNormalizedValue) {
+          checkSetAccuracy(accuracy);
+        }
+        VELOX_USER_CHECK_EQ(
+            accuracy,
+            accuracy_,
+            "Accuracy argument must be constant for all input rows");
+      });
+    }
   }
 
   void checkSetAccuracy(double accuracy) {
@@ -550,11 +619,67 @@ class ApproxPercentileAggregate : public exec::Aggregate {
       std::conditional_t<kSingleGroup, char*, char**> group,
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args) {
+    if (validateIntermediateInputs_) {
+      addIntermediateImpl<kSingleGroup, true>(group, rows, args);
+    } else {
+      addIntermediateImpl<kSingleGroup, false>(group, rows, args);
+    }
+  }
+
+  struct Percentiles {
+    std::vector<double> values;
+    bool isArray;
+  };
+
+  static constexpr double kMissingNormalizedValue = -1;
+  const bool hasWeight_;
+  const bool hasAccuracy_;
+  std::optional<Percentiles> percentiles_;
+  double accuracy_{kMissingNormalizedValue};
+  DecodedVector decodedValue_;
+  DecodedVector decodedWeight_;
+  DecodedVector decodedAccuracy_;
+  DecodedVector decodedDigest_;
+
+ private:
+  template <bool kSingleGroup, bool checkIntermediateInputs>
+  void addIntermediateImpl(
+      std::conditional_t<kSingleGroup, char*, char**> group,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args) {
     VELOX_CHECK_EQ(args.size(), 1);
     DecodedVector decoded(*args[0], rows);
     auto rowVec = decoded.base()->as<RowVector>();
-    VELOX_CHECK(rowVec);
-    DecodedVector percentiles(*rowVec->childAt(kPercentiles), rows);
+    if constexpr (checkIntermediateInputs) {
+      VELOX_USER_CHECK(rowVec);
+      for (int i = kPercentiles; i <= kAccuracy; ++i) {
+        VELOX_USER_CHECK(rowVec->childAt(i)->isConstantEncoding());
+      }
+      for (int i = kK; i <= kMaxValue; ++i) {
+        VELOX_USER_CHECK(rowVec->childAt(i)->isFlatEncoding());
+      }
+      for (int i = kItems; i <= kLevels; ++i) {
+        VELOX_USER_CHECK(
+            rowVec->childAt(i)->encoding() == VectorEncoding::Simple::ARRAY);
+      }
+    } else {
+      VELOX_CHECK(rowVec);
+    }
+
+    const SelectivityVector* baseRows = &rows;
+    SelectivityVector innerRows{rowVec->size(), false};
+    if (!decoded.isIdentityMapping()) {
+      if (decoded.isConstantMapping()) {
+        innerRows.setValid(decoded.index(0), true);
+        innerRows.updateBounds();
+      } else {
+        velox::translateToInnerRows(
+            rows, decoded.indices(), decoded.nulls(&rows), innerRows);
+      }
+      baseRows = &innerRows;
+    }
+
+    DecodedVector percentiles(*rowVec->childAt(kPercentiles), *baseRows);
     auto percentileIsArray =
         rowVec->childAt(kPercentilesIsArray)->asUnchecked<SimpleVector<bool>>();
     auto accuracy =
@@ -567,10 +692,17 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     auto levels = rowVec->childAt(kLevels)->asUnchecked<ArrayVector>();
 
     auto itemsElements = items->elements()->asFlatVector<T>();
-    VELOX_CHECK(itemsElements);
+    auto levelElements = levels->elements()->asFlatVector<int32_t>();
+    if constexpr (checkIntermediateInputs) {
+      VELOX_USER_CHECK(itemsElements);
+      VELOX_USER_CHECK(levelElements);
+    } else {
+      VELOX_CHECK(itemsElements);
+      VELOX_CHECK(levelElements);
+    }
     auto rawItems = itemsElements->rawValues();
-    auto rawLevels =
-        levels->elements()->asFlatVector<int32_t>()->rawValues<uint32_t>();
+    auto rawLevels = levelElements->rawValues<uint32_t>();
+
     KllSketchAccumulator<T>* accumulator = nullptr;
     std::vector<typename KllSketch<T>::View> views;
     if constexpr (kSingleGroup) {
@@ -585,14 +717,23 @@ class ApproxPercentileAggregate : public exec::Aggregate {
         return;
       }
       if (!accumulator) {
-        int j = percentiles.index(i);
+        int indexInBaseVector = percentiles.index(i);
         auto percentilesBase = percentiles.base()->asUnchecked<ArrayVector>();
-        auto rawPercentiles =
-            percentilesBase->elements()->asFlatVector<double>()->rawValues();
-        checkSetPercentile(
-            percentileIsArray->valueAt(i),
-            rawPercentiles + percentilesBase->offsetAt(j),
-            percentilesBase->sizeAt(j));
+        auto percentileBaseElements =
+            percentilesBase->elements()->asFlatVector<double>();
+        if constexpr (checkIntermediateInputs) {
+          VELOX_USER_CHECK(percentileBaseElements);
+          VELOX_USER_CHECK(!percentilesBase->isNullAt(indexInBaseVector));
+        }
+
+        bool isArray = percentileIsArray->valueAt(i);
+        const double* data;
+        vector_size_t len;
+        std::vector<bool> isNull;
+        extractPercentiles(
+            percentilesBase, indexInBaseVector, data, len, isNull);
+        checkSetPercentile(isArray, data, len, isNull);
+
         if (!accuracy->isNullAt(i)) {
           checkSetAccuracy(accuracy->valueAt(i));
         }
@@ -603,6 +744,13 @@ class ApproxPercentileAggregate : public exec::Aggregate {
         }
       } else {
         accumulator = initRawAccumulator(group[row]);
+      }
+
+      if constexpr (checkIntermediateInputs) {
+        VELOX_USER_CHECK(
+            !(k->isNullAt(i) || n->isNullAt(i) || minValue->isNullAt(i) ||
+              maxValue->isNullAt(i) || items->isNullAt(i) ||
+              levels->isNullAt(i)));
       }
       typename KllSketch<T>::View v{
           .k = static_cast<uint32_t>(k->valueAt(i)),
@@ -630,21 +778,6 @@ class ApproxPercentileAggregate : public exec::Aggregate {
       }
     }
   }
-
-  struct Percentiles {
-    std::vector<double> values;
-    bool isArray;
-  };
-
-  static constexpr double kMissingNormalizedValue = -1;
-  const bool hasWeight_;
-  const bool hasAccuracy_;
-  std::optional<Percentiles> percentiles_;
-  double accuracy_{kMissingNormalizedValue};
-  DecodedVector decodedValue_;
-  DecodedVector decodedWeight_;
-  DecodedVector decodedAccuracy_;
-  DecodedVector decodedDigest_;
 };
 
 bool validPercentileType(const Type& type) {
@@ -696,7 +829,12 @@ void addSignatures(
                            .build());
 }
 
-bool registerApproxPercentile(const std::string& name) {
+} // namespace
+
+void registerApproxPercentileAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite) {
   std::vector<std::shared_ptr<exec::AggregateFunctionSignature>> signatures;
   for (const auto& inputType :
        {"tinyint", "smallint", "integer", "bigint", "real", "double"}) {
@@ -707,13 +845,16 @@ bool registerApproxPercentile(const std::string& name) {
         fmt::format("array({})", inputType),
         signatures);
   }
+  auto name = prefix + kApproxPercentile;
   exec::registerAggregateFunction(
       name,
       std::move(signatures),
       [name](
           core::AggregationNode::Step step,
           const std::vector<TypePtr>& argTypes,
-          const TypePtr& resultType) -> std::unique_ptr<exec::Aggregate> {
+          const TypePtr& resultType,
+          const core::QueryConfig& /*config*/)
+          -> std::unique_ptr<exec::Aggregate> {
         auto isRawInput = exec::isRawInput(step);
         auto hasWeight =
             argTypes.size() >= 2 && argTypes[1]->kind() == TypeKind::BIGINT;
@@ -792,14 +933,9 @@ bool registerApproxPercentile(const std::string& name) {
                 name,
                 type->toString());
         }
-      });
-  return true;
-}
-
-} // namespace
-
-void registerApproxPercentileAggregate(const std::string& prefix) {
-  registerApproxPercentile(prefix + kApproxPercentile);
+      },
+      withCompanionFunctions,
+      overwrite);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

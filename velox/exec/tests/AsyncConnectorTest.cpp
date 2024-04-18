@@ -133,20 +133,19 @@ class TestDataSource : public connector::DataSource {
 
 class TestConnector : public connector::Connector {
  public:
-  TestConnector(const std::string& id, std::shared_ptr<const Config> properties)
-      : connector::Connector(id, std::move(properties)) {}
+  TestConnector(const std::string& id) : connector::Connector(id) {}
 
-  std::shared_ptr<connector::DataSource> createDataSource(
+  std::unique_ptr<connector::DataSource> createDataSource(
       const RowTypePtr& /* outputType */,
-      const std::shared_ptr<connector::ConnectorTableHandle>& /* tableHandle */,
+      const std::shared_ptr<ConnectorTableHandle>& /* tableHandle */,
       const std::unordered_map<
           std::string,
           std::shared_ptr<connector::ColumnHandle>>& /* columnHandles */,
       connector::ConnectorQueryCtx* connectorQueryCtx) override {
-    return std::make_shared<TestDataSource>(connectorQueryCtx->memoryPool());
+    return std::make_unique<TestDataSource>(connectorQueryCtx->memoryPool());
   }
 
-  std::shared_ptr<connector::DataSink> createDataSink(
+  std::unique_ptr<connector::DataSink> createDataSink(
       RowTypePtr /*inputType*/,
       std::shared_ptr<
           ConnectorInsertTableHandle> /*connectorInsertTableHandle*/,
@@ -164,9 +163,9 @@ class TestConnectorFactory : public connector::ConnectorFactory {
 
   std::shared_ptr<connector::Connector> newConnector(
       const std::string& id,
-      std::shared_ptr<const Config> properties,
+      std::shared_ptr<const Config> config,
       folly::Executor* /* executor */) override {
-    return std::make_shared<TestConnector>(id, std::move(properties));
+    return std::make_shared<TestConnector>(id);
   }
 };
 } // namespace
@@ -179,7 +178,8 @@ class AsyncConnectorTest : public OperatorTestBase {
         std::make_shared<TestConnectorFactory>());
     auto testConnector =
         connector::getConnectorFactory(TestConnectorFactory::kTestConnectorName)
-            ->newConnector(kTestConnectorId, nullptr, nullptr);
+            ->newConnector(
+                kTestConnectorId, std::make_shared<core::MemConfig>(), nullptr);
     connector::registerConnector(testConnector);
   }
 
@@ -193,7 +193,10 @@ TEST_F(AsyncConnectorTest, basic) {
   auto tableHandle = std::make_shared<TestTableHandle>();
   core::PlanNodeId scanId;
   auto plan = PlanBuilder()
-                  .tableScan(ROW({"a"}, {BIGINT()}), tableHandle, {})
+                  .startTableScan()
+                  .outputType(ROW({"a"}, {BIGINT()}))
+                  .tableHandle(tableHandle)
+                  .endTableScan()
                   .capturePlanNodeId(scanId)
                   .singleAggregation({}, {"min(a)"})
                   .planNode();

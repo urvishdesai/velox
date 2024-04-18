@@ -22,6 +22,7 @@
 #include <string>
 
 #include "velox/dwio/common/InputStream.h"
+#include "velox/dwio/common/Mutation.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/Statistics.h"
 #include "velox/dwio/common/TypeWithId.h"
@@ -40,15 +41,43 @@ namespace facebook::velox::dwio::common {
  */
 class RowReader {
  public:
+  static constexpr int64_t kAtEnd = -1;
+
   virtual ~RowReader() = default;
 
   /**
    * Fetch the next portion of rows.
    * @param size Max number of rows to read
    * @param result output vector
-   * @return number of fetched rows, 0 if there are no more rows to read
+   * @param mutation The mutation to be applied during the read, null means no
+   *  mutation
+   * @return number of rows scanned in the file (including any rows filtered out
+   *  or deleted in mutation), 0 if there are no more rows to read.
    */
-  virtual uint64_t next(uint64_t size, velox::VectorPtr& result) = 0;
+  virtual uint64_t next(
+      uint64_t size,
+      velox::VectorPtr& result,
+      const Mutation* mutation = nullptr) = 0;
+
+  /**
+   * Return the next row number that will be scanned in the next next() call,
+   * kAtEnd when at end of file.  This row number is relative to beginning of
+   * the file (0 for the first row), including all rows in the file, no matter
+   * whether it's deleted or filtered during the previous next() call.
+   *
+   * This function is mainly used to compute the bit mask used for mutation.
+   * Given a list of row numbers in the file, we can calculate the offset of
+   * each rows in the bit mask based on value returned from this call.
+   */
+  virtual int64_t nextRowNumber() = 0;
+
+  /**
+   * Given the max number of rows to read, return the actual number of rows that
+   * will be scanned, including any rows to be deleted or filtered.  Return
+   * kAtEnd when at end of file.  This is also used to compute the bit mask used
+   * in mutation.
+   */
+  virtual int64_t nextReadSize(uint64_t size) = 0;
 
   /**
    * Update current reader statistics. The set of updated values is
@@ -75,6 +104,48 @@ class RowReader {
   virtual bool allPrefetchIssued() const {
     return false;
   }
+
+  enum class FetchResult {
+    kFetched, // This function did the fetch
+    kInProgress, // Another thread already started the IO
+    kAlreadyFetched // Another thread already finished the IO
+  };
+
+  // Struct describing 1 prefetch unit. A prefetch unit is defined by
+  // a rowCount and a function, that when called, will trigger the prefetch
+  // or report that it was already triggered.
+  struct PrefetchUnit {
+    // Number of rows in the prefetch unit
+    uint64_t rowCount;
+    // Task to trigger the prefetch for this unit
+    std::function<FetchResult()> prefetch;
+  };
+
+  /**
+   * Returns a vector of PrefetchUnit objects describing all the prefetch units
+   * owned by this RowReader. For example, a returned vector {{50, func1}, {50,
+   * func2}} would represent a RowReader which has 2 prefetch units (for
+   * example, a stripe for dwrf and alpha file formats). Each prefetch unit has
+   * 50 rows, and func1 and func2 represent callables which will run the
+   * prefetch and report a FetchResult. The FetchResult reports if the prefetch
+   * was completed by the caller, if the prefetch was in progress when the
+   * function was called or if the prefetch was already completed, as a result
+   * of i.e. calling next and having the main thread load the stripe.
+   * @return std::nullopt if the reader implementation does not support
+   * prefetching.
+   */
+  virtual std::optional<std::vector<PrefetchUnit>> prefetchUnits() {
+    return std::nullopt;
+  }
+
+  /**
+   * Helper function used by non-selective reader to project top level columns
+   * according to the scan spec and mutations.
+   */
+  static VectorPtr projectColumns(
+      const VectorPtr& input,
+      const velox::common::ScanSpec& spec,
+      const Mutation* mutation);
 };
 
 /**

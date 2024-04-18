@@ -39,9 +39,9 @@ class NotFunction : public exec::VectorFunction {
     if (input->isConstantEncoding()) {
       bool value = input->as<ConstantVector<bool>>()->valueAt(0);
       negated =
-          AlignedBuffer::allocate<bool>(rows.size(), context.pool(), !value);
+          AlignedBuffer::allocate<bool>(rows.end(), context.pool(), !value);
     } else {
-      negated = AlignedBuffer::allocate<bool>(rows.size(), context.pool());
+      negated = AlignedBuffer::allocate<bool>(rows.end(), context.pool());
       auto rawNegated = negated->asMutable<char>();
 
       auto rawInput = input->asFlatVector<bool>()->rawValues<uint64_t>();
@@ -54,11 +54,15 @@ class NotFunction : public exec::VectorFunction {
         context.pool(),
         BOOLEAN(),
         nullptr,
-        rows.size(),
+        rows.end(),
         negated,
         std::vector<BufferPtr>{});
 
     context.moveOrCopyResult(localResult, rows, result);
+  }
+
+  exec::FunctionCanonicalName getCanonicalName() const override {
+    return exec::FunctionCanonicalName::kNot;
   }
 
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {

@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <boost/algorithm/string.hpp>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,19 +23,26 @@
 #include <vector>
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/expression/TypeSignature.h"
+#include "velox/expression/signature_parser/SignatureParser.h"
+#include "velox/type/Type.h"
 
 namespace facebook::velox::exec {
 
 std::string sanitizeName(const std::string& name);
 
-inline bool isCommonDecimalName(const std::string& typeName) {
-  return (typeName == "DECIMAL");
-}
-
 /// Return a list of primitive type names.
 const std::vector<std::string> primitiveTypeNames();
 
 enum class ParameterType : int8_t { kTypeParameter, kIntegerParameter };
+
+/// Canonical names for functions that have special treatments in pushdowns.
+enum class FunctionCanonicalName {
+  kUnknown,
+  kLt,
+  kNot,
+  kRand,
+};
 
 /// SignatureVariable holds both, type parameters (e.g. K or V in map(K,
 /// V)), and integer parameters with optional constraints (e.g. "r_precision =
@@ -45,7 +53,9 @@ class SignatureVariable {
       std::string name,
       std::optional<std::string> constraint,
       ParameterType type,
-      bool knownTypesOnly = false);
+      bool knownTypesOnly = false,
+      bool orderableTypesOnly = false,
+      bool comparableTypesOnly = false);
 
   const std::string& name() const {
     return name_;
@@ -60,6 +70,16 @@ class SignatureVariable {
     return knownTypesOnly_;
   }
 
+  bool orderableTypesOnly() const {
+    VELOX_USER_CHECK(isTypeParameter());
+    return orderableTypesOnly_;
+  }
+
+  bool comparableTypesOnly() const {
+    VELOX_USER_CHECK(isTypeParameter());
+    return comparableTypesOnly_;
+  }
+
   bool isTypeParameter() const {
     return type_ == ParameterType::kTypeParameter;
   }
@@ -71,42 +91,20 @@ class SignatureVariable {
   bool operator==(const SignatureVariable& rhs) const {
     return type_ == rhs.type_ && name_ == rhs.name_ &&
         constraint_ == rhs.constraint_ &&
-        knownTypesOnly_ == rhs.knownTypesOnly_;
+        knownTypesOnly_ == rhs.knownTypesOnly_ &&
+        orderableTypesOnly_ == rhs.orderableTypesOnly_ &&
+        comparableTypesOnly_ == rhs.comparableTypesOnly_;
   }
 
  private:
   const std::string name_;
   const std::string constraint_;
   const ParameterType type_;
-  // This property only applies to type variables and indicates if the type
-  // can bind to unknown or not.
+  // The following properties apply only to type variables and indicate whether
+  // the type can bind only to known, orderable or comparable types.
   bool knownTypesOnly_ = false;
-};
-
-// Base type (e.g. map) and optional parameters (e.g. K, V).
-// All parameters must be of the same ParameterType.
-class TypeSignature {
- public:
-  TypeSignature(std::string baseName, std::vector<TypeSignature> parameters)
-      : baseName_{std::move(baseName)}, parameters_{std::move(parameters)} {}
-
-  const std::string& baseName() const {
-    return baseName_;
-  }
-
-  const std::vector<TypeSignature>& parameters() const {
-    return parameters_;
-  }
-
-  std::string toString() const;
-
-  bool operator==(const TypeSignature& rhs) const {
-    return baseName_ == rhs.baseName_ && parameters_ == rhs.parameters_;
-  }
-
- private:
-  const std::string baseName_;
-  const std::vector<TypeSignature> parameters_;
+  bool orderableTypesOnly_ = false;
+  bool comparableTypesOnly_ = false;
 };
 
 class FunctionSignature {
@@ -131,6 +129,8 @@ class FunctionSignature {
       std::vector<bool> constantArguments,
       bool variableArity);
 
+  virtual ~FunctionSignature() = default;
+
   const TypeSignature& returnType() const {
     return returnType_;
   }
@@ -143,11 +143,16 @@ class FunctionSignature {
     return constantArguments_;
   }
 
+  bool hasConstantArgument() const {
+    return std::any_of(
+        constantArguments_.begin(), constantArguments_.end(), folly::identity);
+  }
+
   bool variableArity() const {
     return variableArity_;
   }
 
-  std::string toString() const;
+  virtual std::string toString() const;
 
   const auto& variables() const {
     return variables_;
@@ -161,6 +166,26 @@ class FunctionSignature {
         argumentTypes_ == rhs.argumentTypes_ &&
         variableArity_ == rhs.variableArity_;
   }
+
+ protected:
+  /// @param additionalTypes A list of additional types introduced by subclass.
+  /// Since FunctionSignature will validate that the number of used variables
+  /// and the size of variables_ must be equal. If the subclass introduces new
+  /// types, such as intermediateType in AggregateFunctionSignature, and these
+  /// types uses signature variables, it needs to pass the additional types to
+  /// the constructor of FunctionSignature for validation, to ensure that the
+  /// variables used by the subclass will also be counted in the validation of
+  /// FunctionSignature.
+  FunctionSignature(
+      std::unordered_map<std::string, SignatureVariable> variables,
+      TypeSignature returnType,
+      std::vector<TypeSignature> argumentTypes,
+      std::vector<bool> constantArguments,
+      bool variableArity,
+      const std::vector<TypeSignature>& additionalTypes);
+
+  // Return a string of the list of argument types.
+  std::string argumentsToString() const;
 
  private:
   const std::unordered_map<std::string, SignatureVariable> variables_;
@@ -186,16 +211,22 @@ class AggregateFunctionSignature : public FunctionSignature {
             std::move(returnType),
             std::move(argumentTypes),
             std::move(constantArguments),
-            variableArity),
+            variableArity,
+            {intermediateType}),
         intermediateType_{std::move(intermediateType)} {}
 
   const TypeSignature& intermediateType() const {
     return intermediateType_;
   }
 
+  std::string toString() const override;
+
  private:
   const TypeSignature intermediateType_;
 };
+
+using AggregateFunctionSignaturePtr =
+    std::shared_ptr<AggregateFunctionSignature>;
 
 namespace {
 
@@ -212,18 +243,8 @@ inline void addVariable(
 
 } // namespace
 
-/// Parses a string into TypeSignature. The format of the string is type name,
-/// optionally followed by type parameters enclosed in parenthesis.
-/// Examples:
-///     - bigint
-///     - double
-///     - array(T)
-///     - map(K,V)
-///     - row(bigint,array(tinyint),T)
-///     - function(S,T,R)
-TypeSignature parseTypeSignature(const std::string& signature);
-
 /// Convenience class for creating FunctionSignature instances.
+///
 /// Example of usage:
 ///     - signature of "concat" function: varchar... -> varchar
 ///
@@ -249,12 +270,18 @@ class FunctionSignatureBuilder {
     return *this;
   }
 
-  FunctionSignatureBuilder& knownTypeVariable(const std::string& name) {
-    addVariable(
-        variables_,
-        SignatureVariable(name, "", ParameterType::kTypeParameter, true));
+  FunctionSignatureBuilder& variable(const SignatureVariable& variable) {
+    addVariable(variables_, variable);
     return *this;
   }
+
+  FunctionSignatureBuilder& knownTypeVariable(const std::string& name);
+
+  /// Orderable implies comparable, this method would enable
+  /// comparableTypesOnly_ too.
+  FunctionSignatureBuilder& orderableTypeVariable(const std::string& name);
+
+  FunctionSignatureBuilder& comparableTypeVariable(const std::string& name);
 
   FunctionSignatureBuilder& integerVariable(
       const std::string& name,
@@ -317,13 +344,15 @@ class AggregateFunctionSignatureBuilder {
     return *this;
   }
 
-  AggregateFunctionSignatureBuilder& knownTypeVariable(
-      const std::string& name) {
-    addVariable(
-        variables_,
-        SignatureVariable(name, "", ParameterType::kTypeParameter, true));
-    return *this;
-  }
+  AggregateFunctionSignatureBuilder& knownTypeVariable(const std::string& name);
+
+  /// Orderable implies comparable, this method would enable
+  /// comparableTypesOnly_ too.
+  AggregateFunctionSignatureBuilder& orderableTypeVariable(
+      const std::string& name);
+
+  AggregateFunctionSignatureBuilder& comparableTypeVariable(
+      const std::string& name);
 
   AggregateFunctionSignatureBuilder& integerVariable(
       const std::string& name,
@@ -372,6 +401,22 @@ class AggregateFunctionSignatureBuilder {
   std::vector<bool> constantArguments_;
   bool variableArity_{false};
 };
+
+/// Return a string representation of function signature: name(type1,
+/// type1,...). For example, foo(bigint, boolean, varchar).
+std::string toString(
+    const std::string& name,
+    const std::vector<TypePtr>& types);
+
+/// Return a string representation of a list of scalar function signatures.
+/// For example, (boolean) -> integer, (varchar, integer) -> varchar.
+std::string toString(const std::vector<FunctionSignaturePtr>& signatures);
+
+/// Return a string representation of a list of aggregate function signatures.
+/// For example, (boolean) -> varbinary -> integer, (varchar, integer) ->
+/// varbinary -> varchar.
+std::string toString(
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures);
 
 } // namespace facebook::velox::exec
 

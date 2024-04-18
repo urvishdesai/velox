@@ -13,8 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/exec/TopN.h"
+#include <folly/container/F14Map.h>
+
 #include "velox/exec/ContainerRowSerde.h"
+#include "velox/exec/TopN.h"
 #include "velox/vector/FlatVector.h"
 
 namespace facebook::velox::exec {
@@ -36,34 +38,35 @@ TopN::TopN(
           topNNode->sortingOrders(),
           data_.get()),
       topRows_(comparator_),
-      decodedVectors_(outputType_->children().size()) {}
-
-TopN::Comparator::Comparator(
-    const RowTypePtr& type,
-    const std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>>&
-        sortingKeys,
-    const std::vector<core::SortOrder>& sortingOrders,
-    RowContainer* rowContainer)
-    : rowContainer_(rowContainer) {
-  auto numKeys = sortingKeys.size();
-  for (int i = 0; i < numKeys; ++i) {
-    auto channel = exprToChannel(sortingKeys[i].get(), type);
-    VELOX_CHECK(
-        channel != kConstantChannel,
-        "TopN doesn't allow constant comparison keys");
-    keyInfo_.push_back(std::make_pair(channel, sortingOrders[i]));
+      decodedVectors_(outputType_->children().size()) {
+  const auto numColumns{outputType_->children().size()};
+  const auto numSortingKeys{topNNode->sortingKeys().size()};
+  sortingKeyColumns_.reserve(numSortingKeys);
+  std::vector<bool> isSortingKey(numColumns);
+  for (const auto& key : topNNode->sortingKeys()) {
+    sortingKeyColumns_.emplace_back(exprToChannel(key.get(), outputType_));
+    isSortingKey[sortingKeyColumns_.back()] = true;
+  }
+  if (numColumns > numSortingKeys) {
+    nonKeyColumns_.reserve(numColumns - numSortingKeys);
+    for (column_index_t i = 0; i < numColumns; ++i) {
+      if (!isSortingKey[i]) {
+        nonKeyColumns_.emplace_back(i);
+      }
+    }
   }
 }
 
 void TopN::addInput(RowVectorPtr input) {
-  SelectivityVector allRows(input->size());
-
-  // TODO Decode keys first, then decode the rest only for passing positions
-  for (int col = 0; col < input->childrenSize(); ++col) {
-    decodedVectors_[col].decode(*input->childAt(col), allRows);
+  for (const auto col : sortingKeyColumns_) {
+    decodedVectors_[col].decode(*input->childAt(col));
   }
 
-  for (int row = 0; row < input->size(); ++row) {
+  const bool hasNonKeyColumn{!nonKeyColumns_.empty()};
+  // Maps passed rows of 'data_' to the corresponding input row number. These
+  // input rows of non-key columns are later stored into data_.
+  folly::F14FastMap<void*, vector_size_t> passedRows;
+  for (auto row = 0; row < input->size(); ++row) {
     char* newRow = nullptr;
     if (topRows_.size() < count_) {
       newRow = data_->newRow();
@@ -78,11 +81,28 @@ void TopN::addInput(RowVectorPtr input) {
       newRow = data_->initializeRow(topRow, true /* reuse */);
     }
 
-    for (int col = 0; col < input->childrenSize(); ++col) {
+    data_->initializeFields(newRow);
+    for (const auto col : sortingKeyColumns_) {
       data_->store(decodedVectors_[col], row, newRow, col);
     }
 
     topRows_.push(newRow);
+    if (hasNonKeyColumn) {
+      passedRows[newRow] = row;
+    }
+  }
+
+  if (hasNonKeyColumn && !passedRows.empty()) {
+    for (const auto col : nonKeyColumns_) {
+      decodedVectors_[col].decode(*input->childAt(col));
+      for (const auto [dataRow, inputRow] : passedRows) {
+        data_->store(
+            decodedVectors_[col],
+            inputRow,
+            reinterpret_cast<char*>(dataRow),
+            col);
+      }
+    }
   }
 }
 
@@ -91,14 +111,14 @@ RowVectorPtr TopN::getOutput() {
     return nullptr;
   }
 
-  uint32_t numRowsToReturn =
-      std::min(kMaxNumRowsToReturn, rows_.size() - numRowsReturned_);
-  VELOX_CHECK(numRowsToReturn > 0);
+  const auto numRowsToReturn = std::min<vector_size_t>(
+      outputBatchSize_, rows_.size() - numRowsReturned_);
+  VELOX_CHECK_GT(numRowsToReturn, 0);
 
-  auto result = std::dynamic_pointer_cast<RowVector>(
-      BaseVector::create(outputType_, numRowsToReturn, operatorCtx_->pool()));
+  auto result = BaseVector::create<RowVector>(
+      outputType_, numRowsToReturn, operatorCtx_->pool());
 
-  for (int i = 0; i < outputType_->size(); ++i) {
+  for (auto i = 0; i < outputType_->size(); ++i) {
     data_->extractColumn(
         rows_.data() + numRowsReturned_,
         numRowsToReturn,
@@ -117,10 +137,12 @@ void TopN::noMoreInput() {
     return;
   }
   rows_.resize(topRows_.size());
-  for (int i = rows_.size(); i > 0; --i) {
+  for (auto i = rows_.size(); i > 0; --i) {
     rows_[i - 1] = topRows_.top();
     topRows_.pop();
   }
+
+  outputBatchSize_ = outputBatchRows(data_->estimateRowSize());
 }
 
 bool TopN::isFinished() {

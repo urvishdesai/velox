@@ -16,11 +16,38 @@
 
 #include "velox/functions/sparksql/aggregates/Register.h"
 
-#include "velox/functions/sparksql/aggregates/LastAggregate.h"
+#include "velox/functions/sparksql/aggregates/AverageAggregate.h"
+#include "velox/functions/sparksql/aggregates/BitwiseXorAggregate.h"
+#include "velox/functions/sparksql/aggregates/BloomFilterAggAggregate.h"
+#include "velox/functions/sparksql/aggregates/CentralMomentsAggregate.h"
+#include "velox/functions/sparksql/aggregates/CollectListAggregate.h"
+#include "velox/functions/sparksql/aggregates/RegrReplacementAggregate.h"
+#include "velox/functions/sparksql/aggregates/SumAggregate.h"
 
-namespace facebook::velox::functions::sparksql::aggregates {
+namespace facebook::velox::functions::aggregate::sparksql {
 
-void registerAggregateFunctions(const std::string& prefix) {
-  aggregates::registerLastAggregate(prefix + "last");
+extern void registerFirstLastAggregates(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite);
+extern void registerMinMaxByAggregates(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite);
+
+void registerAggregateFunctions(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite) {
+  registerFirstLastAggregates(prefix, withCompanionFunctions, overwrite);
+  registerMinMaxByAggregates(prefix, withCompanionFunctions, overwrite);
+  registerBitwiseXorAggregate(prefix, withCompanionFunctions, overwrite);
+  registerBloomFilterAggAggregate(
+      prefix + "bloom_filter_agg", withCompanionFunctions, overwrite);
+  registerAverage(prefix + "avg", withCompanionFunctions, overwrite);
+  registerSum(prefix + "sum", withCompanionFunctions, overwrite);
+  registerCentralMomentsAggregate(prefix, withCompanionFunctions, overwrite);
+  registerCollectListAggregate(prefix, withCompanionFunctions, overwrite);
+  registerRegrReplacementAggregate(prefix, withCompanionFunctions, overwrite);
 }
-} // namespace facebook::velox::functions::sparksql::aggregates
+} // namespace facebook::velox::functions::aggregate::sparksql

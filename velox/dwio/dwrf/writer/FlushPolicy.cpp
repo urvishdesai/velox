@@ -41,8 +41,7 @@ FlushDecision DefaultFlushPolicy::shouldFlushDictionary(
   return shouldFlushDictionary(
       stripeProgressDecision,
       overMemoryBudget,
-      context.getMemoryUsage(MemoryUsageCategory::DICTIONARY)
-          .getCurrentBytes());
+      context.getMemoryUsage(MemoryUsageCategory::DICTIONARY));
 }
 
 RowsPerStripeFlushPolicy::RowsPerStripeFlushPolicy(
@@ -62,8 +61,8 @@ RowsPerStripeFlushPolicy::RowsPerStripeFlushPolicy(
 // We can throw if writer reported the incoming write to be over memory budget.
 bool RowsPerStripeFlushPolicy::shouldFlush(
     const dwio::common::StripeProgress& stripeProgress) {
-  const auto& stripeIndex = stripeProgress.stripeIndex;
-  const auto& stripeRowCount = stripeProgress.stripeRowCount;
+  const auto stripeIndex = stripeProgress.stripeIndex;
+  const auto stripeRowCount = stripeProgress.stripeRowCount;
   DWIO_ENSURE_LT(
       stripeIndex,
       rowsPerStripe_.size(),

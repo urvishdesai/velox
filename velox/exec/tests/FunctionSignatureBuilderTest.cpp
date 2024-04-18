@@ -86,7 +86,7 @@ TEST_F(FunctionSignatureBuilderTest, basicTypeTests) {
           .argumentType("T")
           .argumentType("array(M)")
           .build(),
-      "Specified element is not found : M");
+      "Type doesn't exist: 'M'");
 
   // Only supported types.
   VELOX_ASSERT_THROW(
@@ -95,7 +95,7 @@ TEST_F(FunctionSignatureBuilderTest, basicTypeTests) {
           .returnType("nosuchtype")
           .argumentType("array(T)")
           .build(),
-      "Specified element is not found : NOSUCHTYPE");
+      "Type doesn't exist: 'NOSUCHTYPE'");
 
   // Any Type.
   EXPECT_TRUE(
@@ -115,16 +115,16 @@ TEST_F(FunctionSignatureBuilderTest, typeParamTests) {
           .returnType("integer")
           .argumentType("Any(T)")
           .build(),
-      "Type 'Any' cannot have parameters");
+      "Failed to parse type signature [Any(T)]: syntax error, unexpected LPAREN, expecting YYEOF");
 
   // Variable Arity in argument fails.
   VELOX_ASSERT_THROW(
       FunctionSignatureBuilder()
           .typeVariable("T")
           .returnType("integer")
-          .argumentType("row(T ..., varchar)")
+          .argumentType("row(..., varchar)")
           .build(),
-      "Specified element is not found : T ...");
+      "Failed to parse type signature [row(..., varchar)]: syntax error, unexpected COMMA");
 
   // Type params cant have type params.
   VELOX_ASSERT_THROW(
@@ -134,7 +134,7 @@ TEST_F(FunctionSignatureBuilderTest, typeParamTests) {
           .returnType("integer")
           .argumentType("T(M)")
           .build(),
-      "Named type cannot have parameters : T(M)");
+      "Failed to parse type signature [T(M)]: syntax error, unexpected LPAREN, expecting YYEOF");
 }
 
 TEST_F(FunctionSignatureBuilderTest, anyInReturn) {
@@ -202,7 +202,8 @@ TEST_F(FunctionSignatureBuilderTest, aggregateConstantFlags) {
     EXPECT_FALSE(aggSignature->constantArguments().at(0));
     EXPECT_TRUE(aggSignature->constantArguments().at(1));
     EXPECT_FALSE(aggSignature->constantArguments().at(2));
-    EXPECT_EQ("(T,constant bigint,T) -> T", aggSignature->toString());
+    EXPECT_EQ(
+        "(T,constant bigint,T) -> array(T) -> T", aggSignature->toString());
   }
 
   {
@@ -220,7 +221,132 @@ TEST_F(FunctionSignatureBuilderTest, aggregateConstantFlags) {
     EXPECT_TRUE(aggSignature->constantArguments().at(1));
     EXPECT_FALSE(aggSignature->constantArguments().at(2));
     EXPECT_EQ(
-        "(bigint,constant T,T,constant double...) -> T",
+        "(bigint,constant T,T,constant double...) -> array(T) -> T",
         aggSignature->toString());
   }
+}
+
+TEST_F(FunctionSignatureBuilderTest, toString) {
+  auto signature = FunctionSignatureBuilder()
+                       .returnType("bigint")
+                       .argumentType("integer")
+                       .build();
+
+  ASSERT_EQ("(integer) -> bigint", toString({signature}));
+
+  signature = FunctionSignatureBuilder()
+                  .returnType("bigint")
+                  .argumentType("varchar")
+                  .argumentType("integer")
+                  .build();
+
+  ASSERT_EQ("(varchar,integer) -> bigint", toString({signature}));
+
+  signature = AggregateFunctionSignatureBuilder()
+                  .returnType("bigint")
+                  .argumentType("varchar")
+                  .intermediateType("varbinary")
+                  .build();
+
+  ASSERT_EQ("(varchar) -> varbinary -> bigint", toString({signature}));
+
+  ASSERT_EQ("foo(BIGINT, VARCHAR)", toString("foo", {BIGINT(), VARCHAR()}));
+}
+
+TEST_F(FunctionSignatureBuilderTest, orderableComparable) {
+  {
+    auto signature = FunctionSignatureBuilder()
+                         .typeVariable("T")
+                         .returnType("array(T)")
+                         .argumentType("array(T)")
+                         .build();
+    ASSERT_FALSE(signature->variables().at("T").orderableTypesOnly());
+    ASSERT_FALSE(signature->variables().at("T").comparableTypesOnly());
+  }
+
+  {
+    auto signature = FunctionSignatureBuilder()
+                         .orderableTypeVariable("T")
+                         .returnType("array(T)")
+                         .argumentType("array(T)")
+                         .build();
+    ASSERT_TRUE(signature->variables().at("T").orderableTypesOnly());
+    ASSERT_TRUE(signature->variables().at("T").comparableTypesOnly());
+  }
+
+  {
+    auto signature = FunctionSignatureBuilder()
+                         .comparableTypeVariable("T")
+                         .returnType("array(T)")
+                         .argumentType("array(T)")
+                         .build();
+    ASSERT_FALSE(signature->variables().at("T").orderableTypesOnly());
+    ASSERT_TRUE(signature->variables().at("T").comparableTypesOnly());
+  }
+
+  VELOX_ASSERT_THROW(
+      FunctionSignatureBuilder()
+          .typeVariable("T")
+          .orderableTypeVariable("T")
+          .returnType("array(T)")
+          .argumentType("array(T)")
+          .build(),
+      "Variable T declared twice");
+}
+
+TEST_F(FunctionSignatureBuilderTest, orderableComparableAggregate) {
+  {
+    auto signature = exec::AggregateFunctionSignatureBuilder()
+                         .typeVariable("T")
+                         .returnType("T")
+                         .intermediateType("T")
+                         .argumentType("T")
+                         .build();
+    ASSERT_FALSE(signature->variables().at("T").orderableTypesOnly());
+    ASSERT_FALSE(signature->variables().at("T").comparableTypesOnly());
+  }
+
+  {
+    auto signature = exec::AggregateFunctionSignatureBuilder()
+                         .orderableTypeVariable("T")
+                         .returnType("T")
+                         .intermediateType("T")
+                         .argumentType("T")
+                         .build();
+    ASSERT_TRUE(signature->variables().at("T").orderableTypesOnly());
+    ASSERT_TRUE(signature->variables().at("T").comparableTypesOnly());
+  }
+
+  {
+    auto signature = exec::AggregateFunctionSignatureBuilder()
+                         .comparableTypeVariable("T")
+                         .returnType("T")
+                         .intermediateType("T")
+                         .argumentType("T")
+                         .build();
+    ASSERT_FALSE(signature->variables().at("T").orderableTypesOnly());
+    ASSERT_TRUE(signature->variables().at("T").comparableTypesOnly());
+  }
+
+  VELOX_ASSERT_THROW(
+      exec::AggregateFunctionSignatureBuilder()
+          .typeVariable("T")
+          .comparableTypeVariable("T")
+          .returnType("T")
+          .intermediateType("T")
+          .argumentType("T")
+          .build(),
+      "Variable T declared twice");
+}
+
+TEST_F(FunctionSignatureBuilderTest, allowVariablesForIntermediateType) {
+  ASSERT_NO_THROW(
+      exec::AggregateFunctionSignatureBuilder()
+          .integerVariable("a_precision")
+          .integerVariable("a_scale")
+          .integerVariable("i_precision", "min(38, a_precision + 10)")
+          .argumentType("DECIMAL(a_precision, a_scale)")
+          .intermediateType("ROW(DECIMAL(i_precision, a_scale), BIGINT)")
+          .returnType("DECIMAL(a_precision, a_scale)")
+          .build());
 }

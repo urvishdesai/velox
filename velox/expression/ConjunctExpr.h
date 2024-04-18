@@ -56,10 +56,6 @@ class ConjunctExpr : public SpecialForm {
       EvalCtx& context,
       VectorPtr& result) override;
 
-  bool propagatesNulls() const override {
-    return false;
-  }
-
   bool isConditional() const override {
     return true;
   }
@@ -74,12 +70,21 @@ class ConjunctExpr : public SpecialForm {
  private:
   static TypePtr resolveType(const std::vector<TypePtr>& argTypes);
 
+  void computePropagatesNulls() override {
+    propagatesNulls_ = false;
+  }
+
   void maybeReorderInputs();
+
   void updateResult(
       BaseVector* inputResult,
       EvalCtx& context,
       FlatVector<bool>* result,
       SelectivityVector* activeRows);
+
+  bool evaluatesArgumentsOnNonIncreasingSelection() const override {
+    return isAnd_;
+  }
 
   // true if conjunction (and), false if disjunction (or).
   const bool isAnd_;
@@ -107,7 +112,8 @@ class ConjunctCallToSpecialForm : public FunctionCallToSpecialForm {
   ExprPtr constructSpecialForm(
       const TypePtr& type,
       std::vector<ExprPtr>&& compiledChildren,
-      bool trackCpuUsage) override;
+      bool trackCpuUsage,
+      const core::QueryConfig& config) override;
 
  private:
   bool isAnd_;

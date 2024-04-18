@@ -13,9 +13,11 @@
 # limitations under the License.
 add_subdirectory(base)
 add_subdirectory(caching)
+add_subdirectory(compression)
 add_subdirectory(encode)
 add_subdirectory(file)
 add_subdirectory(hyperloglog)
+add_subdirectory(io)
 add_subdirectory(memory)
 add_subdirectory(process)
 add_subdirectory(serialization)

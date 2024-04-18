@@ -7,7 +7,8 @@ Background
 
 Spilling in Velox allows a query to succeed using a limited amount of memory
 when some operators are accumulating large state. For example, a hash
-aggregation operator stores the intermediate aggregation state in a hash table,
+aggregation operator stores the intermediate aggregation state in a
+`hash table <hash-table.html>`_,
 and it starts to produce the results after processing all the input.  In high
 cardinality workloads (large number of groups) the size of the hash table
 exceeds the query’s memory limit.
@@ -167,7 +168,7 @@ partition to create a sorted reader to restore the spilled partition state.
     std::unique_ptr<TreeOfLosers<SpillMergeStream>> Spiller::startMerge(
         int32_t partition);
 
-**unsorted spill restore**: Used by order by hash build and hash probe
+**unsorted spill restore**: Used by hash build and hash probe
 operators. The operator first calls Spiller::finishSpill() to mark the
 completion of spilling. The Spiller collects metadata for the spilled
 partitioned and returns these to the operator. The operator processes the
@@ -209,22 +210,6 @@ spillable operators. The latter in turn frees up memory by spilling out (part)
 of its memory state to disk. The integration of spilling with the memory
 management system is under development.
 
-Velox can be configured to trigger spilling if the spillable operator's memory
-usage exceeds a configurable limit:
-
-.. code-block:: c++
-
-  uint64_t QueryConfig::aggregationSpillMemoryThreshold() const;
-
-  uint64_t QueryConfig::orderBySpillMemoryThreshold() const;
-
-  uint64_t QueryConfig::joinSpillMemoryThreshold() const;
-
-This allows us to run queries using limited amount of memory without the memory
-arbitration support. Note that the spilling itself can’t totally prevent out of
-memory as the last memory allocation that exceeds the memory limit, can be made
-from any operator in a query plan not always from the spillable one.
-
 Spill Parameters
 ----------------
 Spill File Size
@@ -238,13 +223,13 @@ spilled partition, we can parallelize the build work among multiple hash build
 operators by assigning each of them a shard of spill files. There are two
 configuration properties to control.
 
-:doc:`max-spill-file-size <../configs>` sets the maximum spill file size limit. For unsorted spill,
+:doc:`max_spill_file_size <../configs>` sets the maximum spill file size limit. For unsorted spill,
 as we continuously append to the same spill file so this helps to prevent a
 spill file from growing too big. For sorted spill, each file stores only one
 sorted run of data, hence, the spill file size is the minimum of spillable data
 size and this configuration limit.
 
-:doc:`min-spill-run-size <../configs>` sets the minimum data size used by sorted spill to select
+:doc:`min_spill_run_size <../configs>` sets the minimum data size used by sorted spill to select
 partitions for spilling. Each sorted spill file can only store one sorted run
 of data. Spiller tries to spill from the same set of partitions if possible.
 By having this configuration limit, we can avoid spilling from partitions which
@@ -259,7 +244,7 @@ Spill Target Size
 The spill target size determines how much data to spill each time. If too
 small, spilling interrupts operator execution frequently and generates lots of
 small files. If too large, operator execution slows down by spilling lots of
-data to disk. Configuration property :doc:`spillable-reservation-growth-pct <../configs>` sets the
+data to disk. Configuration property :doc:`spillable_reservation_growth_pct <../configs>` sets the
 spill target size as a factor of the query memory limit. We might need to tune
 this parameter a bit in practice to see its impact on performance.
 
@@ -276,11 +261,6 @@ left on the storage system so we need some sort of garbage collection support.
 For storage systems that support time to live (TTL), we can leverage that
 feature to implement the spill file garbage collection. If not, we might need
 to build a lightweight garbage collection (GC) service running out of band.
-
-Configuration property :doc:`spiller-spill-path <../configs>` sets the base path for spilling. It
-can be a directory path on the underlying storage system to store all the
-generated spill files. The spill file name is built by concatenating query task
-id, driver id, and the operator id together which is unique within a query.
 
 .. code-block:: c++
 
@@ -373,14 +353,7 @@ other to ensure all operators spill the same set of partitions. If operators
 spill independently, it is possible to end up with all partitions being
 spilled. To build a hash table, we need all rows from one or more partitions.
 Unlike hash aggregation and order by, the hash join spilling is explicitly
-controlled by the hash build operators. A SpillOperatorGroup object coordinates
-the spilling on all the operators. The SpillOperatorGroup object is shared by
-all the hash build operators. It implements a recurring barrier function. When
-spilling gets triggered, the object starts a barrier to stop all the hash build
-operators executions. The last operator reaching the barrier acts as the
-coordinator. It collects spillable stats from the Spillers of all the
-operators, chooses a set of partitions to spill, and runs spilling on all the
-Spillers with the selected partitions.
+controlled by the hash build operators.
 
 .. image:: images/spill-hash-join-probe.png
    :width: 400
@@ -452,7 +425,7 @@ level, *M* = 1*GB*, *N* = 3:
      - 2 PB
 
 For production deployments, we recommend setting a limit for the max spilling
-level using :doc:`max-spill-level <../configs>` configuration property.
+level using :doc:`max_spill_level <../configs>` configuration property.
 
 The following gives a brief description of the hash build and probe workflows
 extended to support (recursive) spilling:
@@ -522,7 +495,7 @@ Some hash probe optimizations are disabled if the spilling has been triggered
 by the hash build. For example, dynamic filtering is disabled because the
 complete set of join keys is not known.
 
-Spilling not supported for `null-aware anti-join type with filter because it
+Spilling not supported for null-aware anti-join type with filter because it
 requires to cross join null-key probe rows with all build-side rows for filter
 evaluation to check if the null-key probe rows can be added to output or not.
 

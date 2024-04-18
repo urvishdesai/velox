@@ -37,33 +37,33 @@ class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
   static constexpr int32_t kBufferSize = 1024;
 
   SelectiveRepeatedColumnReader(
-      std::shared_ptr<const dwio::common::TypeWithId> nodeType,
+      const TypePtr& requestedType,
       FormatParams& params,
       velox::common::ScanSpec& scanSpec,
-      const TypePtr& type)
-      : SelectiveColumnReader(std::move(nodeType), params, scanSpec, type) {}
+      std::shared_ptr<const dwio::common::TypeWithId> type)
+      : SelectiveColumnReader(
+            requestedType,
+            std::move(type),
+            params,
+            scanSpec) {}
 
   /// Reads 'numLengths' next lengths into 'result'. If 'nulls' is
   /// non-null, each kNull bit signifies a null with a length of 0 to
   /// be inserted at the corresponding position in the result. 'nulls'
   /// is expected to be null flags for 'numRows' next rows at the
   /// level of this reader.
-  virtual void readLengths(
-      int32_t* FOLLY_NONNULL lengths,
-      int32_t numLengths,
-      const uint64_t* FOLLY_NULLABLE nulls) = 0;
+  virtual void
+  readLengths(int32_t* lengths, int32_t numLengths, const uint64_t* nulls) = 0;
 
   // Create row set for child columns based on the row set of parent column.
   void makeNestedRowSet(RowSet rows, int32_t maxRow);
 
   // Compute the offsets and lengths based on the current filtered rows passed
   // in.
-  void makeOffsetsAndSizes(RowSet rows);
+  void makeOffsetsAndSizes(RowSet rows, ArrayVectorBase&);
 
   // Creates a struct if '*result' is empty and 'type' is a row.
-  void prepareStructResult(
-      const TypePtr& type,
-      VectorPtr* FOLLY_NULLABLE result) {
+  void prepareStructResult(const TypePtr& type, VectorPtr* result) {
     if (!*result && type->kind() == TypeKind::ROW) {
       *result = BaseVector::create(type, 0, &memoryPool_);
     }
@@ -73,16 +73,17 @@ class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
   // in subclasses.
   RowSet applyFilter(RowSet rows);
 
-  std::vector<int32_t> allLengths_;
+  void setResultNulls(BaseVector& result);
+
+  BufferPtr allLengthsHolder_;
+  vector_size_t* allLengths_;
   RowSet nestedRows_;
   raw_vector<vector_size_t> nestedRowsHolder_;
-  BufferPtr offsets_;
-  BufferPtr sizes_;
-  // The position in the child readers that corresponds to the
-  // position in the length stream. The child readers can be behind if
-  // the last parents were null, so that the child stream was only
-  // read up to the last position corresponding to
-  // the last non-null parent.
+
+  // The position in the child readers that corresponds to the position in the
+  // length stream. The child readers can be behind if the last parents were
+  // null, so that the child stream was only read up to the last position
+  // corresponding to the last non-null parent.
   vector_size_t childTargetReadOffset_ = 0;
   std::vector<SelectiveColumnReader*> children_;
 };
@@ -91,7 +92,7 @@ class SelectiveListColumnReader : public SelectiveRepeatedColumnReader {
  public:
   SelectiveListColumnReader(
       const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
-      const std::shared_ptr<const dwio::common::TypeWithId>& dataType,
+      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       FormatParams& params,
       velox::common::ScanSpec& scanSpec);
 
@@ -101,12 +102,10 @@ class SelectiveListColumnReader : public SelectiveRepeatedColumnReader {
 
   uint64_t skip(uint64_t numValues) override;
 
-  void read(
-      vector_size_t offset,
-      RowSet rows,
-      const uint64_t* FOLLY_NULLABLE incomingNulls) override;
+  void read(vector_size_t offset, RowSet rows, const uint64_t* incomingNulls)
+      override;
 
-  void getValues(RowSet rows, VectorPtr* FOLLY_NULLABLE result) override;
+  void getValues(RowSet rows, VectorPtr* result) override;
 
  protected:
   std::unique_ptr<SelectiveColumnReader> child_;
@@ -117,7 +116,7 @@ class SelectiveMapColumnReader : public SelectiveRepeatedColumnReader {
  public:
   SelectiveMapColumnReader(
       const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
-      const std::shared_ptr<const dwio::common::TypeWithId>& dataType,
+      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       FormatParams& params,
       velox::common::ScanSpec& scanSpec);
 
@@ -128,12 +127,10 @@ class SelectiveMapColumnReader : public SelectiveRepeatedColumnReader {
 
   uint64_t skip(uint64_t numValues) override;
 
-  void read(
-      vector_size_t offset,
-      RowSet rows,
-      const uint64_t* FOLLY_NULLABLE incomingNulls) override;
+  void read(vector_size_t offset, RowSet rows, const uint64_t* incomingNulls)
+      override;
 
-  void getValues(RowSet rows, VectorPtr* FOLLY_NULLABLE result) override;
+  void getValues(RowSet rows, VectorPtr* result) override;
 
   std::unique_ptr<SelectiveColumnReader> keyReader_;
   std::unique_ptr<SelectiveColumnReader> elementReader_;

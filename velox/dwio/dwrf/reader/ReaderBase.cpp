@@ -18,13 +18,14 @@
 
 #include <fmt/format.h>
 
+#include "velox/common/process/TraceContext.h"
+#include "velox/dwio/common/Mutation.h"
 #include "velox/dwio/common/exception/Exception.h"
 
 namespace facebook::velox::dwrf {
 
 using dwio::common::ColumnStatistics;
 using dwio::common::FileFormat;
-using dwio::common::InputStream;
 using dwio::common::LogType;
 using dwio::common::Statistics;
 using dwio::common::encryption::DecrypterFactory;
@@ -82,7 +83,7 @@ ReaderBase::ReaderBase(
           pool,
           std::move(input),
           nullptr,
-          dwio::common::ReaderOptions::kDefaultDirectorySizeGuess,
+          dwio::common::ReaderOptions::kDefaultFooterEstimatedSize,
           dwio::common::ReaderOptions::kDefaultFilePreloadThreshold,
           fileFormat) {}
 
@@ -90,15 +91,19 @@ ReaderBase::ReaderBase(
     MemoryPool& pool,
     std::unique_ptr<dwio::common::BufferedInput> input,
     std::shared_ptr<DecrypterFactory> decryptorFactory,
-    uint64_t directorySizeGuess,
+    uint64_t footerEstimatedSize,
     uint64_t filePreloadThreshold,
-    FileFormat fileFormat)
+    FileFormat fileFormat,
+    bool fileColumnNamesReadAsLowerCase,
+    std::shared_ptr<random::RandomSkipTracker> randomSkip)
     : pool_{pool},
       arena_(std::make_unique<google::protobuf::Arena>()),
       decryptorFactory_(decryptorFactory),
-      directorySizeGuess_(directorySizeGuess),
+      footerEstimatedSize_(footerEstimatedSize),
       filePreloadThreshold_(filePreloadThreshold),
-      input_(std::move(input)) {
+      input_(std::move(input)),
+      randomSkip_(std::move(randomSkip)) {
+  process::TraceContext trace("ReaderBase::ReaderBase");
   // read last bytes into buffer to get PostScript
   // If file is small, load the entire file.
   // TODO: make a config
@@ -107,10 +112,10 @@ ReaderBase::ReaderBase(
 
   auto preloadFile = fileLength_ <= filePreloadThreshold_;
   uint64_t readSize =
-      preloadFile ? fileLength_ : std::min(fileLength_, directorySizeGuess_);
+      preloadFile ? fileLength_ : std::min(fileLength_, footerEstimatedSize_);
   DWIO_ENSURE_GE(readSize, 4, "File size too small");
 
-  input_->enqueue({fileLength_ - readSize, readSize});
+  input_->enqueue({fileLength_ - readSize, readSize, "footer"});
   input_->load(preloadFile ? LogType::FILE : LogType::FOOTER);
 
   // TODO: read footer from spectrum
@@ -159,7 +164,7 @@ ReaderBase::ReaderBase(
       postScript_->compression());
 
   if (tailSize > readSize) {
-    input_->enqueue({fileLength_ - tailSize, tailSize});
+    input_->enqueue({fileLength_ - tailSize, tailSize, "footer"});
     input_->load(LogType::FOOTER);
   }
 
@@ -181,7 +186,8 @@ ReaderBase::ReaderBase(
     footer_ = std::make_unique<FooterWrapper>(footer);
   }
 
-  schema_ = std::dynamic_pointer_cast<const RowType>(convertType(*footer_));
+  schema_ = std::dynamic_pointer_cast<const RowType>(
+      convertType(*footer_, 0, fileColumnNamesReadAsLowerCase));
   DWIO_ENSURE_NOT_NULL(schema_, "invalid schema");
 
   // load stripe index/footer cache
@@ -208,7 +214,8 @@ ReaderBase::ReaderBase(
       const auto stripe = getFooter().stripes(i);
       input_->enqueue(
           {stripe.offset() + stripe.indexLength() + stripe.dataLength(),
-           stripe.footerLength()});
+           stripe.footerLength(),
+           "stripe_footer"});
     }
     if (numStripes) {
       input_->load(LogType::FOOTER);
@@ -273,7 +280,8 @@ std::unique_ptr<ColumnStatistics> ReaderBase::getColumnStatistics(
 
 std::shared_ptr<const Type> ReaderBase::convertType(
     const FooterWrapper& footer,
-    uint32_t index) {
+    uint32_t index,
+    bool fileColumnNamesReadAsLowerCase) {
   DWIO_ENSURE_LT(
       index,
       folly::to<uint32_t>(footer.typesSize()),
@@ -285,27 +293,40 @@ std::shared_ptr<const Type> ReaderBase::convertType(
     case TypeKind::SMALLINT:
     case TypeKind::INTEGER:
     case TypeKind::BIGINT:
+    case TypeKind::HUGEINT:
+      if (type.format() == DwrfFormat::kOrc &&
+          type.getOrcPtr()->kind() == proto::orc::Type_Kind_DECIMAL) {
+        return DECIMAL(
+            type.getOrcPtr()->precision(), type.getOrcPtr()->scale());
+      }
+      [[fallthrough]];
     case TypeKind::REAL:
     case TypeKind::DOUBLE:
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
     case TypeKind::TIMESTAMP:
-    case TypeKind::DATE:
       return createScalarType(type.kind());
     case TypeKind::ARRAY:
-      return ARRAY(convertType(footer, type.subtypes(0)));
+      return ARRAY(convertType(
+          footer, type.subtypes(0), fileColumnNamesReadAsLowerCase));
     case TypeKind::MAP:
       return MAP(
-          convertType(footer, type.subtypes(0)),
-          convertType(footer, type.subtypes(1)));
+          convertType(footer, type.subtypes(0), fileColumnNamesReadAsLowerCase),
+          convertType(
+              footer, type.subtypes(1), fileColumnNamesReadAsLowerCase));
     case TypeKind::ROW: {
       std::vector<std::shared_ptr<const Type>> tl;
       tl.reserve(type.subtypesSize());
       std::vector<std::string> names;
       names.reserve(type.subtypesSize());
       for (int32_t i = 0; i < type.subtypesSize(); ++i) {
-        auto child = convertType(footer, type.subtypes(i));
-        names.push_back(type.fieldNames(i));
+        auto child = convertType(
+            footer, type.subtypes(i), fileColumnNamesReadAsLowerCase);
+        auto childName = type.fieldNames(i);
+        if (fileColumnNamesReadAsLowerCase) {
+          folly::toLowerAscii(childName);
+        }
+        names.push_back(std::move(childName));
         tl.push_back(std::move(child));
       }
 

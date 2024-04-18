@@ -128,6 +128,49 @@ TEST_F(SimpleVectorNonParameterizedTest, BasicRoundTrip) {
   assertVectorAndProperties<int64_t>(expected.data(), vector);
 }
 
+TEST_F(SimpleVectorNonParameterizedTest, ThreadSafeAsciiCompute) {
+  const size_t numRows{100};
+  const size_t numThreads{10};
+
+  std::vector<std::thread> tasks;
+  SelectivityVector rows(numRows);
+  VectorPtr vectorBase;
+  BaseVector::ensureWritable(rows, VARCHAR(), pool_.get(), vectorBase);
+  auto vector = vectorBase->as<FlatVector<StringView>>();
+  for (int i = 0; i < numRows; i++) {
+    vector->set(i, "dsfdsfsdfdsfds"_sv);
+  }
+
+  for (int i = 0; i < numThreads; i++) {
+    tasks.emplace_back([&]() {
+      for (int j = 0; j < numRows; j++) {
+        vector->invalidateIsAscii();
+        for (auto row = 0; row < vector->size(); ++row) {
+          ASSERT_FALSE(vector->isAscii(row));
+        }
+      }
+    });
+  }
+  for (auto& thread : tasks) {
+    thread.join();
+  }
+  tasks.clear();
+
+  for (int i = 0; i < numThreads; i++) {
+    tasks.emplace_back([&]() {
+      for (int j = 0; j < numRows; j++) {
+        vector->computeAndSetIsAscii(rows);
+        for (auto k = 0; k < vector->size(); k++) {
+          ASSERT_TRUE(vector->isAscii(k));
+        }
+      }
+    });
+  }
+  for (auto& thread : tasks) {
+    thread.join();
+  }
+}
+
 // Only signed types are supported.
 using SimpleTypes = ::testing::
     Types<int8_t, int16_t, int32_t, int64_t, double, StringView, bool>;
@@ -360,6 +403,112 @@ TEST_F(SimpleVectorNonParameterizedTest, setAscii) {
 
     assertIsAscii(vector, all, false);
   }
+}
+
+TEST_F(SimpleVectorNonParameterizedTest, stringsAsciiResize) {
+  std::vector<std::string> largeStrings = {
+      std::string(20, '.'),
+      std::string(30, '-'),
+      std::string(40, '='),
+  };
+  const size_t numRows{1'000};
+  SelectivityVector allRows(numRows, true);
+  auto stringAt = [&](auto row) {
+    return row % 3 == 0 ? StringView(largeStrings[(row / 3) % 3]) : ""_sv;
+  };
+
+  const AsciiInfo* asciiInfo{nullptr};
+  const AsciiInfo* constAsciiInfo{nullptr};
+
+  // Create a flat and const string vectors. Ensure ascii info is computed.
+  VectorPtr vector = maker_.flatVector<StringView>(numRows, stringAt, nullptr);
+  vector->as<SimpleVector<StringView>>()->computeAndSetIsAscii(allRows);
+  vector->validate();
+
+  VectorPtr constVector = BaseVector::createConstant(
+      VARCHAR(), largeStrings[0], numRows, pool_.get());
+  constVector->as<SimpleVector<StringView>>()->computeAndSetIsAscii(allRows);
+  constVector->validate();
+
+  asciiInfo = &vector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_TRUE(asciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(vector->size(), asciiInfo->readLockedAsciiComputedRows()->size());
+  EXPECT_TRUE(asciiInfo->isAllAscii());
+
+  constAsciiInfo =
+      &constVector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_TRUE(constAsciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(
+      vector->size(), constAsciiInfo->readLockedAsciiComputedRows()->size());
+  EXPECT_TRUE(constAsciiInfo->isAllAscii());
+
+  // Now resize the vectors and see that ascii info is correct.
+  vector->resize(numRows * 2);
+  vector->validate();
+  constVector->resize(numRows * 2);
+  constVector->validate();
+
+  asciiInfo = &vector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_TRUE(asciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(vector->size(), asciiInfo->readLockedAsciiComputedRows()->size());
+  // In a flat vector the new rows will have false asciiness.
+  EXPECT_FALSE(asciiInfo->isAllAscii());
+
+  constAsciiInfo =
+      &constVector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_TRUE(constAsciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(
+      constVector->size(),
+      constAsciiInfo->readLockedAsciiComputedRows()->size());
+  // In a constant vector the new rows will have the same asciiness.
+  EXPECT_TRUE(constAsciiInfo->isAllAscii());
+
+  // Now tests the prepareForReuse with the same size.
+  allRows.resize(numRows * 2, true);
+  vector->as<SimpleVector<StringView>>()->computeAndSetIsAscii(allRows);
+  constVector->as<SimpleVector<StringView>>()->computeAndSetIsAscii(allRows);
+
+  BaseVector::prepareForReuse(vector, vector->size());
+  vector->validate();
+  // Note that constant vector turns to non-const here, because const cannot be
+  // reused for some reason.
+  BaseVector::prepareForReuse(constVector, constVector->size());
+  vector->validate();
+
+  asciiInfo = &vector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_FALSE(asciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(numRows * 2, asciiInfo->readLockedAsciiComputedRows()->size());
+  EXPECT_FALSE(asciiInfo->isAllAscii());
+
+  constAsciiInfo =
+      &constVector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_FALSE(constAsciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(0, constAsciiInfo->readLockedAsciiComputedRows()->size());
+  EXPECT_FALSE(constAsciiInfo->isAllAscii());
+
+  // Now tests the prepareForReuse with the new size
+  constVector = BaseVector::createConstant(
+      VARCHAR(), largeStrings[0], numRows * 2, pool_.get());
+  vector->as<SimpleVector<StringView>>()->computeAndSetIsAscii(allRows);
+  constVector->as<SimpleVector<StringView>>()->computeAndSetIsAscii(allRows);
+
+  BaseVector::prepareForReuse(vector, numRows * 4);
+  vector->validate();
+  // Note that constant vector turns to non-const here, because const cannot be
+  // reused for some reason.
+  BaseVector::prepareForReuse(constVector, numRows * 4);
+  vector->validate();
+
+  asciiInfo = &vector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_FALSE(asciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(numRows * 2, asciiInfo->readLockedAsciiComputedRows()->size());
+  EXPECT_FALSE(asciiInfo->isAllAscii());
+
+  constAsciiInfo =
+      &constVector->as<SimpleVector<StringView>>()->testGetAsciiInfo();
+  EXPECT_FALSE(constAsciiInfo->readLockedAsciiComputedRows()->hasSelections());
+  EXPECT_EQ(0, constAsciiInfo->readLockedAsciiComputedRows()->size());
+  EXPECT_FALSE(constAsciiInfo->isAllAscii());
 }
 
 VELOX_TYPED_TEST_SUITE(SimpleVectorTypedTest, SimpleTypes);

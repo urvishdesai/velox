@@ -35,14 +35,16 @@ class BinaryStripeStreams {
   std::vector<DwrfStreamIdentifier> getStreamIdentifiers(uint32_t nodeId) const;
 
   std::unique_ptr<proto::RowIndex> getRowGroupIndex(
-      const EncodingKey ek) const {
+      const EncodingKey ek,
+      std::string_view label) const {
     return ProtoUtils::readProto<proto::RowIndex>(stripeStreams_.getStream(
-        ek.forKind(proto::Stream_Kind_ROW_INDEX), false));
+        ek.forKind(proto::Stream_Kind_ROW_INDEX), label, false));
   }
 
   std::unique_ptr<dwio::common::SeekableInputStream> getStream(
-      const DwrfStreamIdentifier& si) const {
-    return stripeStreams_.getCompressedStream(si);
+      const DwrfStreamIdentifier& si,
+      std::string_view label) const {
+    return stripeStreams_.getCompressedStream(si, label);
   }
 
   uint64_t getStreamLength(const DwrfStreamIdentifier& si) const {
@@ -50,12 +52,12 @@ class BinaryStripeStreams {
   }
 
   const StripeInformationWrapper& getStripeInfo() const {
-    return stripeInfo_;
+    return stripeReadState_->stripeMetadata->stripeInfo;
   }
 
  private:
   bool preload_;
-  StripeInformationWrapper stripeInfo_;
+  std::shared_ptr<StripeReadState> stripeReadState_;
   dwio::common::RowReaderOptions options_;
   StripeStreamsImpl stripeStreams_;
   folly::F14FastMap<uint32_t, std::vector<uint32_t>> encodingKeys_;

@@ -25,17 +25,13 @@
 
 #pragma once
 
-#include <cstdint>
-#include <memory>
-#include <string>
-
 #include "velox/common/caching/CachedFactory.h"
 #include "velox/common/caching/FileIds.h"
 #include "velox/common/file/File.h"
-#include "velox/core/Context.h"
-#include "velox/dwio/common/InputStream.h"
 
 namespace facebook::velox {
+
+class Config;
 
 // See the file comment.
 struct FileHandle {
@@ -58,11 +54,6 @@ struct FileHandle {
   // first diff we'll not include the map.
 };
 
-// Estimates the memory usage of a FileHandle object.
-struct FileHandleSizer {
-  uint64_t operator()(const FileHandle& a);
-};
-
 using FileHandleCache = SimpleLRUCache<std::string, FileHandle>;
 
 // Creates FileHandles via the Generator interface the CachedFactory requires.
@@ -71,7 +62,7 @@ class FileHandleGenerator {
   FileHandleGenerator() {}
   FileHandleGenerator(std::shared_ptr<const Config> properties)
       : properties_(std::move(properties)) {}
-  std::unique_ptr<FileHandle> operator()(const std::string& filename);
+  std::shared_ptr<FileHandle> operator()(const std::string& filename);
 
  private:
   const std::shared_ptr<const Config> properties_;
@@ -79,11 +70,8 @@ class FileHandleGenerator {
 
 using FileHandleFactory = CachedFactory<
     std::string,
-    FileHandle,
-    FileHandleGenerator,
-    FileHandleSizer>;
-
-using FileHandleCachedPtr = CachedPtr<std::string, FileHandle>;
+    std::shared_ptr<FileHandle>,
+    FileHandleGenerator>;
 
 using FileHandleCacheStats = SimpleLRUCacheStats;
 

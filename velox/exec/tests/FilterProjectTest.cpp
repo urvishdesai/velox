@@ -15,8 +15,10 @@
  */
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/parse/Expressions.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -321,4 +323,43 @@ TEST_F(FilterProjectTest, projectAndIdentityOverLazy) {
                   .project({"c0 < 10 AND c1 < 10", "c1"})
                   .planNode();
   assertQuery(plan, "SELECT c0 < 10 AND c1 < 10, c1 FROM tmp");
+}
+
+// Verify the optimization of avoiding copy in null propagation does not break
+// the case when the field is shared between multiple parents.
+TEST_F(FilterProjectTest, nestedFieldReferenceSharedChild) {
+  auto shared = makeFlatVector<int64_t>(10, folly::identity);
+  auto vector = makeRowVector({
+      makeRowVector({
+          makeRowVector({shared}, nullEvery(2)),
+          makeRowVector({shared}, nullEvery(3)),
+      }),
+  });
+  auto plan =
+      PlanBuilder()
+          .values({vector})
+          .project({"coalesce((c0).c0.c0, 0) + coalesce((c0).c1.c0, 0)"})
+          .planNode();
+  auto expected = makeFlatVector<int64_t>(10);
+  for (int i = 0; i < 10; ++i) {
+    expected->set(i, (i % 2 == 0 ? 0 : i) + (i % 3 == 0 ? 0 : i));
+  }
+  AssertQueryBuilder(plan).assertResults(makeRowVector({expected}));
+}
+
+TEST_F(FilterProjectTest, numSilentThrow) {
+  auto row = makeRowVector(
+      {makeFlatVector<int32_t>(100, [&](auto row) { return row; })});
+
+  core::PlanNodeId filterId;
+  // Change the plan when /0 error is fixed not to throw.
+  auto plan = PlanBuilder()
+                  .values({row})
+                  .filter("try (c0 / 0) = 1")
+                  .capturePlanNodeId(filterId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(plan).assertEmptyResults();
+  auto planStats = toPlanStats(task->taskStats());
+  ASSERT_EQ(100, planStats.at(filterId).customStats.at("numSilentThrow").sum);
 }

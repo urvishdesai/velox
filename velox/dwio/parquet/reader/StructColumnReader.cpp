@@ -15,28 +15,39 @@
  */
 
 #include "velox/dwio/parquet/reader/StructColumnReader.h"
+
+#include "velox/dwio/common/BufferedInput.h"
+#include "velox/dwio/parquet/reader/ParquetColumnReader.h"
 #include "velox/dwio/parquet/reader/RepeatedColumnReader.h"
+
+namespace facebook::velox::common {
+class ScanSpec;
+}
 
 namespace facebook::velox::parquet {
 
 StructColumnReader::StructColumnReader(
-    const std::shared_ptr<const dwio::common::TypeWithId>& dataType,
+    const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+    const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
     ParquetParams& params,
     common::ScanSpec& scanSpec)
-    : SelectiveStructColumnReader(dataType, dataType, params, scanSpec) {
-  auto& childSpecs = scanSpec_->children();
+    : SelectiveStructColumnReader(requestedType, fileType, params, scanSpec) {
+  auto& childSpecs = scanSpec_->stableChildren();
   for (auto i = 0; i < childSpecs.size(); ++i) {
+    auto childSpec = childSpecs[i];
     if (childSpecs[i]->isConstant()) {
       continue;
     }
-    auto childDataType = nodeType_->childByName(childSpecs[i]->fieldName());
-
-    addChild(ParquetColumnReader::build(childDataType, params, *childSpecs[i]));
+    auto childFileType = fileType_->childByName(childSpec->fieldName());
+    auto childRequestedType =
+        requestedType_->childByName(childSpec->fieldName());
+    addChild(ParquetColumnReader::build(
+        childRequestedType, childFileType, params, *childSpec));
     childSpecs[i]->setSubscript(children_.size() - 1);
   }
-  auto type = reinterpret_cast<const ParquetTypeWithId*>(nodeType_.get());
-  if (type->parent) {
-    levelMode_ = reinterpret_cast<const ParquetTypeWithId*>(nodeType_.get())
+  auto type = reinterpret_cast<const ParquetTypeWithId*>(fileType_.get());
+  if (type->parent()) {
+    levelMode_ = reinterpret_cast<const ParquetTypeWithId*>(fileType_.get())
                      ->makeLevelInfo(levelInfo_);
     childForRepDefs_ = findBestLeaf();
     // Set mode to struct over lists if the child for repdefs has a list between
@@ -44,12 +55,12 @@ StructColumnReader::StructColumnReader(
     auto child = childForRepDefs_;
     for (;;) {
       assert(child);
-      if (child->type()->kind() == TypeKind::ARRAY ||
-          child->type()->kind() == TypeKind::MAP) {
+      if (child->fileType().type()->kind() == TypeKind::ARRAY ||
+          child->fileType().type()->kind() == TypeKind::MAP) {
         levelMode_ = LevelMode::kStructOverLists;
         break;
       }
-      if (child->type()->kind() == TypeKind::ROW) {
+      if (child->fileType().type()->kind() == TypeKind::ROW) {
         child = reinterpret_cast<StructColumnReader*>(child)->childForRepDefs();
         continue;
       }
@@ -64,7 +75,7 @@ StructColumnReader::findBestLeaf() {
   SelectiveColumnReader* best = nullptr;
   for (auto i = 0; i < children_.size(); ++i) {
     auto child = children_[i];
-    auto kind = child->type()->kind();
+    auto kind = child->fileType().type()->kind();
     // Complex type child repdefs must be read in any case.
     if (kind == TypeKind::ROW || kind == TypeKind::ARRAY) {
       return child;
@@ -76,7 +87,7 @@ StructColumnReader::findBestLeaf() {
     } else if (!best->scanSpec()->filter() && child->scanSpec()->filter()) {
       best = child;
       continue;
-    } else if (kind < best->type()->kind()) {
+    } else if (kind < best->fileType().type()->kind()) {
       best = child;
     }
   }
@@ -90,6 +101,27 @@ void StructColumnReader::read(
     const uint64_t* /*incomingNulls*/) {
   ensureRepDefs(*this, offset + rows.back() + 1 - readOffset_);
   SelectiveStructColumnReader::read(offset, rows, nullptr);
+}
+
+std::shared_ptr<dwio::common::BufferedInput> StructColumnReader::loadRowGroup(
+    uint32_t index,
+    const std::shared_ptr<dwio::common::BufferedInput>& input) {
+  if (isRowGroupBuffered(index, *input)) {
+    enqueueRowGroup(index, *input);
+    return input;
+  }
+  auto newInput = input->clone();
+  enqueueRowGroup(index, *newInput);
+  newInput->load(dwio::common::LogType::STRIPE);
+  return newInput;
+}
+
+bool StructColumnReader::isRowGroupBuffered(
+    uint32_t index,
+    dwio::common::BufferedInput& input) {
+  auto [offset, length] =
+      formatData().as<ParquetData>().getRowGroupRegion(index);
+  return input.isBuffered(offset, length);
 }
 
 void StructColumnReader::enqueueRowGroup(
@@ -109,17 +141,13 @@ void StructColumnReader::enqueueRowGroup(
 }
 
 void StructColumnReader::seekToRowGroup(uint32_t index) {
-  SelectiveColumnReader::seekToRowGroup(index);
+  SelectiveStructColumnReader::seekToRowGroup(index);
   BufferPtr noBuffer;
   formatData_->as<ParquetData>().setNulls(noBuffer, 0);
   readOffset_ = 0;
   for (auto& child : children_) {
     child->seekToRowGroup(index);
   }
-}
-
-bool StructColumnReader::filterMatches(const thrift::RowGroup& /*rowGroup*/) {
-  return true;
 }
 
 void StructColumnReader::seekToEndOfPresetNulls() {
@@ -130,9 +158,9 @@ void StructColumnReader::seekToEndOfPresetNulls() {
       continue;
     }
 
-    if (child->type()->kind() != TypeKind::ROW) {
+    if (child->fileType().type()->kind() != TypeKind::ROW) {
       child->seekTo(readOffset_ + numUnread, false);
-    } else if (child->type()->kind() == TypeKind::ROW) {
+    } else if (child->fileType().type()->kind() == TypeKind::ROW) {
       reinterpret_cast<StructColumnReader*>(child)->seekToEndOfPresetNulls();
     }
   }

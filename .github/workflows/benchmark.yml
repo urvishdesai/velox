@@ -28,15 +28,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
 defaults:
   run:
     shell: bash
-#TODO  concurrency groups?
+
 jobs:
   benchmark:
     if: github.repository == 'facebookincubator/velox'
     runs-on: 8-core
-    container: ghcr.io/facebookincubator/velox-dev:amd64-ubuntu-22.04-avx
     env:
       CCACHE_DIR: "${{ github.workspace }}/.ccache/"
       CCACHE_BASEDIR: "${{ github.workspace }}"
@@ -46,11 +49,6 @@ jobs:
       BASELINE_OUTPUT_PATH: "${{ github.workspace }}/benchmark-results/baseline/"
       CONTENDER_OUTPUT_PATH: "${{ github.workspace }}/benchmark-results/contender/"
     steps:
-      - name: "Setup ccache and python"
-        run: |
-            # Set up ccache configs .
-            mkdir -p .ccache
-            ccache -sz -M 5Gi
 
       - name: "Restore ccache"
         uses: actions/cache/restore@v3
@@ -60,7 +58,7 @@ jobs:
           key: ccache-benchmark-${{ github.sha }}
           restore-keys: |
             ccache-benchmark-
-      
+
       - name: "Checkout Repo"
         if: ${{ github.event_name == 'pull_request' }}
         uses: actions/checkout@v3
@@ -88,6 +86,10 @@ jobs:
           git submodule update --init --recursive
           echo $(git log -n 1)
 
+      - name: "Install dependencies"
+        if: ${{ github.event_name == 'pull_request' }}
+        run: source velox/scripts/setup-ubuntu.sh && install_apt_deps
+
       - name: Build Baseline Benchmarks
         if: ${{ github.event_name == 'pull_request' }}
         working-directory: velox
@@ -111,6 +113,9 @@ jobs:
           path: 'velox'
           ref: ${{ github.sha }}
           submodules: 'recursive'
+
+      - name: "Install dependencies"
+        run: source velox/scripts/setup-ubuntu.sh && install_apt_deps
 
       - name: Build Contender Benchmarks
         working-directory: velox
@@ -193,7 +198,7 @@ jobs:
           echo "::endgroup::"
 
       - name: "Save PR number"
-        run: echo "${{ github.event.pull_request.number }}" > pr_number.txt
+        run: echo "${{ github.event.pull_request.number || 0 }}" > pr_number.txt
 
       - name: "Upload PR number"
         uses: actions/upload-artifact@v3

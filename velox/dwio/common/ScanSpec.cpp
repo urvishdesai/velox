@@ -19,45 +19,21 @@
 
 namespace facebook::velox::common {
 
-ScanSpec& ScanSpec::operator=(const ScanSpec& other) {
-  if (this != &other) {
-    numReads_ = other.numReads_;
-    subscript_ = other.subscript_;
-    fieldName_ = other.fieldName_;
-    channel_ = other.channel_;
-    constantValue_ = other.constantValue_;
-    projectOut_ = other.projectOut_;
-    extractValues_ = other.extractValues_;
-    makeFlat_ = other.makeFlat_;
-    filter_ = other.filter_;
-    metadataFilters_ = other.metadataFilters_;
-    selectivity_ = other.selectivity_;
-    enableFilterReorder_ = other.enableFilterReorder_;
-    children_ = other.children_;
-    stableChildren_ = other.stableChildren_;
-    valueHook_ = other.valueHook_;
-    isArrayElementOrMapEntry_ = other.isArrayElementOrMapEntry_;
-    maxArrayElementsCount_ = other.maxArrayElementsCount_;
-  }
-  return *this;
-}
-
 ScanSpec* ScanSpec::getOrCreateChild(const Subfield& subfield) {
   auto container = this;
   auto& path = subfield.path();
   for (size_t depth = 0; depth < path.size(); ++depth) {
     auto element = path[depth].get();
-    bool found = false;
-    for (auto& field : container->children_) {
-      if (field->matches(*element)) {
-        container = field.get();
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
+    VELOX_CHECK_EQ(element->kind(), kNestedField);
+    auto* nestedField = static_cast<const Subfield::NestedField*>(element);
+    auto it = container->childByFieldName_.find(nestedField->name());
+    if (it != container->childByFieldName_.end()) {
+      container = it->second;
+    } else {
       container->children_.push_back(std::make_unique<ScanSpec>(*element));
-      container = container->children_.back().get();
+      auto* child = container->children_.back().get();
+      container->childByFieldName_[child->fieldName()] = child;
+      container = child;
     }
   }
   return container;
@@ -156,6 +132,7 @@ bool ScanSpec::hasFilter() const {
 void ScanSpec::moveAdaptationFrom(ScanSpec& other) {
   // moves the filters and filter order from 'other'.
   std::vector<std::shared_ptr<ScanSpec>> newChildren;
+  childByFieldName_.clear();
   for (auto& otherChild : other.children_) {
     bool found = false;
     for (auto& child : children_) {
@@ -168,6 +145,7 @@ void ScanSpec::moveAdaptationFrom(ScanSpec& other) {
           child->filter_ = std::move(otherChild->filter_);
           child->selectivity_ = otherChild->selectivity_;
         }
+        childByFieldName_[child->fieldName_] = child.get();
         newChildren.push_back(std::move(child));
         found = true;
         break;
@@ -311,8 +289,7 @@ bool testFilter(
     dwio::common::ColumnStatistics* stats,
     uint64_t totalRows,
     const TypePtr& type) {
-  bool mayHaveNull =
-      stats->hasNull().has_value() ? stats->hasNull().value() : true;
+  bool mayHaveNull = true;
 
   // Has-null statistics is often not set. Hence, we supplement it with
   // number-of-values statistic to detect no-null columns more often.
@@ -323,11 +300,7 @@ bool testFilter(
       // Column is all null.
       return filter->testNull();
     }
-
-    if (stats->getNumberOfValues().value() == totalRows) {
-      // Column has no nulls.
-      mayHaveNull = false;
-    }
+    mayHaveNull = stats->getNumberOfValues().value() < totalRows;
   }
 
   if (!mayHaveNull && filter->kind() == common::FilterKind::kIsNull) {
@@ -335,6 +308,9 @@ bool testFilter(
     return false;
   }
   if (mayHaveNull && filter->testNull()) {
+    return true;
+  }
+  if (type->isDecimal()) {
     return true;
   }
   switch (type->kind()) {
@@ -385,6 +361,12 @@ std::string ScanSpec::toString() const {
     if (filter_) {
       out << " filter " << filter_->toString();
     }
+    if (isConstant()) {
+      out << " constant";
+    }
+    if (!metadataFilters_.empty()) {
+      out << " metadata_filters(" << metadataFilters_.size() << ")";
+    }
   }
   if (!children_.empty()) {
     out << " (";
@@ -394,17 +376,6 @@ std::string ScanSpec::toString() const {
     out << ")";
   }
   return out.str();
-}
-
-std::shared_ptr<ScanSpec> ScanSpec::removeChild(const ScanSpec* child) {
-  for (auto it = children_.begin(); it != children_.end(); ++it) {
-    if (it->get() == child) {
-      auto removed = std::move(*it);
-      children_.erase(it);
-      return removed;
-    }
-  }
-  return nullptr;
 }
 
 void ScanSpec::addFilter(const Filter& filter) {

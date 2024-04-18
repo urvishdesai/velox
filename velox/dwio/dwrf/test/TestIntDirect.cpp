@@ -30,7 +30,7 @@ using namespace facebook::velox::dwrf;
 
 template <typename T, bool isSigned, bool vInt>
 void testInts(std::function<T()> generator) {
-  auto pool = memory::getDefaultMemoryPool();
+  auto pool = memory::memoryManager()->addLeafPool();
   constexpr size_t count = 10240;
   DataBuffer<T> buffer{*pool, count};
   std::array<uint64_t, count / 64> nulls;
@@ -41,7 +41,7 @@ void testInts(std::function<T()> generator) {
 
   constexpr size_t capacity =
       count * (vInt ? folly::kMaxVarintLength64 : sizeof(T));
-  MemorySink sink{*pool, capacity};
+  MemorySink sink{capacity, {.pool = pool.get()}};
   DataBufferHolder holder{*pool, capacity, 0, DEFAULT_PAGE_GROW_RATIO, &sink};
   auto output = std::make_unique<BufferedOutputStream>(holder);
   auto encoder =
@@ -77,7 +77,7 @@ void testInts(std::function<T()> generator) {
   EXPECT_EQ(sink.size(), latestPos.at(0));
 
   auto input = std::make_unique<SeekableArrayInputStream>(
-      sink.getData(), expectedSize, expectedSize);
+      sink.data(), expectedSize, expectedSize);
   auto decoder =
       createDirectDecoder<isSigned>(std::move(input), vInt, sizeof(T));
 
@@ -88,7 +88,7 @@ void testInts(std::function<T()> generator) {
   }
 
   input = std::make_unique<SeekableArrayInputStream>(
-      sink.getData(), expectedSize, 100);
+      sink.data(), expectedSize, 100);
   decoder = createDirectDecoder<isSigned>(std::move(input), vInt, sizeof(T));
   int32_t numRead = 0;
   int32_t stride = 1;
@@ -96,7 +96,7 @@ void testInts(std::function<T()> generator) {
     if (numRead + stride >= count / 2) {
       break;
     }
-    decoder->skipLongsFast(stride);
+    decoder->skip(stride);
     numRead += stride;
     stride = (stride * 2 + 1) % 31;
     int64_t num;
@@ -107,7 +107,7 @@ void testInts(std::function<T()> generator) {
 
   // Bulk read consecutive.
   input = std::make_unique<SeekableArrayInputStream>(
-      sink.getData(), expectedSize, 100);
+      sink.data(), expectedSize, 100);
   decoder = createDirectDecoder<isSigned>(std::move(input), vInt, sizeof(T));
   std::vector<uint64_t> result(count / 2);
   decoder->bulkRead(count / 2, result.data());
@@ -126,7 +126,7 @@ void testInts(std::function<T()> generator) {
     i += random - 10;
   }
   input = std::make_unique<SeekableArrayInputStream>(
-      sink.getData(), expectedSize, 100);
+      sink.data(), expectedSize, 100);
   decoder = createDirectDecoder<isSigned>(std::move(input), vInt, sizeof(T));
   decoder->bulkReadRows(rows, result.data());
   for (auto i = 0; i < rows.size(); ++i) {
@@ -134,37 +134,44 @@ void testInts(std::function<T()> generator) {
   }
 }
 
-TEST(TestDirect, fixedWidthShort) {
+class DirectTest : public testing::Test {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+};
+
+TEST_F(DirectTest, fixedWidthShort) {
   testInts<int16_t, true, false>([]() -> int16_t {
     return static_cast<int16_t>(folly::Random::rand32());
   });
 }
 
-TEST(TestDirect, fixedWidthInt) {
+TEST_F(DirectTest, fixedWidthInt) {
   testInts<int32_t, true, false>(
       []() -> int32_t { return folly::Random::rand32(); });
 }
 
-TEST(TestDirect, fixedWidthLong) {
+TEST_F(DirectTest, fixedWidthLong) {
   testInts<int64_t, true, false>(
       []() -> int64_t { return folly::Random::rand64(); });
 }
 
-TEST(TestDirect, vIntSignedShort) {
+TEST_F(DirectTest, vIntSignedShort) {
   folly::Random::DefaultGenerator rng;
   rng.seed(2);
   testInts<int16_t, true, true>(
       [&]() -> int16_t { return folly::Random::rand32(rng); });
 }
 
-TEST(TestDirect, vIntSignedInt) {
+TEST_F(DirectTest, vIntSignedInt) {
   folly::Random::DefaultGenerator rng;
   rng.seed(2);
   testInts<int64_t, true, true>(
       [&]() -> int32_t { return folly::Random::rand32(rng); });
 }
 
-TEST(TestDirect, vIntSignedLong) {
+TEST_F(DirectTest, vIntSignedLong) {
   folly::Random::DefaultGenerator rng;
   rng.seed(2);
   int32_t count = 0;
@@ -178,7 +185,7 @@ TEST(TestDirect, vIntSignedLong) {
   });
 }
 
-TEST(TestDirect, vIntUnsignedLong) {
+TEST_F(DirectTest, vIntUnsignedLong) {
   folly::Random::DefaultGenerator rng;
   rng.seed(1);
   int32_t count = 0;
@@ -218,7 +225,7 @@ void testCorruptedVarInts() {
                , exception::LoggedException);
 }
 
-TEST(TestDirect, corruptedInts) {
+TEST_F(DirectTest, corruptedInts) {
   testCorruptedVarInts<false>();
   testCorruptedVarInts<true>();
 }

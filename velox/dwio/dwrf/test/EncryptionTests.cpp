@@ -18,14 +18,14 @@
 #include <gtest/gtest.h>
 #include "velox/dwio/common/encryption/TestProvider.h"
 #include "velox/dwio/dwrf/test/OrcTest.h"
-#include "velox/dwio/type/fbhive/HiveTypeParser.h"
+#include "velox/type/fbhive/HiveTypeParser.h"
 
 using namespace facebook::velox::dwio;
 using namespace facebook::velox::dwio::common;
 using namespace facebook::velox::dwio::common::encryption;
 using namespace facebook::velox::dwio::common::encryption::test;
 using namespace facebook::velox::dwrf::encryption;
-using namespace facebook::velox::dwio::type::fbhive;
+using namespace facebook::velox::type::fbhive;
 
 TEST(Encryption, NotEncrypted) {
   HiveTypeParser parser;
@@ -213,11 +213,11 @@ TEST(Encryption, NestedType) {
   ASSERT_EQ(handler->getEncryptionGroupCount(), 2);
   for (auto i = 0; i < withId->size(); ++i) {
     auto& col = withId->childAt(i);
-    bool encrypted = (col->column % 2 == 1);
-    for (auto j = col->id; j <= col->maxId; ++j) {
+    bool encrypted = (col->column() % 2 == 1);
+    for (auto j = col->id(); j <= col->maxId(); ++j) {
       ASSERT_EQ(handler->isEncrypted(j), encrypted);
       if (encrypted) {
-        ASSERT_EQ(handler->getEncryptionRoot(j), col->id);
+        ASSERT_EQ(handler->getEncryptionRoot(j), col->id());
       }
     }
   }

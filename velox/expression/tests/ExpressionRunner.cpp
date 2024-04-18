@@ -114,20 +114,27 @@ void ExpressionRunner::run(
     const std::string& mode,
     vector_size_t numRows,
     const std::string& storeResultPath,
-    const std::string& lazyColumnListPath) {
+    const std::string& lazyColumnListPath,
+    bool findMinimalSubExpression,
+    bool useSeperatePoolForInput) {
   VELOX_CHECK(!sql.empty());
-
+  auto memoryManager = memory::memoryManager();
   std::shared_ptr<core::QueryCtx> queryCtx{std::make_shared<core::QueryCtx>()};
-  std::shared_ptr<memory::MemoryPool> pool{memory::getDefaultMemoryPool()};
+  std::shared_ptr<memory::MemoryPool> deserializerPool{
+      memoryManager->addLeafPool()};
+  std::shared_ptr<memory::MemoryPool> pool = useSeperatePoolForInput
+      ? memoryManager->addLeafPool("exprEval")
+      : deserializerPool;
   core::ExecCtx execCtx{pool.get(), queryCtx.get()};
 
   RowVectorPtr inputVector;
+
   if (inputPath.empty()) {
     inputVector = std::make_shared<RowVector>(
-        pool.get(), ROW({}), nullptr, 1, std::vector<VectorPtr>{});
+        deserializerPool.get(), ROW({}), nullptr, 1, std::vector<VectorPtr>{});
   } else {
     inputVector = std::dynamic_pointer_cast<RowVector>(
-        restoreVectorFromFile(inputPath.c_str(), pool.get()));
+        restoreVectorFromFile(inputPath.c_str(), deserializerPool.get()));
     VELOX_CHECK_NOT_NULL(
         inputVector,
         "Input vector is not a RowVector: {}",
@@ -135,10 +142,10 @@ void ExpressionRunner::run(
     VELOX_CHECK_GT(inputVector->size(), 0, "Input vector must not be empty.");
   }
 
-  std::vector<column_index_t> columnsToWrapInLazy;
+  std::vector<int> columnsToWrapInLazy;
   if (!lazyColumnListPath.empty()) {
     columnsToWrapInLazy =
-        restoreStdVectorFromFile<column_index_t>(lazyColumnListPath.c_str());
+        restoreStdVectorFromFile<int>(lazyColumnListPath.c_str());
   }
 
   parse::registerTypeResolver();
@@ -183,15 +190,28 @@ void ExpressionRunner::run(
   LOG(INFO) << "Evaluating SQL expression(s): " << sql;
 
   if (mode == "verify") {
-    VELOX_CHECK_EQ(
-        1, typedExprs.size(), "'verify' mode supports only one SQL expression");
-    test::ExpressionVerifier(&execCtx, {false, ""})
-        .verify(
-            typedExprs[0],
+    auto verifier = test::ExpressionVerifier(&execCtx, {false, ""});
+    try {
+      verifier.verify(
+          typedExprs,
+          inputVector,
+          std::move(resultVector),
+          true,
+          columnsToWrapInLazy);
+    } catch (const std::exception&) {
+      if (findMinimalSubExpression) {
+        VectorFuzzer::Options options;
+        VectorFuzzer fuzzer(options, pool.get());
+        computeMinimumSubExpression(
+            std::move(verifier),
+            fuzzer,
+            typedExprs,
             inputVector,
-            std::move(resultVector),
-            true,
             columnsToWrapInLazy);
+      }
+      throw;
+    }
+
   } else if (mode == "common") {
     if (!columnsToWrapInLazy.empty()) {
       inputVector =

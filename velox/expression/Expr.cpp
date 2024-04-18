@@ -21,7 +21,10 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/SuccinctPrinter.h"
+#include "velox/common/process/ThreadDebugInfo.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/core/Expressions.h"
+#include "velox/expression/CastExpr.h"
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprCompiler.h"
@@ -37,6 +40,19 @@ DEFINE_bool(
     false,
     "Whether to overwrite queryCtx and force the "
     "use of simplified expression evaluation path.");
+
+DEFINE_bool(
+    velox_experimental_save_input_on_fatal_signal,
+    false,
+    "This is an experimental flag only to be used for debugging "
+    "purposes. If set to true, serializes the input vector data and "
+    "all the SQL expressions in the ExprSet that is currently "
+    "executing, whenever a fatal signal is encountered. Enabling "
+    "this flag makes the signal handler async signal unsafe, so it "
+    "should only be used for debugging purposes. The vector and SQLs "
+    "are serialized to files in directories specified by either "
+    "'velox_save_input_on_expression_any_failure_path' or "
+    "'velox_save_input_on_expression_system_failure_path'");
 
 namespace facebook::velox::exec {
 
@@ -83,19 +99,6 @@ bool isMember(
   return std::find(fields.begin(), fields.end(), &field) != fields.end();
 }
 
-void mergeFields(
-    std::vector<FieldReference*>& distinctFields,
-    std::unordered_set<FieldReference*>& multiplyReferencedFields,
-    const std::vector<FieldReference*>& moreFields) {
-  for (auto* newField : moreFields) {
-    if (isMember(distinctFields, *newField)) {
-      multiplyReferencedFields.insert(newField);
-    } else {
-      distinctFields.emplace_back(newField);
-    }
-  }
-}
-
 // Returns true if input expression or any sub-expression is an IF, AND or OR.
 bool hasConditionals(Expr* expr) {
   if (expr->isConditional()) {
@@ -110,18 +113,29 @@ bool hasConditionals(Expr* expr) {
 
   return false;
 }
+
+void checkOrSetEmptyResult(
+    const TypePtr& type,
+    memory::MemoryPool* pool,
+    VectorPtr& result) {
+  if (!result) {
+    result = BaseVector::createNullConstant(type, 0, pool);
+  }
+}
 } // namespace
 
 Expr::Expr(
     TypePtr type,
     std::vector<std::shared_ptr<Expr>>&& inputs,
     std::shared_ptr<VectorFunction> vectorFunction,
+    VectorFunctionMetadata metadata,
     std::string name,
     bool trackCpuUsage)
     : type_(std::move(type)),
       inputs_(std::move(inputs)),
       name_(std::move(name)),
       vectorFunction_(std::move(vectorFunction)),
+      vectorFunctionMetadata_{std::move(metadata)},
       specialForm_{false},
       supportsFlatNoNullsFastPath_{
           vectorFunction_->supportsFlatNoNullsFastPath() &&
@@ -131,7 +145,7 @@ Expr::Expr(
   constantInputs_.reserve(inputs_.size());
   inputIsConstant_.reserve(inputs_.size());
   for (auto& expr : inputs_) {
-    if (auto constantExpr = std::dynamic_pointer_cast<ConstantExpr>(expr)) {
+    if (auto constantExpr = expr->as<ConstantExpr>()) {
       constantInputs_.emplace_back(constantExpr->value());
       inputIsConstant_.push_back(true);
     } else {
@@ -178,71 +192,159 @@ bool Expr::allSupportFlatNoNullsFastPath(
   return true;
 }
 
-void Expr::computeMetadata() {
-  // Sets propagatesNulls_ if a null in any of the columns this
-  // depends on makes the Expr null. If the set of fields
-  // null-propagating arguments depend on is a superset of the fields
-  // non null-propagating arguments depend on and the function itself
-  // has default null behavior, then the Expr propagates nulls.  Sets
-  // isDeterministic to false if some subtree is
-  // non-deterministic. Sets 'distinctFields_' to be the union of
-  // 'distinctFields_' of inputs. If one of the inputs has the
-  // identical set of distinct fields, then the input's distinct
-  // fields are set to empty.
-  bool isNullPropagatingFunction = false;
-  if (isSpecialForm()) {
-    // 'propagatesNulls_' will be adjusted after inputs are processed.
-    propagatesNulls_ = true;
-    deterministic_ = true;
-  } else if (vectorFunction_) {
-    deterministic_ = vectorFunction_->isDeterministic();
-    isNullPropagatingFunction = vectorFunction_->isDefaultNullBehavior();
-    propagatesNulls_ = isNullPropagatingFunction;
+void Expr::clearMetaData() {
+  metaDataComputed_ = false;
+  for (auto& child : inputs_) {
+    child->clearMetaData();
   }
+  propagatesNulls_ = false;
+  distinctFields_.clear();
+  multiplyReferencedFields_.clear();
+  hasConditionals_ = false;
+  deterministic_ = true;
+  sameAsParentDistinctFields_ = false;
+}
 
-  std::vector<FieldReference*> nullPropagatingFields;
-  std::vector<FieldReference*> nonNullPropagatingFields;
-  std::unordered_set<FieldReference*> ignore;
+void Expr::mergeFields(
+    std::vector<FieldReference*>& distinctFields,
+    std::unordered_set<FieldReference*>& multiplyReferencedFields,
+    const std::vector<FieldReference*>& moreFields) {
+  for (auto* newField : moreFields) {
+    if (isMember(distinctFields, *newField)) {
+      multiplyReferencedFields.insert(newField);
+    } else {
+      distinctFields.emplace_back(newField);
+    }
+  }
+}
+
+void Expr::computeDistinctFields() {
   for (auto& input : inputs_) {
-    // Skip computing for inputs already marked as multiply referenced as they
-    // would have it computed already.
-    if (!input->isMultiplyReferenced_) {
-      input->computeMetadata();
-    }
-    deterministic_ &= input->deterministic_;
-    if (!input->distinctFields_.empty()) {
-      if (!isNullPropagatingFunction) {
-        propagatesNulls_ &= input->propagatesNulls_;
-      } else if (input->propagatesNulls_) {
-        mergeFields(nullPropagatingFields, ignore, input->distinctFields_);
-      } else {
-        mergeFields(nonNullPropagatingFields, ignore, input->distinctFields_);
-      }
-    }
     mergeFields(
         distinctFields_, multiplyReferencedFields_, input->distinctFields_);
   }
-  if (isSpecialForm()) {
-    propagatesNulls_ = propagatesNulls();
-  } else if (isNullPropagatingFunction) {
-    propagatesNulls_ =
-        isSubsetOfFields(nonNullPropagatingFields, nullPropagatingFields);
-  } else {
-    propagatesNulls_ = false;
+}
+
+void Expr::computeMetadata() {
+  if (metaDataComputed_) {
+    return;
   }
+
+  // Compute metadata for all the inputs.
   for (auto& input : inputs_) {
-    if (!input->isMultiplyReferenced_ &&
-        isSameFields(distinctFields_, input->distinctFields_)) {
-      input->distinctFields_.clear();
+    input->computeMetadata();
+  }
+
+  // (1) Compute deterministic_.
+  // An expression is deterministic if it is a deterministic function call or a
+  // special form, and all its inputs are also deterministic.
+  if (vectorFunction_) {
+    deterministic_ = vectorFunctionMetadata_.deterministic;
+  } else {
+    VELOX_CHECK(isSpecialForm());
+    deterministic_ = true;
+  }
+
+  for (auto& input : inputs_) {
+    deterministic_ &= input->deterministic_;
+  }
+
+  // (2) Compute distinctFields_ and multiplyReferencedFields_.
+  computeDistinctFields();
+
+  // (3) Compute propagatesNulls_.
+  // propagatesNulls_ is true iff a null in any of the columns this
+  // depends on makes the Expr null.
+  if (isSpecialForm() && !is<ConstantExpr>() && !is<FieldReference>() &&
+      !is<CastExpr>()) {
+    as<SpecialForm>()->computePropagatesNulls();
+  } else {
+    if (vectorFunction_ && !vectorFunctionMetadata_.defaultNullBehavior) {
+      propagatesNulls_ = false;
+    } else {
+      // Logic for handling default-null vector functions.
+      // cast, constant and fieldReference expressions act as vector functions
+      // with default null behavior.
+
+      // If the function has default null behavior, the Expr propagates nulls if
+      // the set of fields null-propagating arguments depend on is a superset of
+      // the fields non null-propagating arguments depend on.
+      std::unordered_set<FieldReference*> nullPropagating, nonNullPropagating;
+      for (auto& input : inputs_) {
+        if (input->propagatesNulls_) {
+          nullPropagating.insert(
+              input->distinctFields_.begin(), input->distinctFields_.end());
+        } else {
+          nonNullPropagating.insert(
+              input->distinctFields_.begin(), input->distinctFields_.end());
+        }
+      }
+
+      // propagatesNulls_ is true if nonNullPropagating is subset of
+      // nullPropagating.
+      propagatesNulls_ = true;
+      for (auto* field : nonNullPropagating) {
+        if (!nullPropagating.count(field)) {
+          propagatesNulls_ = false;
+          break;
+        }
+      }
     }
   }
 
+  for (auto& input : inputs_) {
+    if (isSameFields(distinctFields_, input->distinctFields_)) {
+      input->sameAsParentDistinctFields_ = true;
+    }
+  }
+
+  // (5) Compute hasConditionals_.
   hasConditionals_ = hasConditionals(this);
+
+  metaDataComputed_ = true;
 }
 
 namespace {
+void rethrowFirstError(
+    const SelectivityVector& rows,
+    const ErrorVectorPtr& errors) {
+  auto errorSize = errors->size();
+  rows.testSelected([&](vector_size_t row) {
+    if (row >= errorSize) {
+      return false;
+    }
+    if (!errors->isNullAt(row)) {
+      auto exceptionPtr =
+          std::static_pointer_cast<std::exception_ptr>(errors->valueAt(row));
+      std::rethrow_exception(*exceptionPtr);
+    }
+    return true;
+  });
+}
+
+// Sets errors in 'context' to be the union of 'argumentErrors' for 'rows' and
+// 'errors'. If 'context' throws on first error and 'argumentErrors'
+// has errors, throws the first error in 'argumentErrors' scoped to 'rows'.
+// Otherwise sets 'errors()' of 'context' to the union of the errors. This is
+// used after all arguments of a function call have been evaluated and
+// we decide on whether to throw or what errors to leave in 'context' for the
+// caller.
+void mergeOrThrowArgumentErrors(
+    const SelectivityVector& rows,
+    ErrorVectorPtr& originalErrors,
+    ErrorVectorPtr& argumentErrors,
+    EvalCtx& context) {
+  if (argumentErrors) {
+    if (context.throwOnError()) {
+      rethrowFirstError(rows, argumentErrors);
+    }
+    context.addErrors(rows, argumentErrors, originalErrors);
+  }
+  context.swapErrors(originalErrors);
+}
+
 // Returns true if vector is a LazyVector that hasn't been loaded yet or
-// is not dictionary, sequence or constant encoded.
+// is not dictionary or constant encoded.
 bool isFlat(const BaseVector& vector) {
   auto encoding = vector.encoding();
   if (encoding == VectorEncoding::Simple::LAZY) {
@@ -253,20 +355,119 @@ bool isFlat(const BaseVector& vector) {
     encoding = vector.loadedVector()->encoding();
   }
   return !(
-      encoding == VectorEncoding::Simple::SEQUENCE ||
       encoding == VectorEncoding::Simple::DICTIONARY ||
       encoding == VectorEncoding::Simple::CONSTANT);
 }
 
+inline void checkResultInternalState(VectorPtr& result) {
+#ifndef NDEBUG
+  if (result != nullptr) {
+    result->validate();
+  }
+#endif
+}
+
 } // namespace
+
+template <typename EvalArg>
+bool Expr::evalArgsDefaultNulls(
+    MutableRemainingRows& rows,
+    EvalArg evalArg,
+    EvalCtx& context,
+    VectorPtr& result) {
+  ErrorVectorPtr argumentErrors;
+  ErrorVectorPtr originalErrors;
+  LocalDecodedVector decoded(context);
+  // Store pre-existing errors locally and clear them from
+  // 'context'. We distinguish between argument errors and
+  // pre-existing ones.
+  if (context.errors()) {
+    context.swapErrors(originalErrors);
+  }
+
+  inputValues_.resize(inputs_.size());
+  {
+    ScopedVarSetter throwErrors(
+        context.mutableThrowOnError(), throwArgumentErrors(context));
+
+    for (int32_t i = 0; i < inputs_.size(); ++i) {
+      evalArg(i);
+      const uint64_t* flatNulls = nullptr;
+      auto& arg = inputValues_[i];
+      if (arg->mayHaveNulls()) {
+        decoded.get()->decode(*arg, rows.rows());
+        flatNulls = decoded.get()->nulls(&rows.rows());
+      }
+      // A null with no error deselects the row.
+      // An error adds itself to argument errors.
+      if (context.errors()) {
+        // There are new errors.
+        context.ensureErrorsVectorSize(*context.errorsPtr(), rows.rows().end());
+        auto newErrors = context.errors();
+        assert(newErrors); // lint
+        if (flatNulls) {
+          // There are both nulls and errors. Only a null with no error removes
+          // a row.
+          auto errorNulls = newErrors->rawNulls();
+          auto rowBits = rows.mutableRows().asMutableRange().bits();
+          auto nwords = bits::nwords(rows.rows().end());
+          for (auto j = 0; j < nwords; ++j) {
+            auto nullNoError =
+                errorNulls ? flatNulls[j] | errorNulls[j] : flatNulls[j];
+            rowBits[j] &= nullNoError;
+          }
+          rows.mutableRows().updateBounds();
+        }
+        context.moveAppendErrors(argumentErrors);
+      } else if (flatNulls) {
+        rows.deselectNulls(flatNulls);
+      }
+
+      if (!rows.rows().hasSelections()) {
+        break;
+      }
+    }
+  }
+
+  mergeOrThrowArgumentErrors(
+      rows.rows(), originalErrors, argumentErrors, context);
+
+  if (!rows.deselectErrors()) {
+    releaseInputValues(context);
+    setAllNulls(rows.originalRows(), context, result);
+    return false;
+  }
+
+  return true;
+}
+
+template <typename EvalArg>
+bool Expr::evalArgsWithNulls(
+    MutableRemainingRows& rows,
+    EvalArg evalArg,
+    EvalCtx& context,
+    VectorPtr& result) {
+  inputValues_.resize(inputs_.size());
+  for (int32_t i = 0; i < inputs_.size(); ++i) {
+    evalArg(i);
+    if (!rows.deselectErrors()) {
+      break;
+    }
+  }
+  if (!rows.rows().hasSelections()) {
+    releaseInputValues(context);
+    setAllNulls(rows.originalRows(), context, result);
+    return false;
+  }
+  return true;
+}
 
 void Expr::evalSimplified(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
     return;
   }
 
@@ -285,7 +486,10 @@ void Expr::evalSimplified(
   if (remainingRows->hasSelections()) {
     evalSimplifiedImpl(*remainingRows, context, result);
   }
-  addNulls(rows, remainingRows->asRange().bits(), context, result);
+
+  if (!type()->isFunction()) {
+    addNulls(rows, remainingRows->asRange().bits(), context, result);
+  }
 }
 
 void Expr::releaseInputValues(EvalCtx& evalCtx) {
@@ -303,60 +507,42 @@ void Expr::evalSimplifiedImpl(
     return;
   }
 
-  SelectivityVector remainingRows = rows;
-  inputValues_.resize(inputs_.size());
-  const bool defaultNulls = vectorFunction_->isDefaultNullBehavior();
-
-  for (int32_t i = 0; i < inputs_.size(); ++i) {
+  MutableRemainingRows remainingRows(rows, context);
+  const bool defaultNulls = vectorFunctionMetadata_.defaultNullBehavior;
+  auto evalArg = [&](int32_t i) {
     auto& inputValue = inputValues_[i];
-    inputs_[i]->evalSimplified(remainingRows, context, inputValue);
-
-    // Do not continue evaluation for rows with errors.
-    context.deselectErrors(remainingRows);
-    if (!remainingRows.hasSelections()) {
-      releaseInputValues(context);
-      result =
-          BaseVector::createNullConstant(type(), rows.size(), context.pool());
-      return;
-    }
-
-    BaseVector::flattenVector(inputValue, rows.end());
+    inputs_[i]->evalSimplified(remainingRows.rows(), context, inputValue);
+    BaseVector::flattenVector(inputValue);
     VELOX_CHECK(
         inputValue->encoding() == VectorEncoding::Simple::FLAT ||
         inputValue->encoding() == VectorEncoding::Simple::ARRAY ||
         inputValue->encoding() == VectorEncoding::Simple::MAP ||
-        inputValue->encoding() == VectorEncoding::Simple::ROW);
+        inputValue->encoding() == VectorEncoding::Simple::ROW ||
+        inputValue->encoding() == VectorEncoding::Simple::FUNCTION);
+  };
 
-    // If the resulting vector has nulls, merge them into our current remaining
-    // rows bitmap.
-    if (defaultNulls && inputValue->mayHaveNulls()) {
-      if (auto* rawNulls = inputValue->rawNulls()) {
-        remainingRows.deselectNulls(
-            rawNulls, remainingRows.begin(), remainingRows.end());
-
-        // All rows are null, return a null constant.
-        if (!remainingRows.hasSelections()) {
-          releaseInputValues(context);
-          result = BaseVector::createNullConstant(
-              type(), rows.size(), context.pool());
-          return;
-        }
-      }
+  if (defaultNulls) {
+    if (!evalArgsDefaultNulls(remainingRows, evalArg, context, result)) {
+      return;
+    }
+  } else {
+    if (!evalArgsWithNulls(remainingRows, evalArg, context, result)) {
+      return;
     }
   }
 
   // Apply the actual function.
   try {
     vectorFunction_->apply(
-        remainingRows, inputValues_, type(), context, result);
-  } catch (const VeloxException& ve) {
+        remainingRows.rows(), inputValues_, type(), context, result);
+  } catch (const VeloxException&) {
     throw;
   } catch (const std::exception& e) {
     VELOX_USER_FAIL(e.what());
   }
 
   // Make sure the returned vector has its null bitmap properly set.
-  addNulls(rows, remainingRows.asRange().bits(), context, result);
+  addNulls(rows, remainingRows.rows().asRange().bits(), context, result);
   releaseInputValues(context);
 }
 
@@ -368,13 +554,14 @@ namespace {
 class ExprExceptionContext {
  public:
   ExprExceptionContext(
-      const Expr* FOLLY_NONNULL expr,
-      const RowVector* FOLLY_NONNULL vector)
-      : expr_(expr), vector_(vector) {}
+      const Expr* expr,
+      const RowVector* vector,
+      const ExprSet* parentExprSet)
+      : expr_(expr), vector_(vector), parentExprSet_(parentExprSet) {}
 
   /// Persist data and sql on disk. Data will be persisted in $basePath/vector
   /// and sql will be persisted in $basePath/sql
-  void persistDataAndSql(const char* FOLLY_NONNULL basePath) {
+  void persistDataAndSql(const char* basePath) {
     // Exception already persisted or failed to persist. We don't persist again
     // in this situation.
     if (!dataPath_.empty()) {
@@ -409,13 +596,37 @@ class ExprExceptionContext {
       sqlPath_ = e.what();
       return;
     }
+
+    if (parentExprSet_ != nullptr) {
+      std::stringstream allSql;
+      auto exprs = parentExprSet_->exprs();
+      for (int i = 0; i < exprs.size(); ++i) {
+        if (i > 0) {
+          allSql << ", ";
+        }
+        allSql << exprs[i]->toSql();
+      }
+      try {
+        auto sqlPathOpt = common::generateTempFilePath(basePath, "allExprSql");
+        if (!sqlPathOpt.has_value()) {
+          allExprSqlPath_ =
+              "Failed to create file for saving all SQL expressions.";
+          return;
+        }
+        allExprSqlPath_ = sqlPathOpt.value();
+        saveStringToFile(allSql.str(), allExprSqlPath_.c_str());
+      } catch (std::exception& e) {
+        allExprSqlPath_ = e.what();
+        return;
+      }
+    }
   }
 
-  const Expr* FOLLY_NONNULL expr() const {
+  const Expr* expr() const {
     return expr_;
   }
 
-  const RowVector* FOLLY_NONNULL vector() const {
+  const RowVector* vector() const {
     return vector_;
   }
 
@@ -427,14 +638,21 @@ class ExprExceptionContext {
     return sqlPath_;
   }
 
+  const std::string& allExprSqlPath() const {
+    return allExprSqlPath_;
+  }
+
  private:
   /// The expression.
-  const Expr* FOLLY_NONNULL expr_;
+  const Expr* expr_;
 
   /// The input vector, i.e. EvalCtx::row(). In some cases, input columns are
   /// re-used for results. Hence, 'vector' may no longer contain input data at
   /// the time of exception.
-  const RowVector* FOLLY_NONNULL vector_;
+  const RowVector* vector_;
+
+  // The parent ExprSet that is executing this expression.
+  const ExprSet* parentExprSet_;
 
   /// Path of the file storing the serialized 'vector'. Used to avoid
   /// serializing vector repeatedly in cases when multiple rows generate
@@ -444,6 +662,11 @@ class ExprExceptionContext {
   /// Path of the file storing the expression SQL. Used to avoid writing SQL
   /// repeatedly in cases when multiple rows generate exceptions.
   std::string sqlPath_{""};
+
+  /// Path of the file storing the SQL for all expressions in the ExprSet that
+  /// was executing this expression. Useful if the bug that caused the error was
+  /// encountered due to some mutation from running the other expressions.
+  std::string allExprSqlPath_{"N/A"};
 };
 
 /// Used to generate context for an error occurred while evaluating
@@ -480,10 +703,11 @@ std::string onTopLevelException(VeloxException::Type exceptionType, void* arg) {
   context->persistDataAndSql(basePath);
 
   return fmt::format(
-      "{}. Input data: {}. SQL expression: {}.",
+      "{}. Input data: {}. SQL expression: {}. All SQL expressions: {}.",
       context->expr()->toString(),
       context->dataPath(),
-      context->sqlPath());
+      context->sqlPath(),
+      context->allExprSqlPath());
 }
 
 /// Used to generate context for an error occurred while evaluating
@@ -498,7 +722,7 @@ void Expr::evalFlatNoNulls(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result,
-    bool topLevel) {
+    const ExprSet* parentExprSet) {
   if (shouldEvaluateSharedSubexp()) {
     evaluateSharedSubexpr(
         rows,
@@ -507,10 +731,10 @@ void Expr::evalFlatNoNulls(
         [&](const SelectivityVector& rows,
             EvalCtx& context,
             VectorPtr& result) {
-          evalFlatNoNullsImpl(rows, context, result, topLevel);
+          evalFlatNoNullsImpl(rows, context, result, parentExprSet);
         });
   } else {
-    evalFlatNoNullsImpl(rows, context, result, topLevel);
+    evalFlatNoNullsImpl(rows, context, result, parentExprSet);
   }
 }
 
@@ -518,11 +742,16 @@ void Expr::evalFlatNoNullsImpl(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result,
-    bool topLevel) {
-  ExprExceptionContext exprExceptionContext{this, context.row()};
+    const ExprSet* parentExprSet) {
+  ExprExceptionContext exprExceptionContext{this, context.row(), parentExprSet};
   ExceptionContextSetter exceptionContext(
-      {topLevel ? onTopLevelException : onException,
-       topLevel ? (void*)&exprExceptionContext : this});
+      {parentExprSet ? onTopLevelException : onException,
+       parentExprSet ? (void*)&exprExceptionContext : this});
+
+  if (!rows.hasSelections()) {
+    checkOrSetEmptyResult(type(), context.pool(), result);
+    return;
+  }
 
   if (isSpecialForm()) {
     evalSpecialFormWithStats(rows, context, result);
@@ -535,7 +764,7 @@ void Expr::evalFlatNoNullsImpl(
       // No need to re-evaluate constant expression. Simply move constant values
       // from constantInputs_.
       inputValues_[i] = std::move(constantInputs_[i]);
-      inputValues_[i]->resize(rows.size());
+      inputValues_[i]->resize(rows.end());
     } else {
       inputs_[i]->evalFlatNoNulls(rows, context, inputValues_[i]);
     }
@@ -557,23 +786,24 @@ void Expr::eval(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result,
-    bool topLevel) {
+    const ExprSet* parentExprSet) {
   if (supportsFlatNoNullsFastPath_ && context.throwOnError() &&
       context.inputFlatNoNulls() && rows.countSelected() < 1'000) {
-    evalFlatNoNulls(rows, context, result, topLevel);
+    evalFlatNoNulls(rows, context, result, parentExprSet);
+    checkResultInternalState(result);
     return;
   }
 
   // Make sure to include current expression in the error message in case of an
   // exception.
-  ExprExceptionContext exprExceptionContext{this, context.row()};
+  ExprExceptionContext exprExceptionContext{this, context.row(), parentExprSet};
   ExceptionContextSetter exceptionContext(
-      {topLevel ? onTopLevelException : onException,
-       topLevel ? (void*)&exprExceptionContext : this});
+      {parentExprSet ? onTopLevelException : onException,
+       parentExprSet ? (void*)&exprExceptionContext : this});
 
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
+    checkResultInternalState(result);
     return;
   }
 
@@ -604,12 +834,15 @@ void Expr::eval(
   if (!hasConditionals_ || distinctFields_.size() == 1 ||
       shouldEvaluateSharedSubexp()) {
     // Load lazy vectors if any.
-    for (const auto& field : distinctFields_) {
+    for (auto* field : distinctFields_) {
       context.ensureFieldLoaded(field->index(context), rows);
     }
-  } else if (!propagatesNulls_) {
-    // Load multiply-referenced fields at common parent expr with "rows".
-    // Delay loading fields that are not in multiplyReferencedFields_.
+  } else if (
+      !propagatesNulls_ && !evaluatesArgumentsOnNonIncreasingSelection()) {
+    // Load multiply-referenced fields at common parent expr with "rows".  Delay
+    // loading fields that are not in multiplyReferencedFields_.  In case
+    // evaluatesArgumentsOnNonIncreasingSelection() is true, this is delayed
+    // until we process the inputs of ConjunctExpr.
     for (const auto& field : multiplyReferencedFields_) {
       context.ensureFieldLoaded(field->index(context), rows);
     }
@@ -617,10 +850,12 @@ void Expr::eval(
 
   if (inputs_.empty()) {
     evalAll(rows, context, result);
+    checkResultInternalState(result);
     return;
   }
 
   evalEncodings(rows, context, result);
+  checkResultInternalState(result);
 }
 
 template <typename TEval>
@@ -631,19 +866,43 @@ void Expr::evaluateSharedSubexpr(
     TEval eval) {
   // Captures the inputs referenced by distinctFields_.
   std::vector<const BaseVector*> expressionInputFields;
-  for (const auto& field : distinctFields_) {
+  for (auto* field : distinctFields_) {
     expressionInputFields.push_back(
         context.getField(field->index(context)).get());
   }
 
+  // Find the cached results for the same inputs, or create an entry if one
+  // doesn't exist.
+  auto sharedSubexprResultsIter =
+      sharedSubexprResults_.find(expressionInputFields);
+  if (sharedSubexprResultsIter == sharedSubexprResults_.end()) {
+    auto maxSharedSubexprResultsCached = context.execCtx()
+                                             ->queryCtx()
+                                             ->queryConfig()
+                                             .maxSharedSubexprResultsCached();
+    if (sharedSubexprResults_.size() < maxSharedSubexprResultsCached) {
+      // If we have room left in the cache, add it.
+      sharedSubexprResultsIter =
+          sharedSubexprResults_
+              .insert(
+                  std::pair(std::move(expressionInputFields), SharedResults()))
+              .first;
+    } else {
+      // Otherwise, simply evaluate it and return without caching the results.
+      eval(rows, context, result);
+
+      return;
+    }
+  }
+
   auto& [sharedSubexprRows, sharedSubexprValues] =
-      sharedSubexprResults_[expressionInputFields];
+      sharedSubexprResultsIter->second;
 
   if (sharedSubexprValues == nullptr) {
     eval(rows, context, result);
 
     if (!sharedSubexprRows) {
-      sharedSubexprRows = context.execCtx()->getSelectivityVector(rows.size());
+      sharedSubexprRows = context.execCtx()->getSelectivityVector(rows.end());
     }
 
     *sharedSubexprRows = rows;
@@ -696,7 +955,16 @@ void Expr::evaluateSharedSubexpr(
   context.deselectErrors(*missingRows);
 
   sharedSubexprRows->select(*missingRows);
-  context.moveOrCopyResult(sharedSubexprValues, rows, result);
+
+  if (context.errors()) {
+    LocalSelectivityVector rowsWithoutErrorsHolder(context, rows);
+    auto* rowsWithoutErrors = rowsWithoutErrorsHolder.get();
+    context.deselectErrors(*rowsWithoutErrors);
+
+    context.moveOrCopyResult(sharedSubexprValues, *rowsWithoutErrors, result);
+  } else {
+    context.moveOrCopyResult(sharedSubexprValues, rows, result);
+  }
 }
 
 SelectivityVector* singleRow(
@@ -710,7 +978,7 @@ SelectivityVector* singleRow(
 
 Expr::PeelEncodingsResult Expr::peelEncodings(
     EvalCtx& context,
-    ScopedContextSaver& saver,
+    ContextSaver& saver,
     const SelectivityVector& rows,
     LocalDecodedVector& localDecoded,
     LocalSelectivityVector& newRowsHolder,
@@ -720,18 +988,22 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
   }
 
   // Prepare the rows and vectors to peel.
+
+  // Use finalSelection to generate peel to ensure those rows can be translated
+  // and ensure consistent peeling across multiple calls to this expression if
+  // its a shared subexpression.
   const auto& rowsToPeel =
       context.isFinalSelection() ? rows : *context.finalSelection();
   auto numFields = context.row()->childrenSize();
   std::vector<VectorPtr> vectorsToPeel;
   vectorsToPeel.reserve(distinctFields_.size());
-  for (const auto& field : distinctFields_) {
+  for (auto* field : distinctFields_) {
     auto fieldIndex = field->index(context);
     assert(fieldIndex >= 0 && fieldIndex < numFields);
     auto fieldVector = context.getField(fieldIndex);
     if (fieldVector->isConstantEncoding()) {
       // Make sure constant encoded fields are loaded
-      fieldVector = context.ensureFieldLoaded(fieldIndex, rows);
+      fieldVector = context.ensureFieldLoaded(fieldIndex, rowsToPeel);
     }
     vectorsToPeel.push_back(fieldVector);
   }
@@ -739,7 +1011,7 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
   // Attempt peeling.
   VELOX_CHECK(!vectorsToPeel.empty());
   std::vector<VectorPtr> peeledVectors;
-  auto peeledEncoding = PeeledEncoding::Peel(
+  auto peeledEncoding = PeeledEncoding::peel(
       vectorsToPeel, rowsToPeel, localDecoded, propagatesNulls_, peeledVectors);
 
   if (!peeledEncoding) {
@@ -768,9 +1040,15 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
   }
 
   // If the expression depends on one dictionary, results are cacheable.
-  bool mayCache = distinctFields_.size() == 1 &&
-      VectorEncoding::isDictionary(context.wrapEncoding());
+  bool mayCache = false;
+  if (context.cacheEnabled()) {
+    mayCache = distinctFields_.size() == 1 &&
+        VectorEncoding::isDictionary(context.wrapEncoding()) &&
+        !peeledVectors[0]->memoDisabled();
+  }
 
+  common::testutil::TestValue::adjust(
+      "facebook::velox::exec::Expr::peelEncodings::mayCache", &mayCache);
   return {newRows, finalRowsHolder.get(), mayCache};
 }
 
@@ -778,9 +1056,9 @@ void Expr::evalEncodings(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
-  if (deterministic_ && !distinctFields_.empty()) {
+  if (deterministic_ && !skipFieldDependentOptimizations()) {
     bool hasFlat = false;
-    for (const auto& field : distinctFields_) {
+    for (auto* field : distinctFields_) {
       if (isFlat(*context.getField(field->index(context)))) {
         hasFlat = true;
         break;
@@ -790,8 +1068,8 @@ void Expr::evalEncodings(
     if (!hasFlat) {
       VectorPtr wrappedResult;
       // Attempt peeling and bound the scope of the context used for it.
-      {
-        ScopedContextSaver saveContext;
+
+      withContextSaver([&](ContextSaver& saveContext) {
         LocalSelectivityVector newRowsHolder(context);
         LocalSelectivityVector finalRowsHolder(context);
         LocalDecodedVector decodedHolder(context);
@@ -805,9 +1083,9 @@ void Expr::evalEncodings(
         auto* newRows = peelEncodingsResult.newRows;
         if (newRows) {
           VectorPtr peeledResult;
-          // peelEncodings() can potentially produce an empty selectivity vector
-          // if all selected values we are waiting for are nulls. So, here we
-          // check for such a case.
+          // peelEncodings() can potentially produce an empty selectivity
+          // vector if all selected values we are waiting for are nulls. So,
+          // here we check for such a case.
           if (newRows->hasSelections()) {
             if (peelEncodingsResult.mayCache) {
               evalWithMemo(*newRows, context, peeledResult);
@@ -818,7 +1096,8 @@ void Expr::evalEncodings(
           wrappedResult = context.getPeeledEncoding()->wrap(
               this->type(), context.pool(), peeledResult, rows);
         }
-      }
+      });
+
       if (wrappedResult != nullptr) {
         context.moveOrCopyResult(wrappedResult, rows, result);
         return;
@@ -843,7 +1122,7 @@ bool Expr::removeSureNulls(
 
     if (values->mayHaveNulls()) {
       LocalDecodedVector decoded(context, *values, rows);
-      if (auto* rawNulls = decoded->nulls()) {
+      if (auto* rawNulls = decoded->nulls(&rows)) {
         if (!result) {
           result = nullHolder.get(rows);
         }
@@ -854,56 +1133,17 @@ bool Expr::removeSureNulls(
   }
   if (result) {
     result->updateBounds();
-    return true;
+    return result->countSelected() != rows.countSelected();
   }
   return false;
 }
 
-// static
 void Expr::addNulls(
     const SelectivityVector& rows,
     const uint64_t* rawNulls,
     EvalCtx& context,
-    const TypePtr& type,
-    VectorPtr& result) {
-  // If there's no `result` yet, return a NULL ContantVector.
-  if (!result) {
-    result = BaseVector::createNullConstant(type, rows.end(), context.pool());
-    return;
-  }
-
-  // If result is already a NULL ConstantVector, resize the vector if necessary,
-  // or do nothing otherwise.
-  if (result->isConstantEncoding() && result->isNullAt(0)) {
-    if (result->size() < rows.end()) {
-      if (result.unique()) {
-        result->resize(rows.end());
-      } else {
-        result =
-            BaseVector::createNullConstant(type, rows.end(), context.pool());
-      }
-    }
-    return;
-  }
-
-  if (!result.unique() || !result->isNullsWritable()) {
-    BaseVector::ensureWritable(
-        SelectivityVector::empty(), type, context.pool(), result);
-  }
-
-  if (result->size() < rows.end()) {
-    result->resize(rows.end());
-  }
-
-  result->addNulls(rawNulls, rows);
-}
-
-void Expr::addNulls(
-    const SelectivityVector& rows,
-    const uint64_t* FOLLY_NULLABLE rawNulls,
-    EvalCtx& context,
-    VectorPtr& result) {
-  addNulls(rows, rawNulls, context, type(), result);
+    VectorPtr& result) const {
+  EvalCtx::addNulls(rows, rawNulls, context, type(), result);
 }
 
 void Expr::evalWithNulls(
@@ -911,14 +1151,13 @@ void Expr::evalWithNulls(
     EvalCtx& context,
     VectorPtr& result) {
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
     return;
   }
 
-  if (propagatesNulls_) {
+  if (propagatesNulls_ && !skipFieldDependentOptimizations()) {
     bool mayHaveNulls = false;
-    for (const auto& field : distinctFields_) {
+    for (auto* field : distinctFields_) {
       const auto& vector = context.getField(field->index(context));
       if (isLazyNotLoaded(*vector)) {
         continue;
@@ -930,7 +1169,7 @@ void Expr::evalWithNulls(
       }
     }
 
-    if (mayHaveNulls && !distinctFields_.empty()) {
+    if (mayHaveNulls) {
       LocalSelectivityVector nonNullHolder(context);
       if (removeSureNulls(rows, context, nonNullHolder)) {
         ScopedVarSetter noMoreNulls(context.mutableNullsPruned(), true);
@@ -946,81 +1185,96 @@ void Expr::evalWithNulls(
   evalAll(rows, context, result);
 }
 
+// Optimization that attempts to cache results for inputs that are dictionary
+// encoded and use the same base vector between subsequent input batches. Since
+// this hold onto a reference to the base vector and the cached results, it can
+// be memory intensive. Therefore in order to reduce this consumption and ensure
+// it is only employed for cases where it can be useful, it only starts caching
+// result after it encounters the same base at least twice.
 void Expr::evalWithMemo(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
   VectorPtr base;
   distinctFields_[0]->evalSpecialForm(rows, context, base);
-  ++numCachableInput_;
-  if (baseDictionary_ == base) {
-    ++numCacheableRepeats_;
-    if (cachedDictionaryIndices_) {
-      LocalSelectivityVector cachedHolder(context, rows);
-      auto cached = cachedHolder.get();
-      VELOX_DCHECK(cached != nullptr);
-      cached->intersect(*cachedDictionaryIndices_);
-      if (cached->hasSelections()) {
-        context.ensureWritable(rows, type(), result);
-        result->copy(dictionaryCache_.get(), *cached, nullptr);
-      }
-    }
-    LocalSelectivityVector uncachedHolder(context, rows);
-    auto uncached = uncachedHolder.get();
-    VELOX_DCHECK(uncached != nullptr);
-    if (cachedDictionaryIndices_) {
-      uncached->deselect(*cachedDictionaryIndices_);
-    }
-    if (uncached->hasSelections()) {
-      // Fix finalSelection at "rows" if uncached rows is a strict subset to
-      // avoid losing values not in uncached rows that were copied earlier into
-      // "result" from the cached rows.
-      ScopedFinalSelectionSetter scopedFinalSelectionSetter(
-          context, &rows, uncached->countSelected() < rows.countSelected());
 
-      evalWithNulls(*uncached, context, result);
-      context.deselectErrors(*uncached);
-      context.exprSet()->addToMemo(this);
-      auto newCacheSize = uncached->end();
-
-      // dictionaryCache_ is valid only for cachedDictionaryIndices_. Hence, a
-      // safe call to BaseVector::ensureWritable must include all the rows not
-      // covered by cachedDictionaryIndices_. If BaseVector::ensureWritable is
-      // called only for a subset of rows not covered by
-      // cachedDictionaryIndices_, it will attempt to copy rows that are not
-      // valid leading to a crash.
-      LocalSelectivityVector allUncached(context, dictionaryCache_->size());
-      allUncached.get()->setAll();
-      allUncached.get()->deselect(*cachedDictionaryIndices_);
-      context.ensureWritable(*allUncached.get(), type(), dictionaryCache_);
-
-      if (cachedDictionaryIndices_->size() < newCacheSize) {
-        cachedDictionaryIndices_->resize(newCacheSize, false);
-      }
-
-      cachedDictionaryIndices_->select(*uncached);
-
-      // Resize the dictionaryCache_ to accommodate all the necessary rows.
-      if (dictionaryCache_->size() < uncached->end()) {
-        dictionaryCache_->resize(uncached->end());
-      }
-      dictionaryCache_->copy(result.get(), *uncached, nullptr);
-    }
-    context.releaseVector(base);
+  if (base.get() != baseOfDictionaryRawPtr_ ||
+      baseOfDictionaryWeakPtr_.expired()) {
+    baseOfDictionaryRepeats_ = 0;
+    baseOfDictionaryWeakPtr_ = base;
+    baseOfDictionaryRawPtr_ = base.get();
+    context.releaseVector(baseOfDictionary_);
+    context.releaseVector(dictionaryCache_);
+    evalWithNulls(rows, context, result);
     return;
   }
-  context.releaseVector(baseDictionary_);
-  baseDictionary_ = base;
-  evalWithNulls(rows, context, result);
+  ++baseOfDictionaryRepeats_;
 
-  context.releaseVector(dictionaryCache_);
-  dictionaryCache_ = result;
-  if (!cachedDictionaryIndices_) {
-    cachedDictionaryIndices_ =
-        context.execCtx()->getSelectivityVector(rows.end());
+  if (baseOfDictionaryRepeats_ == 1) {
+    evalWithNulls(rows, context, result);
+    baseOfDictionary_ = base;
+    dictionaryCache_ = result;
+    if (!cachedDictionaryIndices_) {
+      cachedDictionaryIndices_ =
+          context.execCtx()->getSelectivityVector(rows.end());
+    }
+    *cachedDictionaryIndices_ = rows;
+    context.deselectErrors(*cachedDictionaryIndices_);
+    return;
   }
-  *cachedDictionaryIndices_ = rows;
-  context.deselectErrors(*cachedDictionaryIndices_);
+
+  if (cachedDictionaryIndices_) {
+    LocalSelectivityVector cachedHolder(context, rows);
+    auto cached = cachedHolder.get();
+    VELOX_DCHECK(cached != nullptr);
+    cached->intersect(*cachedDictionaryIndices_);
+    if (cached->hasSelections()) {
+      context.ensureWritable(rows, type(), result);
+      result->copy(dictionaryCache_.get(), *cached, nullptr);
+    }
+  }
+  LocalSelectivityVector uncachedHolder(context, rows);
+  auto uncached = uncachedHolder.get();
+  VELOX_DCHECK(uncached != nullptr);
+  if (cachedDictionaryIndices_) {
+    uncached->deselect(*cachedDictionaryIndices_);
+  }
+  if (uncached->hasSelections()) {
+    // Fix finalSelection at "rows" if uncached rows is a strict subset to
+    // avoid losing values not in uncached rows that were copied earlier into
+    // "result" from the cached rows.
+    ScopedFinalSelectionSetter scopedFinalSelectionSetter(
+        context, &rows, uncached->countSelected() < rows.countSelected());
+
+    evalWithNulls(*uncached, context, result);
+    context.deselectErrors(*uncached);
+    context.exprSet()->addToMemo(this);
+    auto newCacheSize = uncached->end();
+
+    // dictionaryCache_ is valid only for cachedDictionaryIndices_. Hence, a
+    // safe call to BaseVector::ensureWritable must include all the rows not
+    // covered by cachedDictionaryIndices_. If BaseVector::ensureWritable is
+    // called only for a subset of rows not covered by
+    // cachedDictionaryIndices_, it will attempt to copy rows that are not
+    // valid leading to a crash.
+    LocalSelectivityVector allUncached(context, dictionaryCache_->size());
+    allUncached.get()->setAll();
+    allUncached.get()->deselect(*cachedDictionaryIndices_);
+    context.ensureWritable(*allUncached.get(), type(), dictionaryCache_);
+
+    if (cachedDictionaryIndices_->size() < newCacheSize) {
+      cachedDictionaryIndices_->resize(newCacheSize, false);
+    }
+
+    cachedDictionaryIndices_->select(*uncached);
+
+    // Resize the dictionaryCache_ to accommodate all the necessary rows.
+    if (dictionaryCache_->size() < uncached->end()) {
+      dictionaryCache_->resize(uncached->end());
+    }
+    dictionaryCache_->copy(result.get(), *uncached, nullptr);
+  }
+  context.releaseVector(base);
 }
 
 void Expr::setAllNulls(
@@ -1035,7 +1289,7 @@ void Expr::setAllNulls(
     result->addNulls(notNulls.get()->asRange().bits(), rows);
     return;
   }
-  result = BaseVector::createNullConstant(type(), rows.size(), context.pool());
+  result = BaseVector::createNullConstant(type(), rows.end(), context.pool());
 }
 
 namespace {
@@ -1062,6 +1316,8 @@ void computeIsAsciiForInputs(
         inputValues[index]->type()->kind() == TypeKind::VARCHAR) {
       auto* vector =
           inputValues[index]->template as<SimpleVector<StringView>>();
+
+      VELOX_CHECK(vector, inputValues[index]->toString());
       vector->computeAndSetIsAscii(rows);
     }
   }
@@ -1106,62 +1362,15 @@ std::optional<bool> computeIsAsciiForResult(
   return isAsciiSet ? std::optional(true) : std::nullopt;
 }
 
-/// Maintains a set of rows for evaluation and removes rows with
-/// nulls or errors as needed. Helps to avoid copying SelectivityVector in cases
-/// when evaluation doesn't encounter nulls or errors.
-class MutableRemainingRows {
- public:
-  /// @param rows Initial set of rows.
-  MutableRemainingRows(const SelectivityVector& rows, EvalCtx& context)
-      : context_{context}, rows_{&rows}, mutableRowsHolder_{context} {}
-
-  /// @return current set of rows which may be different from the initial set if
-  /// deselectNulls or deselectErrors were called.
-  const SelectivityVector& rows() const {
-    return *rows_;
+inline bool isPeelable(VectorEncoding::Simple encoding) {
+  switch (encoding) {
+    case VectorEncoding::Simple::CONSTANT:
+    case VectorEncoding::Simple::DICTIONARY:
+      return true;
+    default:
+      return false;
   }
-
-  /// Removes rows with nulls.
-  /// @return true if at least one row remains.
-  bool deselectNulls(const uint64_t* rawNulls) {
-    ensureMutableRemainingRows();
-    mutableRows_->deselectNulls(rawNulls, rows_->begin(), rows_->end());
-
-    return mutableRows_->hasSelections();
-  }
-
-  /// Removes rows with errors (as recorded in EvalCtx::errors).
-  /// @return true if at least one row remains.
-  bool deselectErrors() {
-    ensureMutableRemainingRows();
-    context_.deselectErrors(*mutableRows_);
-
-    return mutableRows_->hasSelections();
-  }
-
-  /// @return true if current set of rows might be different from the original
-  /// set of rows, which may happen if deselectNull() or deselectErrors() were
-  /// called. May return 'true' even if current set of rows is the same as
-  /// original set. Returns 'false' only if current set of rows is for sure the
-  /// same as original.
-  bool mayHaveChanged() const {
-    return mutableRows_ != nullptr && !mutableRows_->isAllSelected();
-  }
-
- private:
-  void ensureMutableRemainingRows() {
-    if (mutableRows_ == nullptr) {
-      mutableRows_ = mutableRowsHolder_.get(*rows_);
-      rows_ = mutableRows_;
-    }
-  }
-
-  EvalCtx& context_;
-  const SelectivityVector* rows_;
-
-  SelectivityVector* mutableRows_{nullptr};
-  LocalSelectivityVector mutableRowsHolder_;
-};
+}
 
 } // namespace
 
@@ -1170,8 +1379,7 @@ void Expr::evalAll(
     EvalCtx& context,
     VectorPtr& result) {
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
     return;
   }
 
@@ -1188,6 +1396,13 @@ void Expr::evalAll(
   }
 }
 
+bool Expr::throwArgumentErrors(const EvalCtx& context) const {
+  bool defaultNulls = vectorFunctionMetadata_.defaultNullBehavior;
+  return context.throwOnError() &&
+      (!defaultNulls ||
+       (supportsFlatNoNullsFastPath() && context.inputFlatNoNulls()));
+}
+
 void Expr::evalAllImpl(
     const SelectivityVector& rows,
     EvalCtx& context,
@@ -1199,38 +1414,34 @@ void Expr::evalAllImpl(
     return;
   }
   bool tryPeelArgs = deterministic_ ? true : false;
-  bool defaultNulls = vectorFunction_->isDefaultNullBehavior();
+  bool defaultNulls = vectorFunctionMetadata_.defaultNullBehavior;
 
   // Tracks what subset of rows shall un-evaluated inputs and current expression
   // evaluates. Initially points to rows.
   MutableRemainingRows remainingRows(rows, context);
-
-  inputValues_.resize(inputs_.size());
-  for (int32_t i = 0; i < inputs_.size(); ++i) {
-    inputs_[i]->eval(remainingRows.rows(), context, inputValues_[i]);
-    tryPeelArgs =
-        tryPeelArgs && PeeledEncoding::isPeelable(inputValues_[i]->encoding());
-
-    // Do not continue evaluation for rows with errors.
-    if (context.errors() && !remainingRows.deselectErrors()) {
-      // All rows are either null or have an error.
-      releaseInputValues(context);
-      setAllNulls(rows, context, result);
+  if (defaultNulls) {
+    if (!evalArgsDefaultNulls(
+            remainingRows,
+            [&](auto i) {
+              inputs_[i]->eval(remainingRows.rows(), context, inputValues_[i]);
+              tryPeelArgs =
+                  tryPeelArgs && isPeelable(inputValues_[i]->encoding());
+            },
+            context,
+            result)) {
       return;
     }
-
-    // Avoid subsequent computation on rows with known null output.
-    if (defaultNulls && inputValues_[i]->mayHaveNulls()) {
-      LocalDecodedVector decoded(
-          context, *inputValues_[i], remainingRows.rows());
-
-      if (auto* rawNulls = decoded->nulls()) {
-        if (!remainingRows.deselectNulls(rawNulls)) {
-          releaseInputValues(context);
-          setAllNulls(rows, context, result);
-          return;
-        }
-      }
+  } else {
+    if (!evalArgsWithNulls(
+            remainingRows,
+            [&](auto i) {
+              inputs_[i]->eval(remainingRows.rows(), context, inputValues_[i]);
+              tryPeelArgs =
+                  tryPeelArgs && isPeelable(inputValues_[i]->encoding());
+            },
+            context,
+            result)) {
+      return;
     }
   }
 
@@ -1241,24 +1452,11 @@ void Expr::evalAllImpl(
 
   // Write non-selected rows in remainingRows as nulls in the result if some
   // rows have been skipped.
-  if (remainingRows.mayHaveChanged()) {
+  if (remainingRows.hasChanged()) {
     addNulls(rows, remainingRows.rows().asRange().bits(), context, result);
   }
   releaseInputValues(context);
 }
-
-namespace {
-void setPeeledArg(
-    VectorPtr arg,
-    int32_t index,
-    int32_t numArgs,
-    std::vector<VectorPtr>& peeledArgs) {
-  if (peeledArgs.empty()) {
-    peeledArgs.resize(numArgs);
-  }
-  peeledArgs[index] = arg;
-}
-} // namespace
 
 bool Expr::applyFunctionWithPeeling(
     const SelectivityVector& applyRows,
@@ -1266,14 +1464,13 @@ bool Expr::applyFunctionWithPeeling(
     VectorPtr& result) {
   LocalDecodedVector localDecoded(context);
   LocalSelectivityVector newRowsHolder(context);
-  ScopedContextSaver saver;
   // Attempt peeling.
   std::vector<VectorPtr> peeledVectors;
-  auto peeledEncoding = PeeledEncoding::Peel(
+  auto peeledEncoding = PeeledEncoding::peel(
       inputValues_,
       applyRows,
       localDecoded,
-      vectorFunction_->isDefaultNullBehavior(),
+      vectorFunctionMetadata_.defaultNullBehavior,
       peeledVectors);
   if (!peeledEncoding) {
     return false;
@@ -1287,21 +1484,23 @@ bool Expr::applyFunctionWithPeeling(
   // pre-existing rows need to be preserved.
   auto newRows = peeledEncoding->translateToInnerRows(applyRows, newRowsHolder);
 
-  // Save context and set the peel.
-  context.saveAndReset(saver, applyRows);
-  context.setPeeledEncoding(peeledEncoding);
+  withContextSaver([&](ContextSaver& saver) {
+    // Save context and set the peel.
+    context.saveAndReset(saver, applyRows);
+    context.setPeeledEncoding(peeledEncoding);
 
-  // Apply the function.
-  VectorPtr peeledResult;
-  applyFunction(*newRows, context, peeledResult);
-  VectorPtr wrappedResult = context.getPeeledEncoding()->wrap(
-      this->type(), context.pool(), peeledResult, applyRows);
-  context.moveOrCopyResult(wrappedResult, applyRows, result);
+    // Apply the function.
+    VectorPtr peeledResult;
+    applyFunction(*newRows, context, peeledResult);
+    VectorPtr wrappedResult = context.getPeeledEncoding()->wrap(
+        this->type(), context.pool(), peeledResult, applyRows);
+    context.moveOrCopyResult(wrappedResult, applyRows, result);
 
-  // Recycle peeledResult if it's not owned by the result vector. Examples of
-  // when this can happen is when the result is a primitive constant vector, or
-  // when moveOrCopyResult copies wrappedResult content.
-  context.releaseVector(peeledResult);
+    // Recycle peeledResult if it's not owned by the result vector. Examples of
+    // when this can happen is when the result is a primitive constant vector,
+    // or when moveOrCopyResult copies wrappedResult content.
+    context.releaseVector(peeledResult);
+  });
 
   return true;
 }
@@ -1321,7 +1520,7 @@ void Expr::applyFunction(
 
   try {
     vectorFunction_->apply(rows, inputValues_, type(), context, result);
-  } catch (const VeloxException& ve) {
+  } catch (const VeloxException&) {
     throw;
   } catch (const std::exception& e) {
     VELOX_USER_FAIL(e.what());
@@ -1338,13 +1537,13 @@ void Expr::applyFunction(
         // should only apply when the UDF is buggy (hopefully rarely).
         VELOX_USER_FAIL(
             "Function neither returned results nor threw exception.");
-      } catch (const std::exception& e) {
+      } catch (const std::exception&) {
         context.setErrors(remainingRows.rows(), std::current_exception());
       }
     }
 
-    // Since result was empty, and either the function set errors for every row
-    // or we did above, set it to be all NULL.
+    // Since result was empty, and either the function set errors for every
+    // row or we did above, set it to be all NULL.
     result = BaseVector::createNullConstant(type(), rows.end(), context.pool());
   }
 
@@ -1374,8 +1573,8 @@ void printExprTree(
     std::unordered_map<const exec::Expr*, uint32_t>& uniqueExprs) {
   auto it = uniqueExprs.find(&expr);
   if (it != uniqueExprs.end()) {
-    // Common sub-expression. Print the full expression, but skip the stats. Add
-    // ID of the expression it duplicates.
+    // Common sub-expression. Print the full expression, but skip the stats.
+    // Add ID of the expression it duplicates.
     out << indent << expr.toString(true) << " -> " << expr.type()->toString();
     out << " [CSE #" << it->second << "]" << std::endl;
     return;
@@ -1454,11 +1653,99 @@ bool Expr::isConstant() const {
     return false;
   }
   for (auto& input : inputs_) {
-    if (!dynamic_cast<ConstantExpr*>(input.get())) {
+    if (!input->is<ConstantExpr>()) {
       return false;
     }
   }
   return true;
+}
+
+namespace {
+
+common::Subfield extractSubfield(
+    const Expr* expr,
+    const folly::F14FastMap<std::string, int32_t>& shadowedNames) {
+  std::vector<std::unique_ptr<common::Subfield::PathElement>> path;
+  for (;;) {
+    if (auto* ref = expr->as<FieldReference>()) {
+      const auto& name = ref->name();
+      // When the field name is empty string, it typically means that the field
+      // name was not set in the parent type.
+      if (name == "") {
+        expr = expr->inputs()[0].get();
+        continue;
+      }
+      path.push_back(std::make_unique<common::Subfield::NestedField>(name));
+      if (!ref->inputs().empty()) {
+        expr = ref->inputs()[0].get();
+        continue;
+      }
+      if (shadowedNames.count(name) > 0) {
+        return {};
+      }
+      std::reverse(path.begin(), path.end());
+      return common::Subfield(std::move(path));
+    }
+    if (!expr->vectorFunction()) {
+      return {};
+    }
+    auto* subscript =
+        dynamic_cast<const Subscript*>(expr->vectorFunction().get());
+    if (!subscript || !subscript->canPushdown()) {
+      return {};
+    }
+    auto* index = expr->inputs()[1]->as<ConstantExpr>();
+    if (!index) {
+      return {};
+    }
+    switch (index->value()->typeKind()) {
+      case TypeKind::TINYINT:
+        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
+            index->value()->as<ConstantVector<int8_t>>()->value()));
+        break;
+      case TypeKind::SMALLINT:
+        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
+            index->value()->as<ConstantVector<int16_t>>()->value()));
+        break;
+      case TypeKind::INTEGER:
+        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
+            index->value()->as<ConstantVector<int32_t>>()->value()));
+        break;
+      case TypeKind::BIGINT:
+        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
+            index->value()->as<ConstantVector<int64_t>>()->value()));
+        break;
+      case TypeKind::VARCHAR:
+        path.push_back(std::make_unique<common::Subfield::StringSubscript>(
+            index->value()->as<ConstantVector<StringView>>()->value()));
+        break;
+      default:
+        return {};
+    }
+    expr = expr->inputs()[0].get();
+  }
+}
+
+} // namespace
+
+void Expr::extractSubfieldsImpl(
+    folly::F14FastMap<std::string, int32_t>* shadowedNames,
+    std::vector<common::Subfield>* subfields) const {
+  auto subfield = extractSubfield(this, *shadowedNames);
+  if (subfield.valid()) {
+    subfields->push_back(std::move(subfield));
+    return;
+  }
+  for (auto& input : inputs_) {
+    input->extractSubfieldsImpl(shadowedNames, subfields);
+  }
+}
+
+std::vector<common::Subfield> Expr::extractSubfields() const {
+  folly::F14FastMap<std::string, int32_t> shadowedNames;
+  std::vector<common::Subfield> subfields;
+  extractSubfieldsImpl(&shadowedNames, &subfields);
+  return subfields;
 }
 
 ExprSet::ExprSet(
@@ -1469,7 +1756,7 @@ ExprSet::ExprSet(
   exprs_ = compileExpressions(sources, execCtx, this, enableConstantFolding);
   std::vector<FieldReference*> allDistinctFields;
   for (auto& expr : exprs_) {
-    mergeFields(
+    Expr::mergeFields(
         distinctFields_, multiplyReferencedFields_, expr->distinctFields());
   }
 }
@@ -1552,6 +1839,50 @@ std::string ExprSet::toString(bool compact) const {
   return out.str();
 }
 
+namespace {
+void printInputAndExprs(
+    const BaseVector* vector,
+    const std::vector<std::shared_ptr<Expr>>& exprs) {
+  const char* basePath =
+      FLAGS_velox_save_input_on_expression_any_failure_path.c_str();
+  if (strlen(basePath) == 0) {
+    basePath = FLAGS_velox_save_input_on_expression_system_failure_path.c_str();
+  }
+  if (strlen(basePath) == 0) {
+    return;
+  }
+  // Persist vector to disk
+  try {
+    auto dataPathOpt = common::generateTempFilePath(basePath, "vector");
+    if (!dataPathOpt.has_value()) {
+      return;
+    }
+    saveVectorToFile(vector, dataPathOpt.value().c_str());
+    LOG(ERROR) << "Input vector data: " << dataPathOpt.value();
+  } catch (std::exception& e) {
+    LOG(ERROR) << "Error serializing Input vector data: " << e.what();
+  }
+
+  try {
+    std::stringstream allSql;
+    for (int i = 0; i < exprs.size(); ++i) {
+      if (i > 0) {
+        allSql << ", ";
+      }
+      allSql << exprs[i]->toSql();
+    }
+    auto sqlPathOpt = common::generateTempFilePath(basePath, "allExprSql");
+    if (!sqlPathOpt.has_value()) {
+      return;
+    }
+    saveStringToFile(allSql.str(), sqlPathOpt.value().c_str());
+    LOG(ERROR) << "SQL expression: " << sqlPathOpt.value();
+  } catch (std::exception& e) {
+    LOG(ERROR) << "Error serializing SQL expression: " << e.what();
+  }
+}
+} // namespace
+
 void ExprSet::eval(
     int32_t begin,
     int32_t end,
@@ -1575,8 +1906,26 @@ void ExprSet::eval(
     context.ensureFieldLoaded(field->index(context), rows);
   }
 
+  if (FLAGS_velox_experimental_save_input_on_fatal_signal) {
+    auto other = process::GetThreadDebugInfo();
+    process::ThreadDebugInfo debugInfo;
+    if (other) {
+      debugInfo.queryId_ = other->queryId_;
+      debugInfo.taskId_ = other->taskId_;
+    }
+    debugInfo.callback_ = [&]() {
+      printInputAndExprs(context.row(), this->exprs());
+    };
+    process::ScopedThreadDebugInfo scopedDebugInfo(debugInfo);
+
+    for (int32_t i = begin; i < end; ++i) {
+      exprs_[i]->eval(rows, context, result[i], this);
+    }
+    return;
+  }
+
   for (int32_t i = begin; i < end; ++i) {
-    exprs_[i]->eval(rows, context, result[i], true /*topLevel*/);
+    exprs_[i]->eval(rows, context, result[i], this);
   }
 }
 
@@ -1633,4 +1982,23 @@ std::string printExprWithStats(const exec::ExprSet& exprSet) {
   }
   return out.str();
 }
+
+void SimpleExpressionEvaluator::evaluate(
+    exec::ExprSet* exprSet,
+    const SelectivityVector& rows,
+    const RowVector& input,
+    VectorPtr& result) {
+  EvalCtx context(ensureExecCtx(), exprSet, &input);
+  std::vector<VectorPtr> results = {result};
+  exprSet->eval(0, 1, true, rows, context, results);
+  result = results[0];
+}
+
+core::ExecCtx* SimpleExpressionEvaluator::ensureExecCtx() {
+  if (!execCtx_) {
+    execCtx_ = std::make_unique<core::ExecCtx>(pool_, queryCtx_);
+  }
+  return execCtx_.get();
+}
+
 } // namespace facebook::velox::exec

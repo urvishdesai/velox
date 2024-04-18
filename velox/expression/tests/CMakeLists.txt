@@ -12,48 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(velox_expression_test_utility ArgumentTypeFuzzer.cpp
-                                          FuzzerToolkit.cpp)
-
-target_link_libraries(velox_expression_test_utility velox_type
-                      velox_expression_functions gtest)
+add_subdirectory(utils)
 
 add_executable(
   velox_expression_test
   ArgumentTypeFuzzerTest.cpp
-  CustomTypeTest.cpp
-  ExprEncodingsTest.cpp
-  ExprTest.cpp
-  ExprToSubfieldFilterTest.cpp
-  ExprCompilerTest.cpp
-  EvalCtxTest.cpp
-  ExprStatsTest.cpp
+  ArrayViewTest.cpp
+  ArrayWriterTest.cpp
   CastExprTest.cpp
   CoalesceTest.cpp
+  ConjunctTest.cpp
   ConstantFlatVectorReaderTest.cpp
-  MapWriterTest.cpp
-  ArrayWriterTest.cpp
-  ReverseSignatureBinderTest.cpp
-  RowWriterTest.cpp
+  CustomTypeTest.cpp
+  ExprCompilerTest.cpp
+  ExprEncodingsTest.cpp
+  ExprStatsTest.cpp
+  ExprTest.cpp
+  ExprToSubfieldFilterTest.cpp
+  EvalCtxTest.cpp
   EvalSimplifiedTest.cpp
   FunctionCallToSpecialFormTest.cpp
-  SignatureBinderTest.cpp
-  SimpleFunctionTest.cpp
-  SimpleFunctionInitTest.cpp
-  SimpleFunctionCallNullFreeTest.cpp
-  SimpleFunctionPresetNullsTest.cpp
-  ArrayViewTest.cpp
-  StringWriterTest.cpp
-  ArrayWriterTest.cpp
-  StringWriterTest.cpp
-  MapViewTest.cpp
-  RowViewTest.cpp
   GenericViewTest.cpp
+  GenericWriterTest.cpp
+  Main.cpp
+  MapViewTest.cpp
+  MapWriterTest.cpp
+  PeeledEncodingTest.cpp
+  ReverseSignatureBinderTest.cpp
+  RowViewTest.cpp
+  RowWriterTest.cpp
+  SignatureBinderTest.cpp
+  SimpleFunctionCallNullFreeTest.cpp
+  SimpleFunctionInitTest.cpp
+  SimpleFunctionPresetNullsTest.cpp
+  SimpleFunctionTest.cpp
+  StringWriterTest.cpp
+  StringWriterTest.cpp
   TryExprTest.cpp
   VariadicViewTest.cpp
-  VectorReaderTest.cpp
-  GenericWriterTest.cpp
-  PeeledEncodingTest.cpp)
+  VectorReaderTest.cpp)
 
 add_test(
   NAME velox_expression_test
@@ -80,10 +77,10 @@ target_link_libraries(
   gtest
   gtest_main
   gmock
-  ${FOLLY_WITH_DEPENDENCIES}
+  Folly::folly
   gflags::gflags
   glog::glog
-  ${FMT})
+  fmt::fmt)
 
 add_library(velox_expression_verifier ExpressionVerifier.cpp)
 
@@ -91,7 +88,8 @@ target_link_libraries(
   velox_expression_verifier velox_vector_test_lib velox_vector_fuzzer
   velox_type velox_expression_test_utility)
 
-add_library(velox_expression_fuzzer ExpressionFuzzer.cpp FuzzerRunner.cpp)
+add_library(velox_expression_fuzzer ExpressionFuzzer.cpp FuzzerRunner.cpp
+                                    ExpressionFuzzerVerifier.cpp)
 
 target_link_libraries(
   velox_expression_fuzzer
@@ -114,8 +112,9 @@ target_link_libraries(
   gtest_main)
 
 add_library(velox_expression_runner ExpressionRunner.cpp)
-target_link_libraries(velox_expression_runner velox_expression_verifier
-                      velox_functions_prestosql velox_parse_parser gtest)
+target_link_libraries(
+  velox_expression_runner velox_expression_verifier velox_functions_prestosql
+  velox_functions_spark velox_parse_parser gtest)
 
 add_executable(velox_expression_runner_test ExpressionRunnerTest.cpp)
 target_link_libraries(

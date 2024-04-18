@@ -17,6 +17,8 @@
 #include "velox/functions/lib/RegistrationHelpers.h"
 #include "velox/functions/prestosql/Arithmetic.h"
 #include "velox/functions/prestosql/Bitwise.h"
+#include "velox/functions/prestosql/DecimalFunctions.h"
+#include "velox/functions/prestosql/Probability.h"
 #include "velox/functions/prestosql/Rand.h"
 
 namespace facebook::velox::functions {
@@ -24,14 +26,58 @@ namespace facebook::velox::functions {
 namespace {
 void registerSimpleFunctions(const std::string& prefix) {
   registerBinaryFloatingPoint<PlusFunction>({prefix + "plus"});
+  registerFunction<
+      PlusFunction,
+      IntervalDayTime,
+      IntervalDayTime,
+      IntervalDayTime>({prefix + "plus"});
   registerBinaryFloatingPoint<MinusFunction>({prefix + "minus"});
+  registerFunction<
+      MinusFunction,
+      IntervalDayTime,
+      IntervalDayTime,
+      IntervalDayTime>({prefix + "minus"});
   registerBinaryFloatingPoint<MultiplyFunction>({prefix + "multiply"});
+  registerFunction<MultiplyFunction, IntervalDayTime, IntervalDayTime, int64_t>(
+      {prefix + "multiply"});
+  registerFunction<MultiplyFunction, IntervalDayTime, int64_t, IntervalDayTime>(
+      {prefix + "multiply"});
+  registerFunction<
+      IntervalMultiplyFunction,
+      IntervalDayTime,
+      IntervalDayTime,
+      double>({prefix + "multiply"});
+  registerFunction<
+      IntervalMultiplyFunction,
+      IntervalDayTime,
+      double,
+      IntervalDayTime>({prefix + "multiply"});
   registerBinaryFloatingPoint<DivideFunction>({prefix + "divide"});
+  registerFunction<
+      IntervalDivideFunction,
+      IntervalDayTime,
+      IntervalDayTime,
+      double>({prefix + "divide"});
   registerBinaryFloatingPoint<ModulusFunction>({prefix + "mod"});
   registerUnaryNumeric<CeilFunction>({prefix + "ceil", prefix + "ceiling"});
   registerUnaryNumeric<FloorFunction>({prefix + "floor"});
+
   registerUnaryNumeric<AbsFunction>({prefix + "abs"});
+  registerFunction<
+      DecimalAbsFunction,
+      LongDecimal<P1, S1>,
+      LongDecimal<P1, S1>>({prefix + "abs"});
+  registerFunction<
+      DecimalAbsFunction,
+      ShortDecimal<P1, S1>,
+      ShortDecimal<P1, S1>>({prefix + "abs"});
+
   registerUnaryFloatingPoint<NegateFunction>({prefix + "negate"});
+  registerFunction<NegateFunction, LongDecimal<P1, S1>, LongDecimal<P1, S1>>(
+      {prefix + "negate"});
+  registerFunction<NegateFunction, ShortDecimal<P1, S1>, ShortDecimal<P1, S1>>(
+      {prefix + "negate"});
+
   registerFunction<RadiansFunction, double, double>({prefix + "radians"});
   registerFunction<DegreesFunction, double, double>({prefix + "degrees"});
   registerUnaryNumeric<RoundFunction>({prefix + "round"});
@@ -90,6 +136,7 @@ void registerSimpleFunctions(const std::string& prefix) {
   registerFunction<IsNanFunction, bool, double>({prefix + "is_nan"});
   registerFunction<NanFunction, double>({prefix + "nan"});
   registerFunction<RandFunction, double>({prefix + "rand", prefix + "random"});
+  registerUnaryIntegral<RandFunction>({prefix + "rand", prefix + "random"});
   registerFunction<FromBaseFunction, int64_t, Varchar, int64_t>(
       {prefix + "from_base"});
   registerFunction<ToBaseFunction, Varchar, int64_t, int64_t>(
@@ -99,6 +146,49 @@ void registerSimpleFunctions(const std::string& prefix) {
   registerFunction<TruncateFunction, double, double>({prefix + "truncate"});
   registerFunction<TruncateFunction, double, double, int32_t>(
       {prefix + "truncate"});
+  registerFunction<BetaCDFFunction, double, double, double, double>(
+      {prefix + "beta_cdf"});
+  registerFunction<NormalCDFFunction, double, double, double, double>(
+      {prefix + "normal_cdf"});
+  registerFunction<BinomialCDFFunction, double, int64_t, double, int64_t>(
+      {prefix + "binomial_cdf"});
+  registerFunction<BinomialCDFFunction, double, int32_t, double, int32_t>(
+      {prefix + "binomial_cdf"});
+  registerFunction<CauchyCDFFunction, double, double, double, double>(
+      {prefix + "cauchy_cdf"});
+  registerFunction<ChiSquaredCDFFunction, double, double, double>(
+      {prefix + "chi_squared_cdf"});
+  registerFunction<FCDFFunction, double, double, double, double>(
+      {prefix + "f_cdf"});
+  registerFunction<InverseBetaCDFFunction, double, double, double, double>(
+      {prefix + "inverse_beta_cdf"});
+  registerFunction<PoissonCDFFunction, double, double, int64_t>(
+      {prefix + "poisson_cdf"});
+  registerFunction<PoissonCDFFunction, double, double, int32_t>(
+      {prefix + "poisson_cdf"});
+  registerFunction<GammaCDFFunction, double, double, double, double>(
+      {prefix + "gamma_cdf"});
+  registerFunction<LaplaceCDFFunction, double, double, double, double>(
+      {prefix + "laplace_cdf"});
+  registerFunction<
+      WilsonIntervalUpperFunction,
+      double,
+      int64_t,
+      int64_t,
+      double>({prefix + "wilson_interval_upper"});
+  registerFunction<
+      WilsonIntervalLowerFunction,
+      double,
+      int64_t,
+      int64_t,
+      double>({prefix + "wilson_interval_lower"});
+  registerFunction<
+      CosineSimilarityFunction,
+      double,
+      Map<Varchar, double>,
+      Map<Varchar, double>>({prefix + "cosine_similarity"});
+  registerFunction<WeibullCDFFunction, double, double, double, double>(
+      {prefix + "weibull_cdf"});
 }
 
 } // namespace
@@ -106,10 +196,13 @@ void registerSimpleFunctions(const std::string& prefix) {
 void registerArithmeticFunctions(const std::string& prefix = "") {
   registerSimpleFunctions(prefix);
   VELOX_REGISTER_VECTOR_FUNCTION(udf_not, prefix + "not");
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_decimal_add, prefix + "plus");
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_decimal_sub, prefix + "minus");
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_decimal_mul, prefix + "multiply");
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_decimal_div, prefix + "divide");
+
+  registerDecimalPlus(prefix);
+  registerDecimalMinus(prefix);
+  registerDecimalMultiply(prefix);
+  registerDecimalDivide(prefix);
+  registerDecimalFloor(prefix);
+  registerDecimalRound(prefix);
 }
 
 } // namespace facebook::velox::functions

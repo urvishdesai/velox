@@ -120,7 +120,11 @@ void gatherCopy(
 // per event. This function returns true for such metrics.
 bool shouldAggregateRuntimeMetric(const std::string& name) {
   static const folly::F14FastSet<std::string> metricNames{
-      "dataSourceWallNanos", "dataSourceLazyWallNanos", "queuedWallNanos"};
+      "dataSourceAddSplitWallNanos",
+      "dataSourceReadWallNanos",
+      "dataSourceLazyWallNanos",
+      "queuedWallNanos",
+      "flushTimes"};
   if (metricNames.contains(name)) {
     return true;
   }
@@ -143,7 +147,7 @@ void deselectRowsWithNulls(
     auto& decoded = hashers[i]->decodedVector();
     if (decoded.mayHaveNulls()) {
       anyChange = true;
-      const auto* nulls = hashers[i]->decodedVector().nulls();
+      const auto* nulls = hashers[i]->decodedVector().nulls(&rows);
       bits::andBits(rows.asMutableRange().bits(), nulls, 0, rows.end());
     }
   }
@@ -216,7 +220,7 @@ vector_size_t processEncodedFilterResults(
   DecodedVector& decoded = filterEvalCtx.decodedResult;
   decoded.decode(*filterResult.get(), rows);
   auto values = decoded.data<uint64_t>();
-  auto nulls = decoded.nulls();
+  auto nulls = decoded.nulls(&rows);
   auto indices = decoded.indices();
 
   vector_size_t passed = 0;
@@ -382,4 +386,39 @@ void aggregateOperatorRuntimeStats(
   }
 }
 
+folly::Range<vector_size_t*> initializeRowNumberMapping(
+    BufferPtr& mapping,
+    vector_size_t size,
+    memory::MemoryPool* pool) {
+  if (!mapping || !mapping->unique() ||
+      mapping->size() < sizeof(vector_size_t) * size) {
+    mapping = allocateIndices(size, pool);
+  }
+  return folly::Range(mapping->asMutable<vector_size_t>(), size);
+}
+
+void projectChildren(
+    std::vector<VectorPtr>& projectedChildren,
+    const RowVectorPtr& src,
+    const std::vector<IdentityProjection>& projections,
+    int32_t size,
+    const BufferPtr& mapping) {
+  projectChildren(
+      projectedChildren, src->children(), projections, size, mapping);
+}
+
+void projectChildren(
+    std::vector<VectorPtr>& projectedChildren,
+    const std::vector<VectorPtr>& src,
+    const std::vector<IdentityProjection>& projections,
+    int32_t size,
+    const BufferPtr& mapping) {
+  for (auto [inputChannel, outputChannel] : projections) {
+    if (outputChannel >= projectedChildren.size()) {
+      projectedChildren.resize(outputChannel + 1);
+    }
+    projectedChildren[outputChannel] =
+        wrapChild(size, mapping, src[inputChannel]);
+  }
+}
 } // namespace facebook::velox::exec

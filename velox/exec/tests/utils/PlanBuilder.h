@@ -19,6 +19,7 @@
 #include <velox/core/PlanFragment.h>
 #include <velox/core/PlanNode.h>
 #include "velox/common/memory/Memory.h"
+#include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/parse/ExpressionsParser.h"
 #include "velox/parse/PlanNodeIdGenerator.h"
 
@@ -104,10 +105,17 @@ class PlanBuilder {
   /// @param remainingFilter SQL expression for the additional conjunct. May
   /// include multiple columns and SQL functions. The remainingFilter is AND'ed
   /// with all the subfieldFilters.
+  /// @param dataColumns can be different from 'outputType' for the purposes
+  /// of testing queries using missing columns. It is used, if specified, for
+  /// parseExpr call and as 'dataColumns' for the TableHandle. You supply more
+  /// types (for all columns) in this argument as opposed to 'outputType', where
+  /// you define the output types only. See 'missingColumns' test in
+  /// 'TableScanTest'.
   PlanBuilder& tableScan(
       const RowTypePtr& outputType,
       const std::vector<std::string>& subfieldFilters = {},
-      const std::string& remainingFilter = "");
+      const std::string& remainingFilter = "",
+      const RowTypePtr& dataColumns = nullptr);
 
   /// Add a TableScanNode to scan a Hive table.
   ///
@@ -124,26 +132,19 @@ class PlanBuilder {
   /// include multiple columns and SQL functions. Should use column name
   /// aliases, not column names in the files. The remainingFilter is AND'ed
   /// with all the subfieldFilters.
+  /// @param dataColumns can be different from 'outputType' for the purposes
+  /// of testing queries using missing columns. It is used, if specified, for
+  /// parseExpr call and as 'dataColumns' for the TableHandle. You supply more
+  /// types (for all columns) in this argument as opposed to 'outputType', where
+  /// you define the output types only. See 'missingColumns' test in
+  /// 'TableScanTest'.
   PlanBuilder& tableScan(
       const std::string& tableName,
       const RowTypePtr& outputType,
       const std::unordered_map<std::string, std::string>& columnAliases = {},
       const std::vector<std::string>& subfieldFilters = {},
-      const std::string& remainingFilter = "");
-
-  /// Add a TableScanNode using a connector-specific table handle and
-  /// assignments. Supports any connector, not just Hive connector.
-  ///
-  /// @param outputType List of column names and types to project out. Column
-  /// names should match the keys in the 'assignments' map. The 'assignments'
-  /// map may contain more columns then 'outputType' if some columns are only
-  /// used by pushed-down filters.
-  PlanBuilder& tableScan(
-      const RowTypePtr& outputType,
-      const std::shared_ptr<connector::ConnectorTableHandle>& tableHandle,
-      const std::unordered_map<
-          std::string,
-          std::shared_ptr<connector::ColumnHandle>>& assignments);
+      const std::string& remainingFilter = "",
+      const RowTypePtr& dataColumns = nullptr);
 
   /// Add a TableScanNode to scan a TPC-H table.
   ///
@@ -151,10 +152,130 @@ class PlanBuilder {
   /// and scale factor.
   /// @param columnNames The columns to be returned from that table.
   /// @param scaleFactor The TPC-H scale factor.
-  PlanBuilder& tableScan(
+  PlanBuilder& tpchTableScan(
       tpch::Table table,
       std::vector<std::string>&& columnNames,
       double scaleFactor = 1);
+
+  /// Helper class to build a custom TableScanNode.
+  /// Uses a planBuilder instance to get the next plan id, memory pool, and
+  /// parse options.
+  class TableScanBuilder {
+   public:
+    TableScanBuilder(PlanBuilder& builder) : planBuilder_(builder) {}
+
+    /// @param tableName The name of the table to scan.
+    TableScanBuilder& tableName(std::string tableName) {
+      tableName_ = std::move(tableName);
+      return *this;
+    }
+
+    /// @param connectorId The id of the connector to scan.
+    TableScanBuilder& connectorId(std::string connectorId) {
+      connectorId_ = std::move(connectorId);
+      return *this;
+    }
+
+    /// @param outputType List of column names and types to read from the table.
+    TableScanBuilder& outputType(RowTypePtr outputType) {
+      outputType_ = std::move(outputType);
+      return *this;
+    }
+
+    /// @param subfieldFilters A list of SQL expressions for the range filters
+    /// to apply to individual columns. Supported filters are: column <= value,
+    /// column < value, column >= value, column > value, column = value, column
+    /// IN (v1, v2,.. vN), column < v1 OR column >= v2.
+    TableScanBuilder& subfieldFilters(
+        std::vector<std::string> subfieldFilters) {
+      subfieldFilters_ = std::move(subfieldFilters);
+      return *this;
+    }
+
+    /// @param subfieldFilter A SQL expression for the range filter
+    /// to apply to an individual column. Supported filters are: column <=
+    /// value, column < value, column >= value, column > value, column = value,
+    /// column IN (v1, v2,.. vN), column < v1 OR column >= v2.
+    TableScanBuilder& subfieldFilter(std::string subfieldFilter) {
+      subfieldFilters_.emplace_back(std::move(subfieldFilter));
+      return *this;
+    }
+
+    /// @param remainingFilter SQL expression for the additional conjunct. May
+    /// include multiple columns and SQL functions. The remainingFilter is
+    /// AND'ed with all the subfieldFilters.
+    TableScanBuilder& remainingFilter(std::string remainingFilter) {
+      remainingFilter_ = std::move(remainingFilter);
+      return *this;
+    }
+
+    /// @param dataColumns can be different from 'outputType' for the purposes
+    /// of testing queries using missing columns. It is used, if specified, for
+    /// parseExpr call and as 'dataColumns' for the TableHandle. You supply more
+    /// types (for all columns) in this argument as opposed to 'outputType',
+    /// where you define the output types only. See 'missingColumns' test in
+    /// 'TableScanTest'.
+    TableScanBuilder& dataColumns(RowTypePtr dataColumns) {
+      dataColumns_ = std::move(dataColumns);
+      return *this;
+    }
+
+    /// @param columnAliases Optional aliases for the column names. The key is
+    /// the alias (name in 'outputType'), value is the name in the files.
+    TableScanBuilder& columnAliases(
+        std::unordered_map<std::string, std::string> columnAliases) {
+      columnAliases_ = std::move(columnAliases);
+      return *this;
+    }
+
+    /// @param tableHandle Optional tableHandle. Other builder arguments such as
+    /// the subfieldFilters and remainingFilter will be ignored.
+    TableScanBuilder& tableHandle(
+        std::shared_ptr<connector::ConnectorTableHandle> tableHandle) {
+      tableHandle_ = std::move(tableHandle);
+      return *this;
+    }
+
+    /// @param assignments Optional ColumnHandles.
+    /// outputType names should match the keys in the 'assignments' map. The
+    /// 'assignments' map may contain more columns than 'outputType' if some
+    /// columns are only used by pushed-down filters.
+    TableScanBuilder& assignments(
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<connector::ColumnHandle>> assignments) {
+      assignments_ = std::move(assignments);
+      return *this;
+    }
+
+    /// Stop the TableScanBuilder.
+    PlanBuilder& endTableScan() {
+      planBuilder_.planNode_ = build(planBuilder_.nextPlanNodeId());
+      return planBuilder_;
+    }
+
+   private:
+    /// Build the plan node TableScanNode.
+    core::PlanNodePtr build(core::PlanNodeId id);
+
+    PlanBuilder& planBuilder_;
+    std::string tableName_{"hive_table"};
+    std::string connectorId_{"test-hive"};
+    RowTypePtr outputType_;
+    std::vector<std::string> subfieldFilters_;
+    std::string remainingFilter_;
+    RowTypePtr dataColumns_;
+    std::unordered_map<std::string, std::string> columnAliases_;
+    std::shared_ptr<connector::ConnectorTableHandle> tableHandle_;
+    std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
+        assignments_;
+  };
+
+  /// Start a TableScanBuilder.
+  TableScanBuilder& startTableScan() {
+    tableScanBuilder_.reset(new TableScanBuilder(*this));
+    return *tableScanBuilder_;
+  }
 
   /// Add a ValuesNode using specified data.
   ///
@@ -213,6 +334,18 @@ class PlanBuilder {
   /// will produce projected columns named sum_ab, c and p2.
   PlanBuilder& project(const std::vector<std::string>& projections);
 
+  /// Add a ProjectNode to keep all existing columns and append more columns
+  /// using specified expressions.
+  /// @param newColumns A list of one or more expressions to use for computing
+  /// additional columns.
+  PlanBuilder& appendColumns(const std::vector<std::string>& newColumns);
+
+  /// Variation of project that takes untyped expressions.  Used for access
+  /// deeply nested types, in which case Duck DB often fails to parse or infer
+  /// the type.
+  PlanBuilder& projectExpressions(
+      const std::vector<std::shared_ptr<const core::IExpr>>& projections);
+
   /// Similar to project() except 'optionalProjections' could be empty and the
   /// function will skip creating a ProjectNode in that case.
   PlanBuilder& optionalProject(
@@ -227,36 +360,83 @@ class PlanBuilder {
   /// function will skip creating a FilterNode in that case.
   PlanBuilder& optionalFilter(const std::string& optionalFilter);
 
-  /// Adds a TableWriteNode.
+  /// Adds a TableWriteNode to write all input columns into an un-partitioned
+  /// un-bucketed Hive table without compression.
   ///
-  /// @param inputColumns A subset of input columns to write.
-  /// @param tableColumnNames Column names in the target table corresponding to
-  /// inputColumns. The names may or may not match. tableColumnNames[i]
-  /// corresponds to inputColumns[i].
-  /// @param insertHandle Connector-specific table handle.
-  /// @param rowCountColumnName The name of the output column containing the
-  /// number of rows written.
+  /// @param outputDirectoryPath Path to a directory to write data to.
+  /// @param fileFormat File format to use for the written data.
+  /// @param aggregates Aggregations for column statistics collection during
+  /// write, supported aggregation types vary for different column types.
+  /// For example:
+  /// Boolean: count, countIf.
+  /// NumericType/Date/Timestamp: min, max, approx_distinct, count.
+  /// Varchar: count, approx_distinct, sum_data_size_for_stats,
+  /// max_data_size_for_stats.
   PlanBuilder& tableWrite(
-      const RowTypePtr& inputColumns,
-      const std::vector<std::string>& tableColumnNames,
-      const std::shared_ptr<core::InsertTableHandle>& insertHandle,
-      connector::CommitStrategy commitStrategy =
-          connector::CommitStrategy::kNoCommit,
-      const std::string& rowCountColumnName = "rowCount");
+      const std::string& outputDirectoryPath,
+      const dwio::common::FileFormat fileFormat =
+          dwio::common::FileFormat::DWRF,
+      const std::vector<std::string>& aggregates = {});
 
-  /// Add a TableWriteNode assuming that input columns match the source node
-  /// columns in order.
+  /// Adds a TableWriteNode to write all input columns into a partitioned Hive
+  /// table without compression.
   ///
-  /// @param tableColumnNames Column names in the target table.
-  /// @param insertHandle Connector-specific table handle.
-  /// @param rowCountColumnName The name of the output column containing the
-  /// number of rows written.
+  /// @param outputDirectoryPath Path to a directory to write data to.
+  /// @param partitionBy Specifies the partition key columns.
+  /// @param fileFormat File format to use for the written data.
+  /// @param aggregates Aggregations for column statistics collection during
+  /// write.
   PlanBuilder& tableWrite(
-      const std::vector<std::string>& tableColumnNames,
-      const std::shared_ptr<core::InsertTableHandle>& insertHandle,
-      connector::CommitStrategy commitStrategy =
-          connector::CommitStrategy::kNoCommit,
-      const std::string& rowCountColumnName = "rowCount");
+      const std::string& outputDirectoryPath,
+      const std::vector<std::string>& partitionBy,
+      const dwio::common::FileFormat fileFormat =
+          dwio::common::FileFormat::DWRF,
+      const std::vector<std::string>& aggregates = {});
+
+  /// Adds a TableWriteNode to write all input columns into a non-sorted
+  /// bucketed Hive table without compression.
+  ///
+  /// @param outputDirectoryPath Path to a directory to write data to.
+  /// @param partitionBy Specifies the partition key columns.
+  /// @param bucketCount Specifies the bucket count.
+  /// @param bucketedBy Specifies the bucket by columns.
+  /// @param fileFormat File format to use for the written data.
+  /// @param aggregates Aggregations for column statistics collection during
+  /// write.
+  PlanBuilder& tableWrite(
+      const std::string& outputDirectoryPath,
+      const std::vector<std::string>& partitionBy,
+      int32_t bucketCount,
+      const std::vector<std::string>& bucketedBy,
+      const dwio::common::FileFormat fileFormat =
+          dwio::common::FileFormat::DWRF,
+      const std::vector<std::string>& aggregates = {});
+
+  /// Adds a TableWriteNode to write all input columns into a sorted bucket Hive
+  /// table without compression.
+  ///
+  /// @param outputDirectoryPath Path to a directory to write data to.
+  /// @param partitionBy Specifies the partition key columns.
+  /// @param bucketCount Specifies the bucket count.
+  /// @param bucketedBy Specifies the bucket by columns.
+  /// @param sortBy Specifies the sort by columns.
+  /// @param fileFormat File format to use for the written data.
+  /// @param aggregates Aggregations for column statistics collection during
+  /// write.
+  PlanBuilder& tableWrite(
+      const std::string& outputDirectoryPath,
+      const std::vector<std::string>& partitionBy,
+      int32_t bucketCount,
+      const std::vector<std::string>& bucketedBy,
+      const std::vector<std::string>& sortBy,
+      const dwio::common::FileFormat fileFormat =
+          dwio::common::FileFormat::DWRF,
+      const std::vector<std::string>& aggregates = {},
+      const std::string& connectorId = "test-hive");
+
+  /// Add a TableWriteMergeNode.
+  PlanBuilder& tableWriteMerge(
+      const std::shared_ptr<core::AggregationNode>& aggregationNode = nullptr);
 
   /// Add an AggregationNode representing partial aggregation with the
   /// specified grouping keys, aggregates and optional masks.
@@ -299,16 +479,11 @@ class PlanBuilder {
   /// Add final aggregation plan node using specified grouping keys, aggregate
   /// expressions and their types.
   ///
-  /// @param resultTypes Optional list of result types for the aggregates. Use
-  /// it to specify the result types for aggregates which cannot infer result
-  /// type solely from the types of the intermediate results. 'resultTypes' can
-  /// be empty or have fewer elements than 'aggregates'. Elements that are
-  /// present must be aligned with 'aggregates' though, e.g. resultTypes[i]
-  /// specifies the result type for aggregates[i].
+  /// @param rawInputTypes Raw input types for the aggregate functions.
   PlanBuilder& finalAggregation(
       const std::vector<std::string>& groupingKeys,
       const std::vector<std::string>& aggregates,
-      const std::vector<TypePtr>& resultTypes) {
+      const std::vector<std::vector<TypePtr>>& rawInputTypes) {
     return aggregation(
         groupingKeys,
         {},
@@ -316,7 +491,7 @@ class PlanBuilder {
         {},
         core::AggregationNode::Step::kFinal,
         false,
-        resultTypes);
+        rawInputTypes);
   }
 
   /// Add intermediate aggregation plan node to match the current partial
@@ -329,16 +504,14 @@ class PlanBuilder {
   /// aggregate expressions and their types.
   PlanBuilder& intermediateAggregation(
       const std::vector<std::string>& groupingKeys,
-      const std::vector<std::string>& aggregates,
-      const std::vector<TypePtr>& resultTypes) {
+      const std::vector<std::string>& aggregates) {
     return aggregation(
         groupingKeys,
         {},
         aggregates,
         {},
         core::AggregationNode::Step::kIntermediate,
-        false,
-        resultTypes);
+        false);
   }
 
   /// Add a single aggregation plan node using specified grouping keys and
@@ -373,19 +546,14 @@ class PlanBuilder {
   /// @param step Aggregation step: partial, final, intermediate or single.
   /// @param ignoreNullKeys Boolean indicating whether to skip input rows where
   /// one of the grouping keys is null.
-  /// @param resultTypes Optional list of aggregate result types. Must be
-  /// specified for intermediate and final aggregations where it is not possible
-  /// to infer the result types based on input types. Not needed for partial and
-  /// single aggregations.
   PlanBuilder& aggregation(
       const std::vector<std::string>& groupingKeys,
       const std::vector<std::string>& aggregates,
       const std::vector<std::string>& masks,
       core::AggregationNode::Step step,
-      bool ignoreNullKeys,
-      const std::vector<TypePtr>& resultTypes = {}) {
+      bool ignoreNullKeys) {
     return aggregation(
-        groupingKeys, {}, aggregates, masks, step, ignoreNullKeys, resultTypes);
+        groupingKeys, {}, aggregates, masks, step, ignoreNullKeys);
   }
 
   /// Same as above, but also allows to specify a subset of grouping keys on
@@ -400,8 +568,16 @@ class PlanBuilder {
       const std::vector<std::string>& aggregates,
       const std::vector<std::string>& masks,
       core::AggregationNode::Step step,
-      bool ignoreNullKeys,
-      const std::vector<TypePtr>& resultTypes = {});
+      bool ignoreNullKeys) {
+    return aggregation(
+        groupingKeys,
+        preGroupedKeys,
+        aggregates,
+        masks,
+        step,
+        ignoreNullKeys,
+        {});
+  }
 
   /// A convenience method to create partial aggregation plan node for the case
   /// where input is clustered on all grouping keys.
@@ -421,15 +597,13 @@ class PlanBuilder {
   /// where input is clustered on all grouping keys.
   PlanBuilder& finalStreamingAggregation(
       const std::vector<std::string>& groupingKeys,
-      const std::vector<std::string>& aggregates,
-      const std::vector<TypePtr>& resultTypes = {}) {
+      const std::vector<std::string>& aggregates) {
     return streamingAggregation(
         groupingKeys,
         aggregates,
         {},
         core::AggregationNode::Step::kFinal,
-        false,
-        resultTypes);
+        false);
   }
 
   /// Add an AggregationNode assuming input is clustered on all grouping keys.
@@ -438,16 +612,42 @@ class PlanBuilder {
       const std::vector<std::string>& aggregates,
       const std::vector<std::string>& masks,
       core::AggregationNode::Step step,
-      bool ignoreNullKeys,
-      const std::vector<TypePtr>& resultTypes = {});
+      bool ignoreNullKeys);
 
-  /// Add a GroupIdNode using the specified grouping sets, aggregation inputs
-  /// and a groupId column name. And create GroupIdNode plan node with grouping
-  /// keys appearing in the output in the order they appear in 'groupingSets'.
+  /// Add a GroupIdNode using the specified grouping keys, grouping sets,
+  /// aggregation inputs and a groupId column name.
+  /// The grouping keys can specify aliases if an input column is mapped
+  /// to an output column with a different name.
+  /// e.g. Grouping keys {"k1", "k1 as k2"} means there are 2 grouping keys:
+  /// the input column k1 and output column k2 which is an alias of column k1.
+  /// Grouping sets using above grouping keys use the output column aliases.
+  /// e.g. Grouping sets in the above case could be {{"k1"}, {"k2"}, {}}
+  /// The GroupIdNode output columns have grouping keys in the order specified
+  /// in groupingKeys variable.
   PlanBuilder& groupId(
+      const std::vector<std::string>& groupingKeys,
       const std::vector<std::vector<std::string>>& groupingSets,
       const std::vector<std::string>& aggregationInputs,
       std::string groupIdName = "group_id");
+
+  /// Add an ExpandNode using specified projections. See comments for
+  /// ExpandNode class for description of this plan node.
+  ///
+  /// @param projections A list of projection expressions. Each expression is
+  /// either a column name, null or non-null constant.
+  ///
+  /// For example,
+  ///
+  ///     .expand(
+  ///            {{"k1", "null:: bigint k2", "a", "b", "0 as gid"}, //
+  ///            Column name will be extracted from the first projection. If the
+  ///            column is null, it is also necessary to specify the column
+  ///            type.
+  ///             {"k1", "null", "a", "b", "1"},
+  ///             {"null", "null", "a", "b", "2"}})
+  ///
+  ///
+  PlanBuilder& expand(const std::vector<std::vector<std::string>>& projections);
 
   /// Add a LocalMergeNode using specified ORDER BY clauses.
   ///
@@ -460,6 +660,10 @@ class PlanBuilder {
   PlanBuilder& localMerge(
       const std::vector<std::string>& keys,
       std::vector<core::PlanNodePtr> sources);
+
+  /// A convenience method to add a LocalMergeNode with a single source (the
+  /// current plan node).
+  PlanBuilder& localMerge(const std::vector<std::string>& keys);
 
   /// Adds an OrderByNode using specified ORDER BY clauses.
   ///
@@ -490,7 +694,7 @@ class PlanBuilder {
   /// @param isPartial Boolean indicating whether the limit node is partial or
   /// final. Partial limit can run multi-threaded. Final limit must run
   /// single-threaded.
-  PlanBuilder& limit(int32_t offset, int32_t count, bool isPartial);
+  PlanBuilder& limit(int64_t offset, int64_t count, bool isPartial);
 
   /// Add an EnforceSingleRowNode to ensure input has at most one row at
   /// runtime.
@@ -535,7 +739,15 @@ class PlanBuilder {
       int numPartitions,
       const std::vector<std::string>& outputLayout = {});
 
-  /// Add a PartitionedOutputNode to broadcast the input data.
+  /// Same as above, but allows to provide custom partition function.
+  PlanBuilder& partitionedOutput(
+      const std::vector<std::string>& keys,
+      int numPartitions,
+      bool replicateNullsAndAny,
+      core::PartitionFunctionSpecPtr partitionFunctionSpec,
+      const std::vector<std::string>& outputLayout = {});
+
+  /// Adds a PartitionedOutputNode to broadcast the input data.
   ///
   /// @param outputLayout Optional output layout in case it is different then
   /// the input. Output columns may appear in different order from the input,
@@ -544,7 +756,11 @@ class PlanBuilder {
   PlanBuilder& partitionedOutputBroadcast(
       const std::vector<std::string>& outputLayout = {});
 
-  /// Add a LocalPartitionNode to hash-partition the input on the specified
+  /// Adds a PartitionedOutputNode to put data into arbitrary buffer.
+  PlanBuilder& partitionedOutputArbitrary(
+      const std::vector<std::string>& outputLayout = {});
+
+  /// Adds a LocalPartitionNode to hash-partition the input on the specified
   /// keys using exec::HashPartitionFunction. Number of partitions is determined
   /// at runtime based on parallelism of the downstream pipeline.
   ///
@@ -559,7 +775,13 @@ class PlanBuilder {
   /// current plan node).
   PlanBuilder& localPartition(const std::vector<std::string>& keys);
 
-  /// Add a LocalPartitionNode to partition the input using row-wise
+  /// A convenience method to add a LocalPartitionNode with a single source (the
+  /// current plan node) and hive bucket property.
+  PlanBuilder& localPartitionByBucket(
+      const std::shared_ptr<connector::hive::HiveBucketProperty>&
+          bucketProperty);
+
+  /// Add a LocalPartitionNode to partition the input using batch-level
   /// round-robin. Number of partitions is determined at runtime based on
   /// parallelism of the downstream pipeline.
   ///
@@ -570,6 +792,11 @@ class PlanBuilder {
   /// A convenience method to add a LocalPartitionNode with a single source (the
   /// current plan node).
   PlanBuilder& localPartitionRoundRobin();
+
+  /// Add a LocalPartitionNode to partition the input using row-wise
+  /// round-robin. Number of partitions is determined at runtime based on
+  /// parallelism of the downstream pipeline.
+  PlanBuilder& localPartitionRoundRobinRow();
 
   /// Add a HashJoinNode to join two inputs using one or more join keys and an
   /// optional filter.
@@ -611,17 +838,35 @@ class PlanBuilder {
       const std::vector<std::string>& outputLayout,
       core::JoinType joinType = core::JoinType::kInner);
 
-  /// Add a CrossJoinNode to produce a cross product of the inputs. First input
-  /// comes from the preceding plan node. Second input is specified in 'right'
-  /// parameter.
+  /// Add a NestedLoopJoinNode to join two inputs using filter as join
+  /// condition to perform equal/non-equal join. Only supports inner/outer
+  /// joins.
+  ///
+  /// @param right Right-side input. Typically, to reduce memory usage, the
+  /// smaller input is placed on the right-side.
+  /// @param joinCondition SQL expression as the join condition. Can
+  /// use columns from both probe and build sides of the join.
+  /// @param outputLayout Output layout consisting of columns from probe and
+  /// build sides.
+  /// @param joinType Type of the join: inner, left, right, full.
+  PlanBuilder& nestedLoopJoin(
+      const core::PlanNodePtr& right,
+      const std::string& joinCondition,
+      const std::vector<std::string>& outputLayout,
+      core::JoinType joinType = core::JoinType::kInner);
+
+  /// Add a NestedLoopJoinNode to produce a cross product of the inputs. First
+  /// input comes from the preceding plan node. Second input is specified in
+  /// 'right' parameter.
   ///
   /// @param right Right-side input. Typically, to reduce memory usage, the
   /// smaller input is placed on the right-side.
   /// @param outputLayout Output layout consisting of columns from left and
   /// right sides.
-  PlanBuilder& crossJoin(
+  PlanBuilder& nestedLoopJoin(
       const core::PlanNodePtr& right,
-      const std::vector<std::string>& outputLayout);
+      const std::vector<std::string>& outputLayout,
+      core::JoinType joinType = core::JoinType::kInner);
 
   /// Add an UnnestNode to unnest one or more columns of type array or map.
   ///
@@ -668,6 +913,33 @@ class PlanBuilder {
   ///  rows between a + 10 preceding and 10 following)"
   PlanBuilder& window(const std::vector<std::string>& windowFunctions);
 
+  /// Adds WindowNode to compute window functions over pre-sorted inputs.
+  /// All functions must use same partition by and sorting keys and input must
+  /// be already sorted on these.
+  PlanBuilder& streamingWindow(const std::vector<std::string>& windowFunctions);
+
+  /// Add a RowNumberNode to compute single row_number window function with an
+  /// optional limit and no sorting.
+  PlanBuilder& rowNumber(
+      const std::vector<std::string>& partitionKeys,
+      std::optional<int32_t> limit = std::nullopt,
+      bool generateRowNumber = true);
+
+  /// Add a TopNRowNumberNode to compute single row_number window function with
+  /// a limit applied to sorted partitions.
+  PlanBuilder& topNRowNumber(
+      const std::vector<std::string>& partitionKeys,
+      const std::vector<std::string>& sortingKeys,
+      int32_t limit,
+      bool generateRowNumber);
+
+  /// Add a MarkDistinctNode to compute aggregate mask channel
+  /// @param markerKey Name of output mask channel
+  /// @param distinctKeys List of columns to be marked distinct.
+  PlanBuilder& markDistinct(
+      std::string markerKey,
+      const std::vector<std::string>& distinctKeys);
+
   /// Stores the latest plan node ID into the specified variable. Useful for
   /// capturing IDs of the leaf plan nodes (table scans, exchanges, etc.) to use
   /// when adding splits at runtime.
@@ -712,8 +984,6 @@ class PlanBuilder {
     return *this;
   }
 
-  static void registerSerDe();
-
  protected:
   // Users who create custom operators might want to extend the PlanBuilder to
   // customize extended plan builders. Those functions are needed in such
@@ -732,7 +1002,9 @@ class PlanBuilder {
   std::shared_ptr<const core::FieldAccessTypedExpr> field(
       const std::string& name);
 
-  std::vector<core::TypedExprPtr> exprs(const std::vector<std::string>& names);
+  std::vector<core::TypedExprPtr> exprs(
+      const std::vector<std::string>& expressions,
+      const RowTypePtr& inputType);
 
   std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>> fields(
       const std::vector<std::string>& names);
@@ -757,24 +1029,36 @@ class PlanBuilder {
       core::AggregationNode::Step step,
       const core::AggregationNode* partialAggNode);
 
-  struct ExpressionsAndNames {
-    std::vector<std::shared_ptr<const core::CallTypedExpr>> expressions;
+  struct AggregatesAndNames {
+    std::vector<core::AggregationNode::Aggregate> aggregates;
     std::vector<std::string> names;
   };
 
-  ExpressionsAndNames createAggregateExpressionsAndNames(
+  AggregatesAndNames createAggregateExpressionsAndNames(
       const std::vector<std::string>& aggregates,
+      const std::vector<std::string>& masks,
       core::AggregationNode::Step step,
-      const std::vector<TypePtr>& resultTypes);
+      const std::vector<std::vector<TypePtr>>& rawInputTypes = {});
 
-  std::vector<std::shared_ptr<const core::FieldAccessTypedExpr>>
-  createAggregateMasks(
-      size_t numAggregates,
-      const std::vector<std::string>& masks);
+  PlanBuilder& aggregation(
+      const std::vector<std::string>& groupingKeys,
+      const std::vector<std::string>& preGroupedKeys,
+      const std::vector<std::string>& aggregates,
+      const std::vector<std::string>& masks,
+      core::AggregationNode::Step step,
+      bool ignoreNullKeys,
+      const std::vector<std::vector<TypePtr>>& rawInputTypes);
+
+  /// Create WindowNode based on whether input is sorted and then compute the
+  /// window functions.
+  PlanBuilder& window(
+      const std::vector<std::string>& windowFunctions,
+      bool inputSorted);
 
  protected:
   core::PlanNodePtr planNode_;
   parse::ParseOptions options_;
+  std::shared_ptr<TableScanBuilder> tableScanBuilder_;
 
  private:
   std::shared_ptr<core::PlanNodeIdGenerator> planNodeIdGenerator_;

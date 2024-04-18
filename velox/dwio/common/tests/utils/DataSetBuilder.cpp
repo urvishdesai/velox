@@ -17,7 +17,7 @@
 #include "velox/dwio/common/tests/utils/DataSetBuilder.h"
 
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
-#include "velox/dwio/type/fbhive/HiveTypeParser.h"
+#include "velox/type/fbhive/HiveTypeParser.h"
 #include "velox/vector/FlatVector.h"
 
 namespace facebook::velox::test {
@@ -30,7 +30,7 @@ RowTypePtr DataSetBuilder::makeRowType(
   std::string schema = wrapInStruct
       ? fmt::format("struct<{},struct_val:struct<{}>>", columns, columns)
       : fmt::format("struct<{}>", columns);
-  dwio::type::fbhive::HiveTypeParser parser;
+  type::fbhive::HiveTypeParser parser;
   return std::dynamic_pointer_cast<const RowType>(parser.parse(schema));
 }
 
@@ -106,7 +106,7 @@ DataSetBuilder& DataSetBuilder::withAllNullsForField(
   for (RowVectorPtr batch : *batches_) {
     auto fieldValues = getChildBySubfield(batch.get(), field);
     SelectivityVector rows(fieldValues->size());
-    fieldValues->addNulls(nullptr, rows);
+    fieldValues->addNulls(rows);
   }
 
   return *this;
@@ -122,7 +122,7 @@ DataSetBuilder& DataSetBuilder::withNullsForField(
     if (nullsPercent == 0) {
       fieldValues->clearNulls(rows);
     } else if (nullsPercent >= 100) {
-      fieldValues->addNulls(nullptr, rows);
+      fieldValues->addNulls(rows);
     } else {
       std::vector<vector_size_t> nonNullRows =
           getSomeNonNullRowNumbers(fieldValues, 23);
@@ -231,6 +231,76 @@ DataSetBuilder& DataSetBuilder::makeUniformMapKeys(
       }
     }
     keys->copyRanges(keys.get(), ranges);
+  }
+  return *this;
+}
+
+DataSetBuilder& DataSetBuilder::makeMapStringValues(
+    const common::Subfield& field) {
+  for (auto& batch : *batches_) {
+    auto* map = dwio::common::getChildBySubfield(batch.get(), field)
+                    ->asUnchecked<MapVector>();
+    auto keyKind = map->type()->childAt(0)->kind();
+    auto valueKind = map->type()->childAt(1)->kind();
+    auto offsets = map->rawOffsets();
+    auto sizes = map->rawSizes();
+    int32_t offsetIndex = 0;
+    auto mapSize = map->size();
+    auto getNextOffset = [&]() {
+      while (offsetIndex < mapSize) {
+        if (offsets[offsetIndex] != 0) {
+          return offsets[offsetIndex++];
+        }
+        ++offsetIndex;
+      }
+      return 0;
+    };
+
+    int32_t nextOffset = offsets[0];
+    int32_t nullCounter = 0;
+    auto size = map->mapKeys()->size();
+    if (keyKind == TypeKind::VARCHAR) {
+      if (auto keys = map->mapKeys()->as<FlatVector<StringView>>()) {
+        for (auto i = 0; i < size; ++i) {
+          if (i == nextOffset) {
+            // The first key of every map is fixed. The first value is limited
+            // cardinality so that at least one column of flat map comes out as
+            // dict.
+            std::string str = "dictEncodedValue";
+            keys->set(i, StringView(str));
+            nextOffset = getNextOffset();
+            continue;
+          }
+          if (!keys->isNullAt(i) && i % 3 == 0) {
+            std::string str = keys->valueAt(i);
+            str += "----123456789";
+            keys->set(i, StringView(str));
+          }
+        }
+      }
+    }
+    if (valueKind == TypeKind::VARCHAR) {
+      if (auto values = map->mapValues()->as<FlatVector<StringView>>()) {
+        offsetIndex = 0;
+        nextOffset = offsets[0];
+        for (auto i = 0; i < size; ++i) {
+          if (i == nextOffset) {
+            std::string str = fmt::format("dictEncoded{}", i % 3);
+            values->set(i, StringView(str));
+            if (nullCounter++ % 4 == 0) {
+              values->setNull(i, true);
+            }
+            nextOffset = getNextOffset();
+            continue;
+          }
+          if (!values->isNullAt(i) && i % 3 == 0) {
+            std::string str = values->valueAt(i);
+            str += "----123456789";
+            values->set(i, StringView(str));
+          }
+        }
+      }
+    }
   }
   return *this;
 }

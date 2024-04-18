@@ -31,7 +31,7 @@ using namespace facebook::velox::dwrf;
 // Used to compare the ORC data read by DWRFReader against apache-orc repo.
 // Usage: velox_example_scan_orc {orc_file_path}
 int main(int argc, char** argv) {
-  folly::init(&argc, &argv);
+  folly::Init init{&argc, &argv};
 
   if (argc < 2) {
     return 1;
@@ -41,10 +41,11 @@ int main(int argc, char** argv) {
   // filesystem. We also need to register the dwrf reader factory:
   filesystems::registerLocalFileSystem();
   dwrf::registerDwrfReaderFactory();
-  auto pool = facebook::velox::memory::getDefaultMemoryPool();
+  facebook::velox::memory::MemoryManager::initialize({});
+  auto pool = facebook::velox::memory::memoryManager()->addLeafPool();
 
   std::string filePath{argv[1]};
-  ReaderOptions readerOpts{pool.get()};
+  dwio::common::ReaderOptions readerOpts{pool.get()};
   // To make DwrfReader reads ORC file, setFileFormat to FileFormat::ORC
   readerOpts.setFileFormat(FileFormat::ORC);
   auto reader = DwrfReader::create(

@@ -21,11 +21,11 @@
 #include "velox/common/caching/FileGroupStats.h"
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/common/caching/SsdCache.h"
+#include "velox/common/io/IoStatistics.h"
+#include "velox/common/io/Options.h"
 #include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/CacheInputStream.h"
 #include "velox/dwio/common/InputStream.h"
-#include "velox/dwio/common/IoStatistics.h"
-#include "velox/dwio/common/Options.h"
 
 DECLARE_int32(cache_load_quantum);
 
@@ -51,24 +51,25 @@ struct CacheRequest {
   // for sparsely accessed large columns where hitting one piece
   // should not load the adjacent pieces.
   bool coalesces{true};
-  const SeekableInputStream* FOLLY_NONNULL stream;
+  const SeekableInputStream* stream;
 };
 
 class CachedBufferedInput : public BufferedInput {
  public:
   CachedBufferedInput(
       std::shared_ptr<ReadFile> readFile,
-      memory::MemoryPool& pool,
       const MetricsLogPtr& metricsLog,
       uint64_t fileNum,
-      cache::AsyncDataCache* FOLLY_NONNULL cache,
+      cache::AsyncDataCache* cache,
       std::shared_ptr<cache::ScanTracker> tracker,
       uint64_t groupId,
       std::shared_ptr<IoStatistics> ioStats,
-      folly::Executor* FOLLY_NULLABLE executor,
-      int32_t loadQuantum,
-      int32_t maxCoalesceDistance)
-      : BufferedInput(std::move(readFile), pool, metricsLog),
+      folly::Executor* executor,
+      const io::ReaderOptions& readerOptions)
+      : BufferedInput(
+            std::move(readFile),
+            readerOptions.getMemoryPool(),
+            metricsLog),
         cache_(cache),
         fileNum_(fileNum),
         tracker_(std::move(tracker)),
@@ -76,21 +77,18 @@ class CachedBufferedInput : public BufferedInput {
         ioStats_(std::move(ioStats)),
         executor_(executor),
         fileSize_(input_->getLength()),
-        loadQuantum_(loadQuantum),
-        maxCoalesceDistance_(maxCoalesceDistance) {}
+        options_(readerOptions) {}
 
   CachedBufferedInput(
       std::shared_ptr<ReadFileInputStream> input,
-      memory::MemoryPool& pool,
       uint64_t fileNum,
-      cache::AsyncDataCache* FOLLY_NONNULL cache,
+      cache::AsyncDataCache* cache,
       std::shared_ptr<cache::ScanTracker> tracker,
       uint64_t groupId,
       std::shared_ptr<IoStatistics> ioStats,
-      folly::Executor* FOLLY_NULLABLE executor,
-      int32_t loadQuantum,
-      int32_t maxCoalesceDistance)
-      : BufferedInput(std::move(input), pool),
+      folly::Executor* executor,
+      const io::ReaderOptions& readerOptions)
+      : BufferedInput(std::move(input), readerOptions.getMemoryPool()),
         cache_(cache),
         fileNum_(fileNum),
         tracker_(std::move(tracker)),
@@ -98,8 +96,7 @@ class CachedBufferedInput : public BufferedInput {
         ioStats_(std::move(ioStats)),
         executor_(executor),
         fileSize_(input_->getLength()),
-        loadQuantum_(loadQuantum),
-        maxCoalesceDistance_(maxCoalesceDistance) {}
+        options_(readerOptions) {}
 
   ~CachedBufferedInput() override {
     for (auto& load : allCoalescedLoads_) {
@@ -108,8 +105,8 @@ class CachedBufferedInput : public BufferedInput {
   }
 
   std::unique_ptr<SeekableInputStream> enqueue(
-      Region region,
-      const StreamIdentifier* FOLLY_NULLABLE si) override;
+      velox::common::Region region,
+      const StreamIdentifier* si) override;
 
   void load(const LogType) override;
 
@@ -120,7 +117,7 @@ class CachedBufferedInput : public BufferedInput {
 
   /// Schedules load of 'region' on 'executor_'. Fails silently if no memory or
   /// if shouldPreload() is false.
-  bool prefetch(Region region);
+  bool prefetch(velox::common::Region region);
 
   bool shouldPreload(int32_t numPages = 0) override;
 
@@ -138,18 +135,16 @@ class CachedBufferedInput : public BufferedInput {
   virtual std::unique_ptr<BufferedInput> clone() const override {
     return std::make_unique<CachedBufferedInput>(
         input_,
-        pool_,
         fileNum_,
         cache_,
         tracker_,
         groupId_,
         ioStats_,
         executor_,
-        loadQuantum_,
-        maxCoalesceDistance_);
+        options_);
   }
 
-  cache::AsyncDataCache* FOLLY_NONNULL cache() const {
+  cache::AsyncDataCache* cache() const {
     return cache_;
   }
 
@@ -158,10 +153,14 @@ class CachedBufferedInput : public BufferedInput {
   // call for 'stream' since the load is to be triggered by the first
   // access.
   std::shared_ptr<cache::CoalescedLoad> coalescedLoad(
-      const SeekableInputStream* FOLLY_NONNULL stream);
+      const SeekableInputStream* stream);
 
-  folly::Executor* FOLLY_NULLABLE executor() const override {
+  folly::Executor* executor() const override {
     return executor_;
+  }
+
+  uint64_t nextFetchSize() const override {
+    VELOX_NYI();
   }
 
  private:
@@ -176,12 +175,12 @@ class CachedBufferedInput : public BufferedInput {
 
   void readRegion(std::vector<CacheRequest*> requests, bool prefetch);
 
-  cache::AsyncDataCache* FOLLY_NONNULL cache_;
+  cache::AsyncDataCache* cache_;
   const uint64_t fileNum_;
   std::shared_ptr<cache::ScanTracker> tracker_;
   const uint64_t groupId_;
   std::shared_ptr<IoStatistics> ioStats_;
-  folly::Executor* const FOLLY_NULLABLE executor_;
+  folly::Executor* const executor_;
 
   // Regions that are candidates for loading.
   std::vector<CacheRequest> requests_;
@@ -196,8 +195,7 @@ class CachedBufferedInput : public BufferedInput {
   std::vector<std::shared_ptr<cache::CoalescedLoad>> allCoalescedLoads_;
 
   const uint64_t fileSize_;
-  const int32_t loadQuantum_;
-  const int32_t maxCoalesceDistance_;
+  io::ReaderOptions options_;
 };
 
 } // namespace facebook::velox::dwio::common

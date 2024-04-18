@@ -69,8 +69,9 @@ class ExtremeValueFunction : public exec::VectorFunction {
       VectorPtr& result) const {
     context.ensureWritable(rows, outputType, result);
     result->clearNulls(rows);
-    BufferPtr resultValues =
-        result->as<FlatVector<T>>()->mutableValues(rows.end());
+
+    auto* flatResult = result->as<FlatVector<T>>();
+    BufferPtr resultValues = flatResult->mutableValues(rows.end());
     T* __restrict rawResult = resultValues->asMutable<T>();
 
     exec::DecodedArgs decodedArgs(rows, args, context);
@@ -86,18 +87,28 @@ class ExtremeValueFunction : public exec::VectorFunction {
         auto candidateValue = decodedArgs.at(i)->template valueAt<T>(row);
         checkNan(candidateValue);
 
-        if (shouldOverride(currentValue, candidateValue)) {
-          currentValue = candidateValue;
-          valueIndex = i;
+        if constexpr (isLeast) {
+          if (candidateValue < currentValue) {
+            currentValue = candidateValue;
+            valueIndex = i;
+          }
+        } else {
+          if (candidateValue > currentValue) {
+            currentValue = candidateValue;
+            valueIndex = i;
+          }
         }
       }
       usedInputs.insert(valueIndex);
-      rawResult[row] = currentValue;
+
+      if constexpr (std::is_same_v<bool, T>) {
+        flatResult->set(row, currentValue);
+      } else {
+        rawResult[row] = currentValue;
+      }
     });
 
-    if constexpr (std::
-                      is_same_v<T, TypeTraits<TypeKind::VARCHAR>::NativeType>) {
-      auto* flatResult = result->as<FlatVector<T>>();
+    if constexpr (std::is_same_v<T, StringView>) {
       for (auto index : usedInputs) {
         flatResult->acquireSharedStringBuffers(args[index].get());
       }
@@ -112,33 +123,35 @@ class ExtremeValueFunction : public exec::VectorFunction {
       exec::EvalCtx& context,
       VectorPtr& result) const override {
     switch (outputType.get()->kind()) {
+      case TypeKind::BOOLEAN:
+        applyTyped<bool>(rows, args, outputType, context, result);
+        return;
+      case TypeKind::TINYINT:
+        applyTyped<int8_t>(rows, args, outputType, context, result);
+        return;
+      case TypeKind::SMALLINT:
+        applyTyped<int16_t>(rows, args, outputType, context, result);
+        return;
+      case TypeKind::INTEGER:
+        applyTyped<int32_t>(rows, args, outputType, context, result);
+        return;
       case TypeKind::BIGINT:
-        applyTyped<TypeTraits<TypeKind::BIGINT>::NativeType>(
-            rows, args, outputType, context, result);
+        applyTyped<int64_t>(rows, args, outputType, context, result);
         return;
-      case TypeKind::SHORT_DECIMAL:
-        applyTyped<TypeTraits<TypeKind::SHORT_DECIMAL>::NativeType>(
-            rows, args, outputType, context, result);
+      case TypeKind::HUGEINT:
+        applyTyped<int128_t>(rows, args, outputType, context, result);
         return;
-      case TypeKind::LONG_DECIMAL:
-        applyTyped<TypeTraits<TypeKind::LONG_DECIMAL>::NativeType>(
-            rows, args, outputType, context, result);
+      case TypeKind::REAL:
+        applyTyped<float>(rows, args, outputType, context, result);
         return;
       case TypeKind::DOUBLE:
-        applyTyped<TypeTraits<TypeKind::DOUBLE>::NativeType>(
-            rows, args, outputType, context, result);
+        applyTyped<double>(rows, args, outputType, context, result);
         return;
       case TypeKind::VARCHAR:
-        applyTyped<TypeTraits<TypeKind::VARCHAR>::NativeType>(
-            rows, args, outputType, context, result);
+        applyTyped<StringView>(rows, args, outputType, context, result);
         return;
       case TypeKind::TIMESTAMP:
-        applyTyped<TypeTraits<TypeKind::TIMESTAMP>::NativeType>(
-            rows, args, outputType, context, result);
-        return;
-      case TypeKind::DATE:
-        applyTyped<TypeTraits<TypeKind::DATE>::NativeType>(
-            rows, args, outputType, context, result);
+        applyTyped<Timestamp>(rows, args, outputType, context, result);
         return;
       default:
         VELOX_FAIL(
@@ -149,8 +162,18 @@ class ExtremeValueFunction : public exec::VectorFunction {
   }
 
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
-    std::vector<std::string> types = {
-        "bigint", "double", "varchar", "timestamp", "date"};
+    const std::vector<std::string> types = {
+        "boolean",
+        "tinyint",
+        "smallint",
+        "integer",
+        "bigint",
+        "double",
+        "real",
+        "varchar",
+        "timestamp",
+        "date",
+    };
     std::vector<std::shared_ptr<exec::FunctionSignature>> signatures;
     for (const auto& type : types) {
       signatures.emplace_back(exec::FunctionSignatureBuilder()
@@ -178,7 +201,7 @@ VELOX_DECLARE_VECTOR_FUNCTION(
 
 VELOX_DECLARE_VECTOR_FUNCTION(
     udf_greatest,
-    GreatestFunction ::signatures(),
+    GreatestFunction::signatures(),
     std::make_unique<GreatestFunction>());
 
 } // namespace facebook::velox::functions

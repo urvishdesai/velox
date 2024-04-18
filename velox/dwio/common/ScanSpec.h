@@ -56,12 +56,6 @@ class ScanSpec {
 
   explicit ScanSpec(const std::string& name) : fieldName_(name) {}
 
-  ScanSpec(const ScanSpec& other) {
-    *this = other;
-  }
-
-  ScanSpec& operator=(const ScanSpec&);
-
   // Filter to apply. If 'this' corresponds to a struct/list/map, this
   // can only be isNull or isNotNull, other filtering is given by
   // 'children'.
@@ -86,21 +80,21 @@ class ScanSpec {
   }
 
   void addMetadataFilter(
-      MetadataFilter::LeafNode* leaf,
-      std::unique_ptr<common::Filter> filter) {
-    metadataFilters_.emplace_back(leaf, std::move(filter));
+      const MetadataFilter::LeafNode* leaf,
+      common::Filter* filter) {
+    metadataFilters_.emplace_back(leaf, filter);
   }
 
   int numMetadataFilters() const {
     return metadataFilters_.size();
   }
 
-  MetadataFilter::LeafNode* metadataFilterNodeAt(int i) const {
+  const MetadataFilter::LeafNode* metadataFilterNodeAt(int i) const {
     return metadataFilters_[i].first;
   }
 
   common::Filter* metadataFilterAt(int i) const {
-    return metadataFilters_[i].second.get();
+    return metadataFilters_[i].second;
   }
 
   // Returns a constant vector if 'this' corresponds to a partitioning
@@ -208,38 +202,13 @@ class ScanSpec {
   // corresponds to the ColumnReader tree.
   ScanSpec* getOrCreateChild(const Subfield& subfield);
 
-  bool matches(const Subfield::PathElement& element) const {
-    auto kind = element.kind();
-    switch (kind) {
-      case kNestedField:
-        return fieldName_ ==
-            reinterpret_cast<const Subfield::NestedField*>(&element)->name();
-      case kLongSubscript:
-        return subscript_ ==
-            reinterpret_cast<const Subfield::LongSubscript*>(&element)->index();
-      case kStringSubscript:
-        return fieldName_ ==
-            reinterpret_cast<const Subfield::StringSubscript*>(&element)
-                ->index();
-      default:
-        VELOX_CHECK(
-            false, "Only subfields that specify a single field are  supported");
-    }
-    return false;
-  }
-
   ScanSpec* childByName(const std::string& name) const {
-    for (auto& spec : children_) {
-      if (spec->fieldName_ == name) {
-        return spec.get();
-      }
+    auto it = childByFieldName_.find(name);
+    if (it == childByFieldName_.end()) {
+      return nullptr;
     }
-    return nullptr;
+    return it->second;
   }
-
-  // Remove a child from this scan spec, returning the removed child.  This is
-  // used for example to transform a flatmap scan spec into a struct scan spec.
-  std::shared_ptr<ScanSpec> removeChild(const ScanSpec* child);
 
   SelectivityInfo& selectivity() {
     return selectivity_;
@@ -286,13 +255,14 @@ class ScanSpec {
 
   // Resets cached values after this or children were updated, e.g. a new filter
   // was added or existing filter was modified.
-  void resetCachedValues() {
+  void resetCachedValues(bool doReorder) {
     hasFilter_.reset();
     for (auto& child : children_) {
-      child->resetCachedValues();
+      child->resetCachedValues(doReorder);
     }
-
-    reorder();
+    if (doReorder) {
+      reorder();
+    }
   }
 
   void setEnableFilterReorder(bool enableFilterReorder) {
@@ -344,6 +314,14 @@ class ScanSpec {
   // projected out.
   void addAllChildFields(const Type&);
 
+  const std::vector<std::string>& flatMapFeatureSelection() const {
+    return flatMapFeatureSelection_;
+  }
+
+  void setFlatMapFeatureSelection(std::vector<std::string> features) {
+    flatMapFeatureSelection_ = std::move(features);
+  }
+
  private:
   void reorder();
 
@@ -374,15 +352,14 @@ class ScanSpec {
   // True if a string dictionary or flat map in this field should be
   // returned as flat.
   bool makeFlat_ = false;
-  std::shared_ptr<common::Filter> filter_;
+  std::unique_ptr<common::Filter> filter_;
 
   // Filters that will be only used for row group filtering based on metadata.
   // The conjunctions among these filters are tracked in MetadataFilter, with
   // the pointers to LeafNodes are stored here.  We need to keep these pointers
   // so that we can match the leaf node filter results and apply logical
   // conjunctions later properly.
-  std::vector<
-      std::pair<MetadataFilter::LeafNode*, std::shared_ptr<common::Filter>>>
+  std::vector<std::pair<const MetadataFilter::LeafNode*, common::Filter*>>
       metadataFilters_;
 
   SelectivityInfo selectivity_;
@@ -409,6 +386,8 @@ class ScanSpec {
   // 'children_' is reorderable by a running scan.
   std::vector<ScanSpec*> stableChildren_;
 
+  folly::F14FastMap<std::string, ScanSpec*> childByFieldName_;
+
   mutable std::optional<bool> hasFilter_;
   ValueHook* valueHook_ = nullptr;
 
@@ -419,6 +398,9 @@ class ScanSpec {
   // Only take the first maxArrayElementsCount_ elements from each array.
   vector_size_t maxArrayElementsCount_ =
       std::numeric_limits<vector_size_t>::max();
+
+  // Used only for bulk reader to project flat map features.
+  std::vector<std::string> flatMapFeatureSelection_;
 };
 
 // Returns false if no value from a range defined by stats can pass the

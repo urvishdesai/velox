@@ -164,7 +164,7 @@ void RleDecoderV2<isSigned>::seekToRowGroup(
       dwio::common::IntDecoder<isSigned>::bufferStart = 0;
   runRead = runLength = 0;
   // skip ahead the given number of records
-  skip(location.next());
+  this->pendingSkip = location.next();
 }
 
 template void RleDecoderV2<true>::seekToRowGroup(
@@ -173,24 +173,34 @@ template void RleDecoderV2<false>::seekToRowGroup(
     dwio::common::PositionProvider& location);
 
 template <bool isSigned>
-void RleDecoderV2<isSigned>::skip(uint64_t numValues) {
+void RleDecoderV2<isSigned>::skipPending() {
   // simple for now, until perf tests indicate something encoding specific is
   // needed
-  const uint64_t N = 64;
+  constexpr int64_t N = 64;
   int64_t dummy[N];
-
+  auto numValues = this->pendingSkip;
+  this->pendingSkip = 0;
   while (numValues) {
     uint64_t nRead = std::min(N, numValues);
-    next(dummy, nRead, nullptr);
+    doNext(dummy, nRead, nullptr);
     numValues -= nRead;
   }
 }
 
-template void RleDecoderV2<true>::skip(uint64_t numValues);
-template void RleDecoderV2<false>::skip(uint64_t numValues);
+template void RleDecoderV2<true>::skipPending();
+template void RleDecoderV2<false>::skipPending();
 
 template <bool isSigned>
 void RleDecoderV2<isSigned>::next(
+    int64_t* const data,
+    const uint64_t numValues,
+    const uint64_t* const nulls) {
+  skipPending();
+  doNext(data, numValues, nulls);
+}
+
+template <bool isSigned>
+void RleDecoderV2<isSigned>::doNext(
     int64_t* const data,
     const uint64_t numValues,
     const uint64_t* const nulls) {
@@ -206,13 +216,11 @@ void RleDecoderV2<isSigned>::next(
 
     if (runRead == runLength) {
       resetRun();
-      firstByte = readByte();
     }
 
     uint64_t offset = nRead, length = numValues - nRead;
 
-    EncodingType enc = static_cast<EncodingType>((firstByte >> 6) & 0x03);
-    switch (static_cast<int64_t>(enc)) {
+    switch (type) {
       case SHORT_REPEAT:
         nRead += nextShortRepeats(data, offset, length, nulls);
         break;
@@ -231,11 +239,11 @@ void RleDecoderV2<isSigned>::next(
   }
 }
 
-template void RleDecoderV2<true>::next(
+template void RleDecoderV2<true>::doNext(
     int64_t* const data,
     const uint64_t numValues,
     const uint64_t* const nulls);
-template void RleDecoderV2<false>::next(
+template void RleDecoderV2<false>::doNext(
     int64_t* const data,
     const uint64_t numValues,
     const uint64_t* const nulls);
@@ -260,7 +268,7 @@ uint64_t RleDecoderV2<isSigned>::nextShortRepeats(
     firstValue = readLongBE(byteSize);
 
     if (isSigned) {
-      firstValue = ZigZag::decode(static_cast<uint64_t>(firstValue));
+      firstValue = ZigZag::decode<uint64_t>(static_cast<uint64_t>(firstValue));
     }
   }
 
@@ -321,12 +329,13 @@ uint64_t RleDecoderV2<isSigned>::nextDirect(
     if (nulls) {
       for (uint64_t pos = offset; pos < offset + nRead; ++pos) {
         if (!bits::isBitNull(nulls, pos)) {
-          data[pos] = ZigZag::decode(static_cast<uint64_t>(data[pos]));
+          data[pos] =
+              ZigZag::decode<uint64_t>(static_cast<uint64_t>(data[pos]));
         }
       }
     } else {
       for (uint64_t pos = offset; pos < offset + nRead; ++pos) {
-        data[pos] = ZigZag::decode(static_cast<uint64_t>(data[pos]));
+        data[pos] = ZigZag::decode<uint64_t>(static_cast<uint64_t>(data[pos]));
       }
     }
   }
@@ -582,5 +591,37 @@ template uint64_t RleDecoderV2<false>::nextDelta(
     uint64_t offset,
     uint64_t numValues,
     const uint64_t* const nulls);
+
+template <bool isSigned>
+int64_t RleDecoderV2<isSigned>::readValue() {
+  if (runRead == runLength) {
+    resetRun();
+  }
+
+  uint64_t nRead = 0;
+  int64_t value = 0;
+  switch (type) {
+    case SHORT_REPEAT:
+      nRead = nextShortRepeats(&value, 0, 1, nullptr);
+      break;
+    case DIRECT:
+      nRead = nextDirect(&value, 0, 1, nullptr);
+      break;
+    case PATCHED_BASE:
+      nRead = nextPatched(&value, 0, 1, nullptr);
+      break;
+    case DELTA:
+      nRead = nextDelta(&value, 0, 1, nullptr);
+      break;
+    default:
+      DWIO_RAISE("unknown encoding");
+  }
+  VELOX_CHECK(nRead == (uint64_t)1);
+  return value;
+}
+
+template int64_t RleDecoderV2<true>::readValue();
+
+template int64_t RleDecoderV2<false>::readValue();
 
 } // namespace facebook::velox::dwrf

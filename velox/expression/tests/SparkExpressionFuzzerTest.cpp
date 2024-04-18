@@ -18,6 +18,7 @@
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -30,18 +31,7 @@ DEFINE_int64(
     "Initial seed for random number generator "
     "(use it to reproduce previous results).");
 
-DEFINE_string(
-    only,
-    "",
-    "If specified, Fuzzer will only choose functions from "
-    "this comma separated list of function names "
-    "(e.g: --only \"split\" or --only \"substr,ltrim\").");
-
-DEFINE_string(
-    special_forms,
-    "and,or",
-    "Comma-separated list of special forms to use in generated expression. "
-    "Supported special forms: and, or, coalesce, if, switch, cast.");
+using facebook::velox::test::FuzzerRunner;
 
 int main(int argc, char** argv) {
   facebook::velox::functions::sparksql::registerFunctions("");
@@ -51,13 +41,24 @@ int main(int argc, char** argv) {
   // Calls common init functions in the necessary order, initializing
   // singletons, installing proper signal handlers for better debugging
   // experience, and initialize glog and gflags.
-  folly::init(&argc, &argv);
+  folly::Init init(&argc, &argv);
 
   // The following list are the Spark UDFs that hit issues
   // For rlike you need the following combo in the only list:
   // rlike, md5 and upper
   std::unordered_set<std::string> skipFunctions = {
-      "regexp_extract", "rlike", "chr", "replace"};
-  return FuzzerRunner::run(
-      FLAGS_only, FLAGS_seed, skipFunctions, FLAGS_special_forms);
+      "regexp_extract",
+      // https://github.com/facebookincubator/velox/issues/8438
+      "regexp_replace",
+      "rlike",
+      "chr",
+      "replace",
+      "might_contain",
+      "unix_timestamp"};
+
+  // Required by spark_partition_id function.
+  std::unordered_map<std::string, std::string> queryConfigs = {
+      {facebook::velox::core::QueryConfig::kSparkPartitionId, "123"}};
+
+  return FuzzerRunner::run(FLAGS_seed, skipFunctions, queryConfigs);
 }

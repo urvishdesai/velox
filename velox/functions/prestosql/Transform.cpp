@@ -25,14 +25,6 @@ namespace {
 // See documentation at https://prestodb.io/docs/current/functions/array.html
 class TransformFunction : public exec::VectorFunction {
  public:
-  bool isDefaultNullBehavior() const override {
-    // transform is null preserving for the array. But since an
-    // expr tree with a lambda depends on all named fields, including
-    // captures, a null in a capture does not automatically make a
-    // null result.
-    return false;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -50,11 +42,8 @@ class TransformFunction : public exec::VectorFunction {
     std::vector<VectorPtr> lambdaArgs = {flatArray->elements()};
     auto newNumElements = flatArray->elements()->size();
 
-    SelectivityVector finalSelection;
-    if (!context.isFinalSelection()) {
-      finalSelection = toElementRows<ArrayVector>(
-          newNumElements, *context.finalSelection(), flatArray.get());
-    }
+    SelectivityVector validRowsInReusedResult =
+        toElementRows<ArrayVector>(newNumElements, rows, flatArray.get());
 
     // transformed elements
     VectorPtr newElements;
@@ -73,7 +62,7 @@ class TransformFunction : public exec::VectorFunction {
 
       entry.callable->apply(
           elementRows,
-          finalSelection,
+          &validRowsInReusedResult,
           wrapCapture,
           &context,
           lambdaArgs,
@@ -81,11 +70,14 @@ class TransformFunction : public exec::VectorFunction {
           &newElements);
     }
 
+    // Set nulls for rows not present in 'rows'.
+    BufferPtr newNulls = addNullsForUnselectedRows(flatArray, rows);
+
     VectorPtr localResult = std::make_shared<ArrayVector>(
         flatArray->pool(),
         outputType,
-        flatArray->nulls(),
-        flatArray->size(),
+        std::move(newNulls),
+        rows.end(),
         flatArray->offsets(),
         flatArray->sizes(),
         newElements);
@@ -105,9 +97,15 @@ class TransformFunction : public exec::VectorFunction {
 };
 } // namespace
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+/// transform is null preserving for the array. But since an
+/// expr tree with a lambda depends on all named fields, including
+/// captures, a null in a capture does not automatically make a
+/// null result.
+
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_transform,
     TransformFunction::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<TransformFunction>());
 
 } // namespace facebook::velox::functions

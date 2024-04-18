@@ -31,10 +31,12 @@ target_link_libraries(
   velox_dwio_common
   velox_dwio_dwrf_common
   velox_dwio_dwrf_utils
+  velox_exec
   velox_process
   velox_time
   velox_vector
-  ${LZ4}
-  ${LZO}
-  ${ZSTD}
-  ${ZLIB_LIBRARIES})
+  Boost::headers
+  lz4::lz4
+  lzo2::lzo2
+  zstd::zstd
+  ZLIB::ZLIB)

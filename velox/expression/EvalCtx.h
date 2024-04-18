@@ -29,22 +29,19 @@ class Expr;
 class ExprSet;
 class LocalDecodedVector;
 class LocalSelectivityVector;
-struct ScopedContextSaver;
+struct ContextSaver;
 class PeeledEncoding;
 
 // Context for holding the base row vector, error state and various
 // flags for Expr interpreter.
 class EvalCtx {
  public:
-  EvalCtx(
-      core::ExecCtx* FOLLY_NONNULL execCtx,
-      ExprSet* FOLLY_NULLABLE exprSet,
-      const RowVector* FOLLY_NULLABLE row);
+  EvalCtx(core::ExecCtx* execCtx, ExprSet* exprSet, const RowVector* row);
 
   /// For testing only.
-  explicit EvalCtx(core::ExecCtx* FOLLY_NONNULL execCtx);
+  explicit EvalCtx(core::ExecCtx* execCtx);
 
-  const RowVector* FOLLY_NONNULL row() const {
+  const RowVector* row() const {
     return row_;
   }
 
@@ -54,7 +51,7 @@ class EvalCtx {
     return inputFlatNoNulls_;
   }
 
-  memory::MemoryPool* FOLLY_NONNULL pool() const {
+  memory::MemoryPool* pool() const {
     return execCtx_->pool();
   }
 
@@ -77,11 +74,19 @@ class EvalCtx {
   }
 
   /// Used by peelEncodings.
-  void saveAndReset(ScopedContextSaver& saver, const SelectivityVector& rows);
+  void saveAndReset(ContextSaver& saver, const SelectivityVector& rows);
 
-  void restore(ScopedContextSaver& saver);
+  void restore(ContextSaver& saver);
 
+  // If exceptionPtr is known to be a VeloxException use setVeloxExceptionError
+  // instead.
   void setError(vector_size_t index, const std::exception_ptr& exceptionPtr);
+
+  // Similar to setError but more performant, should be used when the user knows
+  // for sure that exception_ptr is a velox exception.
+  void setVeloxExceptionError(
+      vector_size_t index,
+      const std::exception_ptr& exceptionPtr);
 
   void setErrors(
       const SelectivityVector& rows,
@@ -95,7 +100,13 @@ class EvalCtx {
     rows.template applyToSelected([&](auto row) INLINE_LAMBDA {
       try {
         func(row);
-      } catch (const std::exception& e) {
+      } catch (const VeloxException& e) {
+        if (!e.isUserError()) {
+          throw;
+        }
+        // Avoid double throwing.
+        setVeloxExceptionError(row, std::current_exception());
+      } catch (const std::exception&) {
         setError(row, std::current_exception());
       }
     });
@@ -125,6 +136,13 @@ class EvalCtx {
       const BufferPtr& elementToTopLevelRows,
       ErrorVectorPtr& topLevelErrors);
 
+  // Given a mapping from element rows to top-level rows, set errors in
+  // the elements as nulls in the top level row.
+  void convertElementErrorsToTopLevelNulls(
+      const SelectivityVector& elementRows,
+      const BufferPtr& elementToTopLevelRows,
+      VectorPtr& result);
+
   void deselectErrors(SelectivityVector& rows) const {
     if (!errors_) {
       return;
@@ -139,11 +157,11 @@ class EvalCtx {
   // Returns the vector of errors or nullptr if no errors. This is
   // intentionally a raw pointer to signify that the caller may not
   // retain references to this.
-  ErrorVector* FOLLY_NULLABLE errors() const {
+  ErrorVector* errors() const {
     return errors_.get();
   }
 
-  ErrorVectorPtr* FOLLY_NONNULL errorsPtr() {
+  ErrorVectorPtr* errorsPtr() {
     return &errors_;
   }
 
@@ -151,11 +169,31 @@ class EvalCtx {
     std::swap(errors_, other);
   }
 
+  /// Adds errors in 'this' to 'other'. Clears errors from 'this'.
+  void moveAppendErrors(ErrorVectorPtr& other) {
+    if (!errors_) {
+      return;
+    }
+
+    if (!other) {
+      std::swap(errors_, other);
+      return;
+    }
+
+    ensureErrorsVectorSize(other, errors_->size());
+    bits::forEachBit(
+        errors_->rawNulls(), 0, errors_->size(), bits::kNotNull, [&](auto row) {
+          other->set(row, errors_->valueAt(row));
+        });
+
+    errors_.reset();
+  }
+
   bool throwOnError() const {
     return throwOnError_;
   }
 
-  bool* FOLLY_NONNULL mutableThrowOnError() {
+  bool* mutableThrowOnError() {
     return &throwOnError_;
   }
 
@@ -163,7 +201,7 @@ class EvalCtx {
     return nullsPruned_;
   }
 
-  bool* FOLLY_NONNULL mutableNullsPruned() {
+  bool* mutableNullsPruned() {
     return &nullsPruned_;
   }
 
@@ -179,7 +217,7 @@ class EvalCtx {
   // current SelectivityVector. For example, true for top level
   // projections or conjuncts of a top level AND. False for then and
   // else of an IF.
-  bool* FOLLY_NONNULL mutableIsFinalSelection() {
+  bool* mutableIsFinalSelection() {
     return &isFinalSelection_;
   }
 
@@ -188,15 +226,15 @@ class EvalCtx {
     return &finalSelection_;
   }
 
-  const SelectivityVector* FOLLY_NULLABLE finalSelection() const {
+  const SelectivityVector* finalSelection() const {
     return finalSelection_;
   }
 
-  core::ExecCtx* FOLLY_NONNULL execCtx() const {
+  core::ExecCtx* execCtx() const {
     return execCtx_;
   }
 
-  ExprSet* FOLLY_NULLABLE exprSet() const {
+  ExprSet* exprSet() const {
     return exprSet_;
   }
 
@@ -206,13 +244,25 @@ class EvalCtx {
     peeledEncoding_ = std::move(peel);
   }
 
+  bool resultShouldBePreserved(
+      const VectorPtr& result,
+      const SelectivityVector& rows) const {
+    return result && !isFinalSelection() && *finalSelection() != rows;
+  }
+
   // Copy "rows" of localResult into results if "result" is partially populated
   // and must be preserved. Copy localResult pointer into result otherwise.
   void moveOrCopyResult(
       const VectorPtr& localResult,
       const SelectivityVector& rows,
       VectorPtr& result) const {
-    if (result && !isFinalSelection() && *finalSelection() != rows) {
+#ifndef NDEBUG
+    if (localResult != nullptr) {
+      // Make sure local/temporary vectors have consistent state.
+      localResult->validate();
+    }
+#endif
+    if (resultShouldBePreserved(result, rows)) {
       BaseVector::ensureWritable(rows, result->type(), result->pool(), result);
       result->copy(localResult.get(), rows, nullptr);
     } else {
@@ -220,7 +270,18 @@ class EvalCtx {
     }
   }
 
-  VectorPool& vectorPool() const {
+  /// Adds nulls from 'rawNulls' to positions of 'result' given by
+  /// 'rows'. Ensures that '*result' is writable, of sufficient size
+  /// and that it can take nulls. Makes a new '*result' when
+  /// appropriate.
+  static void addNulls(
+      const SelectivityVector& rows,
+      const uint64_t* rawNulls,
+      EvalCtx& context,
+      const TypePtr& type,
+      VectorPtr& result);
+
+  VectorPool* vectorPool() const {
     return execCtx_->vectorPool();
   }
 
@@ -228,7 +289,11 @@ class EvalCtx {
     return execCtx_->getVector(type, size);
   }
 
+  // Return true if the vector was moved to the pool.
   bool releaseVector(VectorPtr& vector) {
+    if (!vector) {
+      return false;
+    }
     return execCtx_->releaseVector(vector);
   }
 
@@ -243,7 +308,7 @@ class EvalCtx {
       const TypePtr& type,
       VectorPtr& result) {
     BaseVector::ensureWritable(
-        rows, type, execCtx_->pool(), result, &execCtx_->vectorPool());
+        rows, type, execCtx_->pool(), result, execCtx_->vectorPool());
   }
 
   /// Make sure the vector is addressable up to index `size`-1. Initialize all
@@ -253,10 +318,24 @@ class EvalCtx {
     return peeledEncoding_.get();
   }
 
+  /// Returns true if caching in expression evaluation is enabled, such as
+  /// Expr::evalWithMemo.
+  bool cacheEnabled() const {
+    return cacheEnabled_;
+  }
+
+  /// Returns the maximum number of distinct inputs to cache results for in a
+  /// given shared subexpression.
+  uint32_t maxSharedSubexprResultsCached() const {
+    return maxSharedSubexprResultsCached_;
+  }
+
  private:
-  core::ExecCtx* const FOLLY_NONNULL execCtx_;
-  ExprSet* FOLLY_NULLABLE const exprSet_;
-  const RowVector* FOLLY_NULLABLE row_;
+  core::ExecCtx* const execCtx_;
+  ExprSet* const exprSet_;
+  const RowVector* row_;
+  const bool cacheEnabled_;
+  const uint32_t maxSharedSubexprResultsCached_;
   bool inputFlatNoNulls_;
 
   // Corresponds 1:1 to children of 'row_'. Set to an inner vector
@@ -278,7 +357,7 @@ class EvalCtx {
 
   // If isFinalSelection_ is false, the set of rows for the upper-most IF or
   // OR. Used to determine the set of rows for loading lazy vectors.
-  const SelectivityVector* FOLLY_NULLABLE finalSelection_;
+  const SelectivityVector* finalSelection_;
 
   // Stores exception found during expression evaluation. Exceptions are stored
   // in a opaque flat vector, which will translate to a
@@ -286,22 +365,31 @@ class EvalCtx {
   ErrorVectorPtr errors_;
 };
 
-/// Utility wrapper struct that is used to temporarily reset the value of the an
-/// ExprCtx till it goes out of scope. EvalCtx::saveAndReset() is used to
-/// achieve that. The old context can also be explicitly restored using
-/// EvalCtx::restore().
-struct ScopedContextSaver {
-  ~ScopedContextSaver();
+/// Utility wrapper struct that is used to temporarily reset the value of the
+/// EvalCtx. EvalCtx::saveAndReset() is used to achieve that. Use
+/// withContextSaver to ensure the original context is restored on a scucessful
+/// run or call EvalContext::restore to do it manually.
+struct ContextSaver {
   // The context to restore. nullptr if nothing to restore.
-  EvalCtx* FOLLY_NULLABLE context = nullptr;
+  EvalCtx* context = nullptr;
   std::vector<VectorPtr> peeled;
   std::shared_ptr<PeeledEncoding> peeledEncoding;
   bool nullsPruned = false;
   // The selection of the context being saved.
-  const SelectivityVector* FOLLY_NONNULL rows;
-  const SelectivityVector* FOLLY_NULLABLE finalSelection;
+  const SelectivityVector* rows;
+  const SelectivityVector* finalSelection;
   ErrorVectorPtr errors;
 };
+
+/// Restores the context when the body executes successfully.
+template <typename F>
+void withContextSaver(F&& f) {
+  ContextSaver saver;
+  f(saver);
+  if (saver.context) {
+    saver.context->restore(saver);
+  }
+}
 
 /// Produces a SelectivityVector with a single row selected using a pool of
 /// SelectivityVectors managed by the EvalCtx::execCtx().
@@ -348,28 +436,24 @@ class LocalSelectivityVector {
       : context_(*context.execCtx()),
         vector_(context_.getSelectivityVector(size)) {}
 
-  explicit LocalSelectivityVector(
-      EvalCtx* FOLLY_NONNULL context,
-      vector_size_t size)
+  explicit LocalSelectivityVector(EvalCtx* context, vector_size_t size)
       : LocalSelectivityVector(*context, size) {}
 
   explicit LocalSelectivityVector(core::ExecCtx& context)
       : context_(context), vector_(nullptr) {}
-  explicit LocalSelectivityVector(core::ExecCtx* FOLLY_NONNULL context)
+  explicit LocalSelectivityVector(core::ExecCtx* context)
       : context_(*context), vector_(nullptr) {}
 
   explicit LocalSelectivityVector(EvalCtx& context)
       : context_(*context.execCtx()), vector_(nullptr) {}
 
-  explicit LocalSelectivityVector(EvalCtx* FOLLY_NONNULL context)
+  explicit LocalSelectivityVector(EvalCtx* context)
       : LocalSelectivityVector(*context) {}
 
   LocalSelectivityVector(core::ExecCtx& context, vector_size_t size)
       : context_(context), vector_(context_.getSelectivityVector(size)) {}
 
-  LocalSelectivityVector(
-      core::ExecCtx* FOLLY_NONNULL context,
-      vector_size_t size)
+  LocalSelectivityVector(core::ExecCtx* context, vector_size_t size)
       : LocalSelectivityVector(*context, size) {}
 
   // Grab an instance of a SelectivityVector from the pool and initialize it to
@@ -396,11 +480,11 @@ class LocalSelectivityVector {
     return *vector_;
   }
 
-  SelectivityVector* FOLLY_NULLABLE get() {
+  SelectivityVector* get() {
     return vector_.get();
   }
 
-  SelectivityVector* FOLLY_NONNULL get(vector_size_t size) {
+  SelectivityVector* get(vector_size_t size) {
     if (!vector_) {
       vector_ = context_.getSelectivityVector(size);
     }
@@ -408,7 +492,7 @@ class LocalSelectivityVector {
   }
 
   // Returns a recycled SelectivityVector with 'size' bits set to 'value'.
-  SelectivityVector* FOLLY_NONNULL get(vector_size_t size, bool value) {
+  SelectivityVector* get(vector_size_t size, bool value) {
     if (!vector_) {
       vector_ = context_.getSelectivityVector();
     }
@@ -417,7 +501,7 @@ class LocalSelectivityVector {
   }
 
   // Returns a recycled SelectivityVector initialized from 'other'.
-  SelectivityVector* FOLLY_NONNULL get(const SelectivityVector& other) {
+  SelectivityVector* get(const SelectivityVector& other) {
     if (!vector_) {
       vector_ = context_.getSelectivityVector();
     }
@@ -435,12 +519,12 @@ class LocalSelectivityVector {
     return *vector_;
   }
 
-  SelectivityVector* FOLLY_NULLABLE operator->() {
+  SelectivityVector* operator->() {
     VELOX_DCHECK_NOT_NULL(vector_, "get(size) must be called.");
     return vector_.get();
   }
 
-  const SelectivityVector* FOLLY_NONNULL operator->() const {
+  const SelectivityVector* operator->() const {
     VELOX_DCHECK_NOT_NULL(vector_, "get(size) must be called.");
     return vector_.get();
   }
@@ -457,7 +541,7 @@ class LocalDecodedVector {
   explicit LocalDecodedVector(EvalCtx& context)
       : context_(*context.execCtx()) {}
 
-  explicit LocalDecodedVector(EvalCtx* FOLLY_NONNULL context)
+  explicit LocalDecodedVector(EvalCtx* context)
       : LocalDecodedVector(*context) {}
 
   LocalDecodedVector(
@@ -483,7 +567,7 @@ class LocalDecodedVector {
     }
   }
 
-  DecodedVector* FOLLY_NONNULL get() {
+  DecodedVector* get() {
     if (!vector_) {
       vector_ = context_.get().getDecodedVector();
     }
@@ -501,12 +585,12 @@ class LocalDecodedVector {
     return *vector_;
   }
 
-  DecodedVector* FOLLY_NONNULL operator->() {
+  DecodedVector* operator->() {
     VELOX_DCHECK_NOT_NULL(vector_, "get() must be called.");
     return vector_.get();
   }
 
-  const DecodedVector* FOLLY_NONNULL operator->() const {
+  const DecodedVector* operator->() const {
     VELOX_DCHECK_NOT_NULL(vector_, "get() must be called.");
     return vector_.get();
   }
@@ -525,14 +609,14 @@ class ScopedFinalSelectionSetter {
  public:
   ScopedFinalSelectionSetter(
       EvalCtx& evalCtx,
-      const SelectivityVector* FOLLY_NULLABLE finalSelection,
+      const SelectivityVector* finalSelection,
       bool checkCondition = true,
       bool override = false);
   ~ScopedFinalSelectionSetter();
 
  private:
   EvalCtx& evalCtx_;
-  const SelectivityVector* FOLLY_NULLABLE oldFinalSelection_;
+  const SelectivityVector* oldFinalSelection_;
   bool oldIsFinalSelection_;
 };
 

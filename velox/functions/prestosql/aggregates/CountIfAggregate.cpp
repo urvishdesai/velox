@@ -33,14 +33,6 @@ class CountIfAggregate : public exec::Aggregate {
     return sizeof(int64_t);
   }
 
-  void initializeNewGroups(
-      char** groups,
-      folly::Range<const vector_size_t*> indices) override {
-    for (auto i : indices) {
-      *value<int64_t>(groups[i]) = 0;
-    }
-  }
-
   void extractAccumulators(char** groups, int32_t numGroups, VectorPtr* result)
       override {
     extractValues(groups, numGroups, result);
@@ -162,13 +154,27 @@ class CountIfAggregate : public exec::Aggregate {
     addToGroup(group, numTrue);
   }
 
+ protected:
+  void initializeNewGroupsInternal(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) override {
+    for (auto i : indices) {
+      *value<int64_t>(groups[i]) = 0;
+    }
+  }
+
  private:
   inline void addToGroup(char* group, int64_t numTrue) {
     *value<int64_t>(group) += numTrue;
   }
 };
 
-bool registerCountIf(const std::string& name) {
+} // namespace
+
+void registerCountIfAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite) {
   std::vector<std::shared_ptr<exec::AggregateFunctionSignature>> signatures{
       exec::AggregateFunctionSignatureBuilder()
           .returnType("bigint")
@@ -177,14 +183,16 @@ bool registerCountIf(const std::string& name) {
           .build(),
   };
 
+  auto name = prefix + kCountIf;
   exec::registerAggregateFunction(
       name,
       std::move(signatures),
       [name](
           core::AggregationNode::Step step,
           std::vector<TypePtr> argTypes,
-          const TypePtr&
-          /*resultType*/) -> std::unique_ptr<exec::Aggregate> {
+          const TypePtr& /*resultType*/,
+          const core::QueryConfig& /*config*/)
+          -> std::unique_ptr<exec::Aggregate> {
         VELOX_CHECK_EQ(argTypes.size(), 1, "{} takes one argument", name);
 
         auto isPartial = exec::isRawInput(step);
@@ -197,14 +205,10 @@ bool registerCountIf(const std::string& name) {
         }
 
         return std::make_unique<CountIfAggregate>();
-      });
-  return true;
-}
-
-} // namespace
-
-void registerCountIfAggregate(const std::string& prefix) {
-  registerCountIf(prefix + kCountIf);
+      },
+      {false /*orderSensitive*/},
+      withCompanionFunctions,
+      overwrite);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

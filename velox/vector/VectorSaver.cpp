@@ -416,7 +416,9 @@ void writeRowVector(const BaseVector& vector, std::ostream& out) {
   // Nulls buffer.
   writeOptionalBuffer(vector.nulls(), out);
 
-  auto rowVector = vector.as<RowVector>();
+  const auto* rowVector = vector.as<RowVector>();
+  VELOX_CHECK_NOT_NULL(
+      rowVector, "Expected a RowVector, got: {}", vector.toString());
 
   // Child vectors.
   auto numChildren = rowVector->childrenSize();
@@ -539,11 +541,15 @@ class LoadedVectorShim : public VectorLoader {
  public:
   explicit LoadedVectorShim(VectorPtr vector) : vector_(vector) {}
 
-  void loadInternal(RowSet /*rowSet*/, ValueHook* /*hook*/, VectorPtr* result)
-      override {
+  void loadInternal(
+      RowSet /*rowSet*/,
+      ValueHook* /*hook*/,
+      vector_size_t resultSize,
+      VectorPtr* result) override {
     VELOX_CHECK(
         vector_ != nullptr, "This lazy vector should not have been loaded.");
     *result = vector_;
+    VELOX_CHECK_EQ((*result)->size(), resultSize);
   }
 
  private:
@@ -622,17 +628,13 @@ void saveVector(const BaseVector& vector, std::ostream& out) {
   }
 }
 
-void saveVectorToFile(
-    const BaseVector* FOLLY_NONNULL vector,
-    const char* FOLLY_NONNULL filePath) {
+void saveVectorToFile(const BaseVector* vector, const char* filePath) {
   std::ofstream outputFile(filePath, std::ofstream::binary);
   saveVector(*vector, outputFile);
   outputFile.close();
 }
 
-void saveStringToFile(
-    const std::string& content,
-    const char* FOLLY_NONNULL filePath) {
+void saveStringToFile(const std::string& content, const char* filePath) {
   std::ofstream outputFile(filePath, std::ofstream::binary);
   outputFile.write(content.data(), content.size());
   outputFile.close();
@@ -670,8 +672,8 @@ VectorPtr restoreVector(std::istream& in, memory::MemoryPool* pool) {
 }
 
 VectorPtr restoreVectorFromFile(
-    const char* FOLLY_NONNULL filePath,
-    memory::MemoryPool* FOLLY_NONNULL pool) {
+    const char* filePath,
+    memory::MemoryPool* pool) {
   std::ifstream inputFile(filePath, std::ifstream::binary);
   VELOX_CHECK(!inputFile.fail(), "Cannot open file: {}", filePath);
 
@@ -680,7 +682,7 @@ VectorPtr restoreVectorFromFile(
   return result;
 }
 
-std::string restoreStringFromFile(const char* FOLLY_NONNULL filePath) {
+std::string restoreStringFromFile(const char* filePath) {
   std::ifstream inputFile(filePath, std::ifstream::binary);
   VELOX_CHECK(!inputFile.fail(), "Cannot open file: {}", filePath);
 
@@ -729,6 +731,9 @@ void saveStdVectorToFile(const std::vector<T>& list, const char* filePath) {
 template void saveStdVectorToFile<column_index_t>(
     const std::vector<column_index_t>& list,
     const char* filePath);
+template void saveStdVectorToFile<int>(
+    const std::vector<int>& list,
+    const char* filePath);
 
 template <typename T>
 std::vector<T> restoreStdVectorFromFile(const char* filePath) {
@@ -743,6 +748,7 @@ std::vector<T> restoreStdVectorFromFile(const char* filePath) {
 
 template std::vector<column_index_t> restoreStdVectorFromFile<column_index_t>(
     const char* filePath);
+template std::vector<int> restoreStdVectorFromFile<int>(const char* filePath);
 
 void saveSelectivityVector(const SelectivityVector& rows, std::ostream& out) {
   auto range = rows.asRange();
@@ -769,3 +775,10 @@ SelectivityVector restoreSelectivityVector(std::istream& in) {
 }
 
 } // namespace facebook::velox
+
+template <>
+struct fmt::formatter<facebook::velox::Encoding> : formatter<int> {
+  auto format(facebook::velox::Encoding s, format_context& ctx) {
+    return formatter<int>::format(static_cast<int>(s), ctx);
+  }
+};

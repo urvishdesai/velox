@@ -15,7 +15,9 @@
  */
 
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
-#include "velox/functions/prestosql/aggregates/tests/AggregationTestBase.h"
+#include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
+
+using namespace facebook::velox::functions::aggregate::test;
 
 namespace facebook::velox::aggregate::test {
 namespace {
@@ -135,7 +137,9 @@ TYPED_TEST(ApproxMostFrequentTest, emptyGroup) {
 using ApproxMostFrequentTestInt = ApproxMostFrequentTest<int>;
 
 TEST_F(ApproxMostFrequentTestInt, invalidBuckets) {
-  pool()->getMemoryUsageTracker()->testingUpdateMaxMemory(1 << 21);
+  auto rootPool = memory::memoryManager()->addRootPool(
+      "test-root", 1 << 21, exec::MemoryReclaimer::create());
+  auto leafPool = rootPool->addLeafChild("test-leaf");
   auto run = [&](int64_t buckets) {
     auto rows = makeRowVector({
         makeConstant<int64_t>(buckets, buckets),
@@ -146,7 +150,7 @@ TEST_F(ApproxMostFrequentTestInt, invalidBuckets) {
                     .values({rows})
                     .singleAggregation({}, {"approx_most_frequent(c0, c1, c2)"})
                     .planNode();
-    return exec::test::AssertQueryBuilder(plan).copyResults(pool());
+    return exec::test::AssertQueryBuilder(plan).copyResults(leafPool.get());
   };
   ASSERT_EQ(run(10)->size(), 1);
   try {
@@ -155,6 +159,27 @@ TEST_F(ApproxMostFrequentTestInt, invalidBuckets) {
   } catch (const VeloxException& e) {
     EXPECT_EQ(e.errorCode(), error_code::kMemCapExceeded);
   }
+}
+
+using ApproxMostFrequentTestStringView = ApproxMostFrequentTest<StringView>;
+
+TEST_F(ApproxMostFrequentTestStringView, stringLifeCycle) {
+  std::string s[32];
+  for (int i = 0; i < 32; ++i) {
+    s[i] = std::string(StringView::kInlineSize, 'x') + std::to_string(i);
+  }
+  auto values = makeFlatVector<StringView>(1000, [&](auto row) {
+    return StringView(s[static_cast<int>(std::sqrt(row))]);
+  });
+  auto rows = makeRowVector({values});
+  auto expected = makeRowVector({
+      makeMapVector<StringView, int64_t>(
+          {{{StringView(s[30]), 122},
+            {StringView(s[29]), 118},
+            {StringView(s[28]), 114}}}),
+  });
+  testReadFromFiles(
+      {rows, rows}, {}, {"approx_most_frequent(3, c0, 31)"}, {expected});
 }
 
 } // namespace

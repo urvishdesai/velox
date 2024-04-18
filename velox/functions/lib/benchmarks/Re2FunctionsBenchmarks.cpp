@@ -86,8 +86,9 @@ BENCHMARK_NAMED_PARAM_MULTI(regexExtract, bs100k, 100 << 10);
 
 std::shared_ptr<exec::VectorFunction> makeRegexExtract(
     const std::string& name,
-    const std::vector<exec::VectorFunctionArg>& inputArgs) {
-  return makeRe2Extract(name, inputArgs, /*emptyNoMatch=*/false);
+    const std::vector<exec::VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& config) {
+  return makeRe2Extract(name, inputArgs, config, /*emptyNoMatch=*/false);
 }
 
 void registerRe2Functions() {
@@ -102,8 +103,9 @@ void registerRe2Functions() {
 } // namespace facebook::velox::functions::test
 
 int main(int argc, char** argv) {
-  folly::init(&argc, &argv);
+  folly::Init init{&argc, &argv};
   facebook::velox::functions::test::registerRe2Functions();
+  facebook::velox::memory::MemoryManager::initialize({});
   folly::runBenchmarks();
   return 0;
 }

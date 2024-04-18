@@ -42,7 +42,7 @@ class SequenceVector : public SimpleVector<T> {
   SequenceVector(
       velox::memory::MemoryPool* pool,
       size_t length,
-      std::shared_ptr<BaseVector> sequenceValues,
+      VectorPtr sequenceValues,
       BufferPtr sequenceLengths,
       const SimpleVectorStats<T>& stats = {},
       std::optional<int32_t> distinctCount = std::nullopt,
@@ -68,6 +68,19 @@ class SequenceVector : public SimpleVector<T> {
     return isNullAtFast(idx);
   }
 
+  bool containsNullAt(vector_size_t idx) const override {
+    if constexpr (std::is_same_v<T, ComplexType>) {
+      if (isNullAt(idx)) {
+        return true;
+      }
+
+      size_t offset = offsetOfIndex(idx);
+      return sequenceValues_->containsNullAt(offset);
+    } else {
+      return isNullAt(idx);
+    }
+  }
+
   const T valueAtFast(vector_size_t idx) const;
 
   const T valueAt(vector_size_t idx) const override {
@@ -90,7 +103,7 @@ class SequenceVector : public SimpleVector<T> {
    * this vector as SequenceLength types. This is used during execution to
    * process over the subset of values when possible.
    */
-  inline std::shared_ptr<BaseVector> getSequenceValues() const {
+  inline VectorPtr getSequenceValues() const {
     return sequenceValues_;
   }
 
@@ -108,7 +121,11 @@ class SequenceVector : public SimpleVector<T> {
     return const_cast<SequenceVector<T>*>(this)->loadedVector();
   }
 
-  VectorPtr valueVector() const override {
+  const VectorPtr& valueVector() const override {
+    return sequenceValues_;
+  }
+
+  VectorPtr& valueVector() override {
     return sequenceValues_;
   }
 
@@ -119,7 +136,7 @@ class SequenceVector : public SimpleVector<T> {
   /**
    * Returns a shared_ptr to the underlying values container.
    */
-  inline std::shared_ptr<BaseVector> getValuesVectorShared() const {
+  inline VectorPtr getValuesVectorShared() const {
     return sequenceValues_;
   }
 
@@ -158,6 +175,10 @@ class SequenceVector : public SimpleVector<T> {
     throw std::runtime_error("addNulls not supported");
   }
 
+  void addNulls(const SelectivityVector& rows) override {
+    throw std::runtime_error("addNulls not supported");
+  }
+
   std::string toString(vector_size_t index) const override {
     if (BaseVector::isNullAt(index)) {
       return "null";
@@ -183,7 +204,7 @@ class SequenceVector : public SimpleVector<T> {
 
   bool checkLoadRange(size_t idx, size_t count) const;
 
-  std::shared_ptr<BaseVector> sequenceValues_;
+  VectorPtr sequenceValues_;
   SimpleVector<T>* scalarSequenceValues_ = nullptr;
   BufferPtr sequenceLengths_;
   // Caches 'sequenceLengths_->as<vector_size_t>()'

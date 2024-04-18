@@ -46,14 +46,6 @@ struct DecodedInputs {
 // https://prestodb.io/docs/current/functions/array.html#zip_with
 class ZipWithFunction : public exec::VectorFunction {
  public:
-  bool isDefaultNullBehavior() const override {
-    // zip_with is null preserving for the arrays, but since an
-    // expr tree with a lambda depends on all named fields, including
-    // captures, a null in a capture does not automatically make a
-    // null result.
-    return false;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -92,7 +84,7 @@ class ZipWithFunction : public exec::VectorFunction {
     auto* rawOffsets = resultBuffers.offsets->as<vector_size_t>();
     auto* rawSizes = resultBuffers.sizes->as<vector_size_t>();
 
-    const SelectivityVector allElementRows(numResultElements);
+    const SelectivityVector validRowsInReusedResult(numResultElements);
 
     VectorPtr newElements;
 
@@ -129,13 +121,9 @@ class ZipWithFunction : public exec::VectorFunction {
         });
       }
 
-      // Make sure already populated entries in newElements do not get
-      // overwritten.
-      exec::ScopedFinalSelectionSetter(context, &allElementRows, true, true);
-
       entry.callable->apply(
           elementRows,
-          allElementRows,
+          &validRowsInReusedResult,
           wrapCapture,
           &context,
           lambdaArgs,
@@ -186,6 +174,8 @@ class ZipWithFunction : public exec::VectorFunction {
         decodedInputs.decodedRight->mayHaveNulls()) {
       nulls = allocateNulls(rows.end(), pool);
       rawNulls = nulls->asMutable<uint64_t>();
+      // Set nulls for rows not present in 'rows'.
+      memcpy(rawNulls, rows.asRange().bits(), bits::nbytes(rows.end()));
     }
 
     auto leftSizes = decodedInputs.baseLeft->rawSizes();
@@ -250,7 +240,7 @@ class ZipWithFunction : public exec::VectorFunction {
     auto* sizes = base->rawSizes();
 
     if (!needsPadding && decoded->isIdentityMapping() && rows.isAllSelected() &&
-        areSameOffsets(offsets, resultOffsets, rows.size())) {
+        areSameOffsets(offsets, resultOffsets, rows.end())) {
       return base->elements();
     }
 
@@ -324,9 +314,15 @@ class ZipWithFunction : public exec::VectorFunction {
 };
 } // namespace
 
-VELOX_DECLARE_VECTOR_FUNCTION(
+/// zip_with is null preserving for the arrays, but since an
+/// expr tree with a lambda depends on all named fields, including
+/// captures, a null in a capture does not automatically make a
+/// null result.
+
+VELOX_DECLARE_VECTOR_FUNCTION_WITH_METADATA(
     udf_zip_with,
     ZipWithFunction::signatures(),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     std::make_unique<ZipWithFunction>());
 
 } // namespace facebook::velox::functions

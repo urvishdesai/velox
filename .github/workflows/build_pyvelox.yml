@@ -46,13 +46,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # TODO: https://github.com/facebookincubator/velox/issues/9014
+  if: false
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-11]
+        os: [ubuntu-22.04]
     steps:
       - uses: actions/checkout@v3
         with:
@@ -127,6 +129,7 @@ jobs:
             cp -R /host${{ github.workspace }}/.ccache /output/.ccache &&
             ccache -s
           CIBW_ENVIRONMENT_PASS_LINUX: CCACHE_DIR BUILD_VERSION
+          CIBW_TEST_EXTRAS: "tests"
           CIBW_TEST_COMMAND: "cd {project}/pyvelox && python -m unittest -v"
           CIBW_TEST_SKIP: "*macos*"
           CCACHE_DIR: "${{ matrix.os != 'macos-11' && '/output' || github.workspace }}/.ccache"

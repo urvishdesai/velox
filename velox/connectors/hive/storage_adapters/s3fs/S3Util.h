@@ -23,8 +23,11 @@
 
 #include <aws/s3/S3Errors.h>
 #include <aws/s3/model/HeadObjectResult.h>
+#include <folly/Uri.h>
 
 #include "velox/common/base/Exceptions.h"
+
+#include <fmt/format.h>
 
 namespace facebook::velox {
 
@@ -40,6 +43,9 @@ constexpr std::string_view kS3aScheme{"s3a://"};
 constexpr std::string_view kS3nScheme{"s3n://"};
 // OSS Alibaba support S3 format, usage only with SSL.
 constexpr std::string_view kOssScheme{"oss://"};
+// Tencent COS support S3 format.
+constexpr std::string_view kCosScheme{"cos://"};
+constexpr std::string_view kCosNScheme{"cosn://"};
 // From AWS documentation
 constexpr int kS3MaxKeySize{1024};
 } // namespace
@@ -60,13 +66,21 @@ inline bool isOssFile(const std::string_view filename) {
   return filename.substr(0, kOssScheme.size()) == kOssScheme;
 }
 
+inline bool isCosFile(const std::string_view filename) {
+  return filename.substr(0, kCosScheme.size()) == kCosScheme;
+}
+
+inline bool isCosNFile(const std::string_view filename) {
+  return filename.substr(0, kCosNScheme.size()) == kCosNScheme;
+}
+
 inline bool isS3File(const std::string_view filename) {
   // TODO: Each prefix should be implemented as its own filesystem.
   return isS3AwsFile(filename) || isS3aFile(filename) || isS3nFile(filename) ||
-      isOssFile(filename);
+      isOssFile(filename) || isCosFile(filename) || isCosNFile(filename);
 }
 
-inline void bucketAndKeyFromS3Path(
+inline void getBucketAndKeyFromS3Path(
     const std::string& path,
     std::string& bucket,
     std::string& key) {
@@ -102,6 +116,10 @@ inline std::string s3Path(const std::string_view& path) {
     return std::string(path.substr(kS3nScheme.length()));
   } else if (isOssFile(path)) {
     return std::string(path.substr(kOssScheme.length()));
+  } else if (isCosFile(path)) {
+    return std::string(path.substr(kCosScheme.length()));
+  } else if (isCosNFile(path)) {
+    return std::string(path.substr(kCosNScheme.length()));
   }
   return std::string(path);
 }
@@ -122,22 +140,74 @@ inline std::string getS3BackendService(
   }
   return "Unknown";
 }
+
+inline std::string getRequestID(
+    const Aws::Http::HeaderValueCollection& headers) {
+  static const std::vector<std::string> kRequestIds{
+      "x-amz-request-id", "x-oss-request-id"};
+
+  for (const auto& kRequestId : kRequestIds) {
+    const auto it = headers.find(kRequestId);
+    if (it != headers.end()) {
+      return it->second;
+    }
+  }
+  return "";
+}
 } // namespace
 
-#define VELOX_CHECK_AWS_OUTCOME(outcome, errorMsgPrefix, bucket, key)                                          \
-  {                                                                                                            \
-    if (!outcome.IsSuccess()) {                                                                                \
-      auto error = outcome.GetError();                                                                         \
-      VELOX_FAIL(                                                                                              \
-          "{} due to: '{}'. Path:'{}', SDK Error Type:{}, HTTP Status Code:{}, S3 Service:'{}', Message:'{}'", \
-          errorMsgPrefix,                                                                                      \
-          getErrorStringFromS3Error(error),                                                                    \
-          s3URI(bucket, key),                                                                                  \
-          error.GetErrorType(),                                                                                \
-          error.GetResponseCode(),                                                                             \
-          getS3BackendService(error.GetResponseHeaders()),                                                     \
-          error.GetMessage());                                                                                 \
-    }                                                                                                          \
+/// Only Amazon (amz) and Alibaba (oss) request IDs are supported.
+#define VELOX_CHECK_AWS_OUTCOME(outcome, errorMsgPrefix, bucket, key)                                                          \
+  {                                                                                                                            \
+    if (!outcome.IsSuccess()) {                                                                                                \
+      auto error = outcome.GetError();                                                                                         \
+      auto errMsg = fmt::format(                                                                                               \
+          "{} due to: '{}'. Path:'{}', SDK Error Type:{}, HTTP Status Code:{}, S3 Service:'{}', Message:'{}', RequestID:'{}'", \
+          errorMsgPrefix,                                                                                                      \
+          getErrorStringFromS3Error(error),                                                                                    \
+          s3URI(bucket, key),                                                                                                  \
+          static_cast<int>(error.GetErrorType()),                                                                              \
+          error.GetResponseCode(),                                                                                             \
+          getS3BackendService(error.GetResponseHeaders()),                                                                     \
+          error.GetMessage(),                                                                                                  \
+          getRequestID(error.GetResponseHeaders()));                                                                           \
+      if (error.GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND) {                                                 \
+        VELOX_FILE_NOT_FOUND_ERROR(errMsg);                                                                                    \
+      }                                                                                                                        \
+      VELOX_FAIL(errMsg)                                                                                                       \
+    }                                                                                                                          \
   }
 
+bool isHostExcludedFromProxy(
+    const std::string& hostname,
+    const std::string& noProxyList);
+
+std::string getHttpProxyEnvVar();
+std::string getHttpsProxyEnvVar();
+std::string getNoProxyEnvVar();
+
+class S3ProxyConfigurationBuilder {
+ public:
+  S3ProxyConfigurationBuilder(const std::string& s3Endpoint)
+      : s3Endpoint_(s3Endpoint){};
+
+  S3ProxyConfigurationBuilder& useSsl(const bool& useSsl) {
+    useSsl_ = useSsl;
+    return *this;
+  }
+
+  std::optional<folly::Uri> build();
+
+ private:
+  const std::string s3Endpoint_;
+  bool useSsl_;
+};
+
 } // namespace facebook::velox
+
+template <>
+struct fmt::formatter<Aws::Http::HttpResponseCode> : formatter<int> {
+  auto format(Aws::Http::HttpResponseCode s, format_context& ctx) {
+    return formatter<int>::format(static_cast<int>(s), ctx);
+  }
+};

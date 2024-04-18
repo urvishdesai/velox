@@ -18,16 +18,16 @@
 
 #include "velox/common/time/Timer.h"
 #include "velox/dwio/common/BufferedInput.h"
-#include "velox/dwio/common/DataSink.h"
+#include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/common/Reader.h"
 #include "velox/dwio/common/ScanSpec.h"
 #include "velox/dwio/common/SelectiveColumnReader.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/dwio/common/tests/utils/DataSetBuilder.h"
 #include "velox/dwio/common/tests/utils/FilterGenerator.h"
-#include "velox/dwio/type/fbhive/HiveTypeParser.h"
 #include "velox/type/Filter.h"
 #include "velox/type/Subfield.h"
+#include "velox/type/fbhive/HiveTypeParser.h"
 #include "velox/vector/FlatVector.h"
 
 #include <gtest/gtest.h>
@@ -78,10 +78,13 @@ class E2EFilterTestBase : public testing::Test {
  protected:
   static constexpr int32_t kRowsInGroup = 10'000;
 
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   void SetUp() override {
-    rootPool_ =
-        memory::getProcessDefaultMemoryManager().getPool("E2EFilterTestBase");
-    leafPool_ = rootPool_->addChild("E2EFilterTestBase");
+    rootPool_ = memory::memoryManager()->addRootPool("E2EFilterTestBase");
+    leafPool_ = rootPool_->addLeafChild("E2EFilterTestBase");
   }
 
   static bool typeKindSupportsValueHook(TypeKind kind) {
@@ -190,6 +193,7 @@ class E2EFilterTestBase : public testing::Test {
 
   void readWithFilter(
       std::shared_ptr<common::ScanSpec> spec,
+      const MutationSpec&,
       const std::vector<RowVectorPtr>& batches,
       const std::vector<uint64_t>& hitRows,
       uint64_t& time,
@@ -257,6 +261,7 @@ class E2EFilterTestBase : public testing::Test {
  private:
   void testReadWithFilterLazy(
       const std::shared_ptr<common::ScanSpec>& spec,
+      const MutationSpec&,
       const std::vector<RowVectorPtr>& batches,
       const std::vector<uint64_t>& hitRows);
 
@@ -277,6 +282,7 @@ class E2EFilterTestBase : public testing::Test {
       const std::vector<RowVectorPtr>& batches,
       common::Subfield filterField,
       std::unique_ptr<common::Filter> filter,
+      core::ExpressionEvaluator*,
       const std::string& remainingFilter,
       std::function<bool(int64_t a, int64_t c)> validationFilter);
 
@@ -284,6 +290,8 @@ class E2EFilterTestBase : public testing::Test {
   void testMetadataFilter();
 
   void testSubfieldsPruning();
+
+  void testMutationCornerCases();
 
   // Allows testing reading with different batch sizes.
   void resetReadBatchSizes() {

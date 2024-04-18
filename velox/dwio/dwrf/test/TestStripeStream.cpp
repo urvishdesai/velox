@@ -19,8 +19,8 @@
 #include "velox/dwio/dwrf/test/OrcTest.h"
 #include "velox/dwio/dwrf/utils/ProtoUtils.h"
 #include "velox/dwio/dwrf/writer/WriterBase.h"
-#include "velox/dwio/type/fbhive/HiveTypeParser.h"
 #include "velox/type/Type.h"
+#include "velox/type/fbhive/HiveTypeParser.h"
 
 using namespace testing;
 using namespace facebook::velox::dwio::common;
@@ -28,9 +28,10 @@ using namespace facebook::velox::dwio::common::encryption::test;
 using namespace facebook::velox::dwrf;
 using namespace facebook::velox::dwrf::encryption;
 using namespace facebook::velox::memory;
-
 using facebook::velox::RowType;
-using facebook::velox::dwio::type::fbhive::HiveTypeParser;
+using facebook::velox::common::Region;
+using facebook::velox::dwio::common::BufferedInput;
+using facebook::velox::type::fbhive::HiveTypeParser;
 
 class RecordingInputStream : public facebook::velox::InMemoryReadFile {
  public:
@@ -59,16 +60,16 @@ class TestProvider : public StrideIndexProvider {
 
 namespace {
 void enqueueReads(
-    const StripeReaderBase& reader,
+    BufferedInput& input,
+    facebook::velox::dwrf::ReaderBase& readerBase,
+    const proto::StripeFooter& footer,
     const ColumnSelector& selector,
     uint64_t stripeStart,
     uint32_t stripeIndex) {
-  auto& input = reader.getStripeInput();
-  auto& metadataCache = reader.getReader().getMetadataCache();
+  auto& metadataCache = readerBase.getMetadataCache();
   uint64_t offset = stripeStart;
   uint64_t length = 0;
   uint32_t regions = 0;
-  auto& footer = reader.getStripeFooter();
   for (const auto& stream : footer.streams()) {
     length = stream.length();
     // If index cache is available, there is no need to read it
@@ -87,19 +88,39 @@ void enqueueReads(
 }
 
 StripeStreamsImpl createAndLoadStripeStreams(
-    const StripeReaderBase& stripeReader,
+    std::shared_ptr<StripeReadState> readState,
     const ColumnSelector& selector) {
   TestProvider indexProvider;
   StripeStreamsImpl streams{
-      stripeReader, selector, RowReaderOptions{}, 0, indexProvider, 0};
-  enqueueReads(stripeReader, selector, 0, 0);
+      readState,
+      selector,
+      RowReaderOptions{},
+      0,
+      StripeStreamsImpl::kUnknownStripeRows,
+      indexProvider,
+      0};
+  enqueueReads(
+      *readState->stripeMetadata->stripeInput,
+      *readState->readerBase,
+      *readState->stripeMetadata->footer,
+      selector,
+      0,
+      0);
   streams.loadReadPlan();
   return streams;
 }
+
+class StripeStreamTest : public testing::Test {
+ protected:
+  static void SetUpTestCase() {
+    MemoryManager::testingSetInstance({});
+  }
+
+  std::shared_ptr<MemoryPool> pool_{memoryManager()->addLeafPool()};
+};
 } // namespace
 
-TEST(StripeStream, planReads) {
-  auto pool = getDefaultMemoryPool();
+TEST_F(StripeStreamTest, planReads) {
   google::protobuf::Arena arena;
   auto footer = google::protobuf::Arena::CreateMessage<proto::Footer>(&arena);
   footer->set_rowindexstride(100);
@@ -108,14 +129,19 @@ TEST(StripeStream, planReads) {
   auto is = std::make_unique<RecordingInputStream>();
   auto isPtr = is.get();
   auto readerBase = std::make_shared<ReaderBase>(
-      *pool,
-      std::make_unique<BufferedInput>(std::move(is), *pool),
+      *pool_,
+      std::make_unique<BufferedInput>(
+          std::move(is),
+          *pool_,
+          MetricsLog::voidLog(),
+          nullptr,
+          BufferedInput::kMaxMergeDistance,
+          true),
       std::make_unique<PostScript>(proto::PostScript{}),
       footer,
       nullptr);
   ColumnSelector cs{readerBase->getSchema(), std::vector<uint64_t>{2}, true};
-  auto stripeFooter =
-      google::protobuf::Arena::CreateMessage<proto::StripeFooter>(&arena);
+  auto stripeFooter = std::make_unique<proto::StripeFooter>();
   std::vector<std::tuple<uint64_t, StreamKind, uint64_t>> ss{
       std::make_tuple(1, StreamKind::StreamKind_ROW_INDEX, 100),
       std::make_tuple(2, StreamKind::StreamKind_ROW_INDEX, 100),
@@ -129,19 +155,31 @@ TEST(StripeStream, planReads) {
     stream->set_kind(static_cast<proto::Stream_Kind>(std::get<1>(s)));
     stream->set_length(std::get<2>(s));
   }
-  std::vector<Region> expected{{100, 500}, {5000600, 1000000}};
-  StripeReaderBase stripeReader{readerBase, stripeFooter};
-  auto streams = createAndLoadStripeStreams(stripeReader, cs);
+  TestDecrypterFactory factory;
+  auto handler = DecryptionHandler::create(FooterWrapper(footer), &factory);
+  auto stripeMetadata = std::make_unique<const StripeMetadata>(
+      readerBase->getBufferedInput().clone(),
+      std::move(stripeFooter),
+      std::move(handler),
+      StripeInformationWrapper(
+          static_cast<const proto::StripeInformation*>(nullptr)));
+  auto stripeReadState =
+      std::make_shared<StripeReadState>(readerBase, std::move(stripeMetadata));
+  StripeReaderBase stripeReader{readerBase};
+  auto streams = createAndLoadStripeStreams(stripeReadState, cs);
   auto const& actual = isPtr->getReads();
-  EXPECT_EQ(actual.size(), expected.size());
-  for (uint64_t i = 0; i < actual.size(); ++i) {
-    EXPECT_EQ(actual[i].offset, expected[i].offset);
-    EXPECT_EQ(actual[i].length, expected[i].length);
-  }
+  ASSERT_FALSE(actual.empty());
+  EXPECT_EQ(std::min(actual.cbegin(), actual.cend())->offset, 100);
+  EXPECT_EQ(
+      std::accumulate(
+          actual.cbegin(),
+          actual.cend(),
+          0,
+          [](uint64_t ac, const Region& r) { return ac + r.length; }),
+      1000300);
 }
 
-TEST(StripeStream, filterSequences) {
-  auto pool = getDefaultMemoryPool();
+TEST_F(StripeStreamTest, filterSequences) {
   google::protobuf::Arena arena;
   auto footer = google::protobuf::Arena::CreateMessage<proto::Footer>(&arena);
   footer->set_rowindexstride(100);
@@ -150,8 +188,8 @@ TEST(StripeStream, filterSequences) {
   auto is = std::make_unique<RecordingInputStream>();
   auto isPtr = is.get();
   auto readerBase = std::make_shared<ReaderBase>(
-      *pool,
-      std::make_unique<BufferedInput>(std::move(is), *pool),
+      *pool_,
+      std::make_unique<BufferedInput>(std::move(is), *pool_),
       std::make_unique<PostScript>(proto::PostScript{}),
       footer,
       nullptr);
@@ -165,8 +203,7 @@ TEST(StripeStream, filterSequences) {
 
   // mock the input stream data to verify our plan
   // only covered the filtered streams
-  auto stripeFooter =
-      google::protobuf::Arena::CreateMessage<proto::StripeFooter>(&arena);
+  auto stripeFooter = std::make_unique<proto::StripeFooter>();
   std::vector<std::tuple<uint64_t, StreamKind, uint64_t, uint64_t>> ss{
       std::make_tuple(1, StreamKind::StreamKind_ROW_INDEX, 100, 0),
       std::make_tuple(2, StreamKind::StreamKind_ROW_INDEX, 100, 0),
@@ -184,10 +221,20 @@ TEST(StripeStream, filterSequences) {
     stream->set_sequence(std::get<3>(s));
   }
 
+  TestDecrypterFactory factory;
+  auto handler = DecryptionHandler::create(FooterWrapper(footer), &factory);
   // filter by sequence 1
   std::vector<Region> expected{{600, 5000000}, {8000600, 1000000}};
-  StripeReaderBase stripeReader{readerBase, stripeFooter};
-  auto streams = createAndLoadStripeStreams(stripeReader, cs);
+  auto stripeMetadata = std::make_unique<const StripeMetadata>(
+      readerBase->getBufferedInput().clone(),
+      std::move(stripeFooter),
+      std::move(handler),
+      StripeInformationWrapper(
+          static_cast<const proto::StripeInformation*>(nullptr)));
+  auto stripeReadState =
+      std::make_shared<StripeReadState>(readerBase, std::move(stripeMetadata));
+  StripeReaderBase stripeReader{readerBase};
+  auto streams = createAndLoadStripeStreams(stripeReadState, cs);
   auto const& actual = isPtr->getReads();
   EXPECT_EQ(actual.size(), expected.size());
   for (uint64_t i = 0; i < actual.size(); ++i) {
@@ -196,8 +243,7 @@ TEST(StripeStream, filterSequences) {
   }
 }
 
-TEST(StripeStream, zeroLength) {
-  auto pool = getDefaultMemoryPool();
+TEST_F(StripeStreamTest, zeroLength) {
   google::protobuf::Arena arena;
   auto footer = google::protobuf::Arena::CreateMessage<proto::Footer>(&arena);
   footer->set_rowindexstride(100);
@@ -209,14 +255,13 @@ TEST(StripeStream, zeroLength) {
   auto is = std::make_unique<RecordingInputStream>();
   auto isPtr = is.get();
   auto readerBase = std::make_shared<ReaderBase>(
-      *pool,
-      std::make_unique<BufferedInput>(std::move(is), *pool),
+      *pool_,
+      std::make_unique<BufferedInput>(std::move(is), *pool_),
       std::make_unique<PostScript>(std::move(ps)),
       footer,
       nullptr);
 
-  auto stripeFooter =
-      google::protobuf::Arena::CreateMessage<proto::StripeFooter>(&arena);
+  auto stripeFooter = std::make_unique<proto::StripeFooter>();
   std::vector<std::tuple<uint64_t, StreamKind, uint64_t>> ss{
       std::make_tuple(0, StreamKind::StreamKind_ROW_INDEX, 0),
       std::make_tuple(1, StreamKind::StreamKind_ROW_INDEX, 0),
@@ -227,11 +272,29 @@ TEST(StripeStream, zeroLength) {
     stream->set_kind(static_cast<proto::Stream_Kind>(std::get<1>(s)));
     stream->set_length(std::get<2>(s));
   }
-  StripeReaderBase stripeReader{readerBase, stripeFooter};
+
+  TestDecrypterFactory factory;
+  auto handler = DecryptionHandler::create(FooterWrapper(footer), &factory);
+  auto stripeMetadata = std::make_unique<const StripeMetadata>(
+      readerBase->getBufferedInput().clone(),
+      std::move(stripeFooter),
+      std::move(handler),
+      StripeInformationWrapper(
+          static_cast<const proto::StripeInformation*>(nullptr)));
+  auto stripeReadState =
+      std::make_shared<StripeReadState>(readerBase, std::move(stripeMetadata));
+  StripeReaderBase stripeReader{readerBase};
+
   TestProvider indexProvider;
   ColumnSelector cs{std::dynamic_pointer_cast<const RowType>(type)};
   StripeStreamsImpl streams{
-      stripeReader, cs, RowReaderOptions{}, 0, indexProvider, 0};
+      stripeReadState,
+      cs,
+      RowReaderOptions{},
+      0,
+      StripeStreamsImpl::kUnknownStripeRows,
+      indexProvider,
+      0};
   streams.loadReadPlan();
   auto const& actual = isPtr->getReads();
   EXPECT_EQ(actual.size(), 0);
@@ -239,7 +302,7 @@ TEST(StripeStream, zeroLength) {
   for (const auto& s : ss) {
     auto id = EncodingKey(std::get<0>(s))
                   .forKind(static_cast<proto::Stream_Kind>(std::get<1>(s)));
-    auto stream = streams.getStream(id, true);
+    auto stream = streams.getStream(id, {}, true);
     EXPECT_NE(stream, nullptr);
     const void* buf = nullptr;
     int32_t size = 1;
@@ -249,8 +312,7 @@ TEST(StripeStream, zeroLength) {
   }
 }
 
-TEST(StripeStream, planReadsIndex) {
-  auto pool = getDefaultMemoryPool();
+TEST_F(StripeStreamTest, planReadsIndex) {
   google::protobuf::Arena arena;
 
   // build ps
@@ -276,7 +338,7 @@ TEST(StripeStream, planReadsIndex) {
 
   // build cache
   std::string str(buffer.str());
-  auto cacheBuffer = std::make_shared<DataBuffer<char>>(*pool, str.size());
+  auto cacheBuffer = std::make_shared<DataBuffer<char>>(*pool_, str.size());
   memcpy(cacheBuffer->data(), str.data(), str.size());
   auto cache = std::make_unique<StripeMetadataCache>(
       StripeCacheMode::INDEX, FooterWrapper(footer), std::move(cacheBuffer));
@@ -284,14 +346,13 @@ TEST(StripeStream, planReadsIndex) {
   auto is = std::make_unique<RecordingInputStream>();
   auto isPtr = is.get();
   auto readerBase = std::make_shared<ReaderBase>(
-      *pool,
-      std::make_unique<BufferedInput>(std::move(is), *pool),
+      *pool_,
+      std::make_unique<BufferedInput>(std::move(is), *pool_),
       std::make_unique<PostScript>(std::move(ps)),
       footer,
       std::move(cache));
 
-  auto stripeFooter =
-      google::protobuf::Arena::CreateMessage<proto::StripeFooter>(&arena);
+  auto stripeFooter = std::make_unique<proto::StripeFooter>();
   std::vector<std::tuple<uint64_t, StreamKind, uint64_t>> ss{
       std::make_tuple(0, StreamKind::StreamKind_ROW_INDEX, length),
       std::make_tuple(1, StreamKind::StreamKind_ROW_INDEX, length),
@@ -303,25 +364,42 @@ TEST(StripeStream, planReadsIndex) {
     stream->set_kind(static_cast<proto::Stream_Kind>(std::get<1>(s)));
     stream->set_length(std::get<2>(s));
   }
-  StripeReaderBase stripeReader{readerBase, stripeFooter};
+
+  TestDecrypterFactory factory;
+  auto handler = DecryptionHandler::create(FooterWrapper(footer), &factory);
+  auto stripeMetadata = std::make_unique<const StripeMetadata>(
+      readerBase->getBufferedInput().clone(),
+      std::move(stripeFooter),
+      std::move(handler),
+      StripeInformationWrapper(
+          static_cast<const proto::StripeInformation*>(nullptr)));
+  auto stripeReadState =
+      std::make_shared<StripeReadState>(readerBase, std::move(stripeMetadata));
+  StripeReaderBase stripeReader{readerBase};
   ColumnSelector cs{std::dynamic_pointer_cast<const RowType>(type)};
-  auto streams = createAndLoadStripeStreams(stripeReader, cs);
+  auto streams = createAndLoadStripeStreams(stripeReadState, cs);
   auto const& actual = isPtr->getReads();
-  EXPECT_EQ(actual.size(), 1);
-  EXPECT_EQ(actual[0].offset, length * 2);
-  EXPECT_EQ(actual[0].length, 1000200);
+  ASSERT_FALSE(actual.empty());
+  EXPECT_EQ(std::min(actual.cbegin(), actual.cend())->offset, length * 2);
+  EXPECT_EQ(
+      std::accumulate(
+          actual.cbegin(),
+          actual.cend(),
+          0UL,
+          [](uint64_t ac, const Region& r) { return ac + r.length; }),
+      1000200);
 
   EXPECT_EQ(
       ProtoUtils::readProto<proto::RowIndex>(
           streams.getStream(
-              EncodingKey(0).forKind(proto::Stream_Kind_ROW_INDEX), true))
+              EncodingKey(0).forKind(proto::Stream_Kind_ROW_INDEX), {}, true))
           ->entry(0)
           .positions(0),
       123);
   EXPECT_EQ(
       ProtoUtils::readProto<proto::RowIndex>(
           streams.getStream(
-              EncodingKey(1).forKind(proto::Stream_Kind_ROW_INDEX), true))
+              EncodingKey(1).forKind(proto::Stream_Kind_ROW_INDEX), {}, true))
           ->entry(0)
           .positions(0),
       123);
@@ -353,8 +431,8 @@ void addNode(T& t, uint32_t node, uint32_t offset = 0) {
   }
 }
 
-TEST(StripeStream, readEncryptedStreams) {
-  auto pool = getProcessDefaultMemoryManager().getPool("readEncryptedStreams");
+TEST_F(StripeStreamTest, readEncryptedStreams) {
+  auto pool = memoryManager()->addRootPool("readEncryptedStreams");
   google::protobuf::Arena arena;
   proto::PostScript ps;
   ps.set_compression(proto::CompressionKind::ZSTD);
@@ -381,10 +459,9 @@ TEST(StripeStream, readEncryptedStreams) {
   auto handler = DecryptionHandler::create(FooterWrapper(footer), &factory);
   TestEncrypter encrypter;
 
-  auto sinkPool = pool->addChild("sink");
+  auto sinkPool = pool->addLeafChild("sink");
   ProtoWriter pw{pool, *sinkPool};
-  auto stripeFooter =
-      google::protobuf::Arena::CreateMessage<proto::StripeFooter>(&arena);
+  auto stripeFooter = std::make_unique<proto::StripeFooter>();
   addNode(*stripeFooter, 1);
   proto::StripeEncryptionGroup group1;
   addNode(group1, 2, 100);
@@ -398,7 +475,7 @@ TEST(StripeStream, readEncryptedStreams) {
   // add empty string to group3, so decoding will fail if read
   *stripeFooter->add_encryptiongroups() = "";
 
-  auto readerPool = pool->addChild("reader");
+  auto readerPool = pool->addLeafChild("reader");
   auto readerBase = std::make_shared<ReaderBase>(
       *readerPool,
       std::make_unique<BufferedInput>(
@@ -408,19 +485,34 @@ TEST(StripeStream, readEncryptedStreams) {
       footer,
       nullptr,
       std::move(handler));
-  auto stripeReader =
-      std::make_unique<StripeReaderBase>(readerBase, stripeFooter);
+  auto stripeMetadata = std::make_unique<const StripeMetadata>(
+      &readerBase->getBufferedInput(),
+      std::move(stripeFooter),
+      DecryptionHandler::create(FooterWrapper(footer), &factory),
+      StripeInformationWrapper(
+          static_cast<const proto::StripeInformation*>(nullptr)));
+  auto stripeReadState =
+      std::make_shared<StripeReadState>(readerBase, std::move(stripeMetadata));
+  StripeReaderBase stripeReader{readerBase};
   ColumnSelector selector{readerBase->getSchema(), {1, 2, 4}, true};
   TestProvider provider;
   StripeStreamsImpl streams{
-      *stripeReader, selector, RowReaderOptions{}, 0, provider, 0};
+      stripeReadState,
+      selector,
+      RowReaderOptions{},
+      0,
+      StripeStreamsImpl::kUnknownStripeRows,
+      provider,
+      0};
 
   // make sure projected columns exist
   std::unordered_set<uint32_t> existed{1, 2, 4};
   for (uint32_t node = 1; node < 6; ++node) {
     EncodingKey ek{node};
     auto stream = streams.getStream(
-        DwrfStreamIdentifier{node, 0, 0, StreamKind::StreamKind_DATA}, false);
+        DwrfStreamIdentifier{node, 0, 0, StreamKind::StreamKind_DATA},
+        {},
+        false);
     if (existed.count(node)) {
       ASSERT_EQ(streams.getEncoding(ek).dictionarysize(), node + 1);
       ASSERT_NE(stream, nullptr);
@@ -431,8 +523,8 @@ TEST(StripeStream, readEncryptedStreams) {
   }
 }
 
-TEST(StripeStream, schemaMismatch) {
-  auto pool = getProcessDefaultMemoryManager().getPool("schemaMismatch");
+TEST_F(StripeStreamTest, schemaMismatch) {
+  auto pool = memoryManager()->addRootPool("schemaMismatch");
   google::protobuf::Arena arena;
   proto::PostScript ps;
   ps.set_compression(proto::CompressionKind::ZSTD);
@@ -454,10 +546,9 @@ TEST(StripeStream, schemaMismatch) {
   auto handler = DecryptionHandler::create(FooterWrapper(footer), &factory);
   TestEncrypter encrypter;
 
-  auto sinkPool = pool->addChild("sink");
+  auto sinkPool = pool->addLeafChild("sink");
   ProtoWriter pw{pool, *sinkPool};
-  auto stripeFooter =
-      google::protobuf::Arena::CreateMessage<proto::StripeFooter>(&arena);
+  auto stripeFooter = std::make_unique<proto::StripeFooter>();
   addNode(*stripeFooter, 1);
   addNode(*stripeFooter, 2);
   addNode(*stripeFooter, 4);
@@ -466,18 +557,25 @@ TEST(StripeStream, schemaMismatch) {
   encrypter.setKey("key");
   pw.writeProto(*stripeFooter->add_encryptiongroups(), group, encrypter);
 
-  auto readerPool = pool->addChild("reader");
+  auto readerPool = pool->addLeafChild("reader");
   auto readerBase = std::make_shared<ReaderBase>(
       *readerPool,
       std::make_unique<BufferedInput>(
           std::make_shared<facebook::velox::InMemoryReadFile>(std::string()),
-          *pool),
+          *pool_),
       std::make_unique<PostScript>(std::move(ps)),
       footer,
       nullptr,
       std::move(handler));
-  auto stripeReader =
-      std::make_unique<StripeReaderBase>(readerBase, stripeFooter);
+  auto stripeMetadata = std::make_unique<const StripeMetadata>(
+      &readerBase->getBufferedInput(),
+      std::move(stripeFooter),
+      DecryptionHandler::create(FooterWrapper(footer), &factory),
+      StripeInformationWrapper(
+          static_cast<const proto::StripeInformation*>(nullptr)));
+  auto stripeReadState =
+      std::make_shared<StripeReadState>(readerBase, std::move(stripeMetadata));
+  StripeReaderBase stripeReader{readerBase};
   // now, we read the file as if schema has changed
   auto schema =
       HiveTypeParser().parse("struct<a:struct<a1:int,a2:int>,b:int,c:int>");
@@ -486,13 +584,21 @@ TEST(StripeStream, schemaMismatch) {
       std::dynamic_pointer_cast<const RowType>(schema), {4, 5}, true};
   TestProvider provider;
   StripeStreamsImpl streams{
-      *stripeReader, selector, RowReaderOptions{}, 0, provider, 0};
+      stripeReadState,
+      selector,
+      RowReaderOptions{},
+      0,
+      StripeStreamsImpl::kUnknownStripeRows,
+      provider,
+      0};
 
   // make sure all columns exist. Node id of b and c in the file is 3, 4
   for (uint32_t node = 3; node < 4; ++node) {
     EncodingKey ek{node};
     auto stream = streams.getStream(
-        DwrfStreamIdentifier{node, 0, 0, StreamKind::StreamKind_DATA}, false);
+        DwrfStreamIdentifier{node, 0, 0, StreamKind::StreamKind_DATA},
+        {},
+        false);
     ASSERT_EQ(streams.getEncoding(ek).dictionarysize(), node + 1);
     ASSERT_NE(stream, nullptr);
   }
@@ -507,15 +613,16 @@ class TestStripeStreams : public StripeStreamsBase {
 
   const proto::ColumnEncoding& getEncoding(
       const EncodingKey& ek) const override {
-    return *getEncodingProxy(ek.node, ek.sequence);
+    return *getEncodingProxy(ek.node(), ek.sequence());
   }
 
   std::unique_ptr<SeekableInputStream> getStream(
       const DwrfStreamIdentifier& si,
+      std::string_view /* label */,
       bool throwIfNotFound) const override {
     return std::unique_ptr<SeekableInputStream>(getStreamProxy(
-        si.encodingKey().node,
-        si.encodingKey().sequence,
+        si.encodingKey().node(),
+        si.encodingKey().sequence(),
         static_cast<proto::Stream_Kind>(si.kind()),
         throwIfNotFound));
   }
@@ -536,6 +643,10 @@ class TestStripeStreams : public StripeStreamsBase {
 
   bool getUseVInts(const DwrfStreamIdentifier& /* unused */) const override {
     return true; // current tests all expect results from using vints
+  }
+
+  int64_t stripeRows() const override {
+    VELOX_UNSUPPORTED();
   }
 
   uint32_t rowsPerRowGroup() const override {
@@ -569,9 +680,8 @@ proto::ColumnEncoding genColumnEncoding(
 }
 } // namespace
 
-TEST(StripeStream, shareDictionary) {
-  std::shared_ptr<MemoryPool> pool = getDefaultMemoryPool("shareDictionary");
-  TestStripeStreams ss(pool.get());
+TEST_F(StripeStreamTest, shareDictionary) {
+  TestStripeStreams ss(pool_.get());
 
   auto nonSharedDictionaryEncoding =
       genColumnEncoding(1, 0, proto::ColumnEncoding_Kind_DICTIONARY, 100);
@@ -619,21 +729,23 @@ TEST(StripeStream, shareDictionary) {
       ss, getStreamProxy(2, Not(0), proto::Stream_Kind_DICTIONARY_DATA, _))
       .WillRepeatedly(Return(nullptr));
 
+  facebook::velox::memory::AllocationPool allocPool(pool_.get());
+  StreamLabels labels(allocPool);
   std::vector<std::function<facebook::velox::BufferPtr()>> dictInits{};
   dictInits.push_back(
-      ss.getIntDictionaryInitializerForNode(EncodingKey{1, 0}, 8));
+      ss.getIntDictionaryInitializerForNode(EncodingKey{1, 0}, 8, labels));
   dictInits.push_back(
-      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 2}, 16));
+      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 2}, 16, labels));
   dictInits.push_back(
-      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 3}, 4));
+      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 3}, 4, labels));
   dictInits.push_back(
-      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 5}, 16));
+      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 5}, 16, labels));
   dictInits.push_back(
-      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 8}, 8));
+      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 8}, 8, labels));
   dictInits.push_back(
-      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 13}, 4));
+      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 13}, 4, labels));
   dictInits.push_back(
-      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 21}, 16));
+      ss.getIntDictionaryInitializerForNode(EncodingKey{2, 21}, 16, labels));
 
   auto dictCache = ss.getStripeDictionaryCache();
   // Maybe verify range is useful here.

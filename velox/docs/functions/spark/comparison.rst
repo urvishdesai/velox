@@ -6,7 +6,7 @@ Comparison Functions
 
     Returns true if x is within the specified [min, max] range
     inclusive. The types of all arguments must be the same.
-    Supported types are: TINYINT, SMALLINT, INTEGER, BIGINT, DOUBLE, REAL.
+    Supported types are: TINYINT, SMALLINT, INTEGER, BIGINT, DOUBLE, REAL, DECIMAL.
 
 .. spark:function:: equalnullsafe(x, y) -> boolean
 
@@ -14,6 +14,9 @@ Comparison Functions
     types of x and y must be the same. Unlike :spark:func:`equalto` returns true if both inputs
     are NULL and false if one of the inputs is NULL.
     Corresponds to Spark's operator ``<=>``.
+    Note that NaN in Spark is handled differently from standard floating point semantics.
+    It is considered larger than any other numeric values. This rule is applied for functions
+    "equalnullsafe", "equalto", "greaterthan", "greaterthanorequal", "lessthan", "lessthanorequal".
 
 .. spark:function:: equalto(x, y) -> boolean
 
@@ -75,5 +78,32 @@ Comparison Functions
     Returns true if x is not equal to y. Supports all scalar types. The types
     of x and y must be the same. Corresponds to Spark's operator ``!=``.
 
+.. spark:function:: decimal_lessthan(x, y) -> boolean
 
+    Returns true if x is less than y. Supports decimal types with different precisions and scales.
+    Corresponds to Spark's operator ``<``.
 
+.. spark:function:: decimal_lessthanorequal(x, y) -> boolean
+
+    Returns true if x is less than y or x is equal to y. Supports decimal types with different precisions and scales.
+    Corresponds to Spark's operator ``<=``.
+
+.. spark:function:: decimal_equalto(x, y) -> boolean
+
+    Returns true if x is equal to y. Supports decimal types with different precisions and scales.
+    Corresponds to Spark's operator ``==``.
+
+.. spark:function:: decimal_notequalto(x, y) -> boolean
+
+    Returns true if x is not equal to y. Supports decimal types with different precisions and scales.
+    Corresponds to Spark's operator ``!=``.
+
+.. spark:function:: decimal_greaterthan(x, y) -> boolean
+
+    Returns true if x is greater than y. Supports decimal types with different precisions and scales.
+    Corresponds to Spark's operator ``>``.
+
+.. spark:function:: decimal_greaterthanorequal(x, y) -> boolean
+
+    Returns true if x is greater than y or x is equal to y. Supports decimal types with different precisions and scales.
+    Corresponds to Spark's operator ``>=``.

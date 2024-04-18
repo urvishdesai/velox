@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(velox_test_util TestValue.cpp)
-target_link_libraries(velox_test_util velox_common_base)
+add_library(velox_test_util ScopedTestTime.cpp TestValue.cpp)
+target_link_libraries(velox_test_util PUBLIC velox_exception)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)

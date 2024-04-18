@@ -17,25 +17,31 @@
 #pragma once
 
 #include "velox/common/file/FileSystems.h"
+#include "velox/connectors/hive/HiveConfig.h"
 
 namespace facebook::velox::filesystems {
+using namespace facebook::velox::connector::hive;
 
-// Implementation of S3 filesystem and file interface.
-// We provide a registration method for read and write files so the appropriate
-// type of file can be constructed based on a filename. See the
-// (register|generate)ReadFile and (register|generate)WriteFile functions.
+bool initializeS3(const Config* config);
+
+void finalizeS3();
+
+/// Implementation of S3 filesystem and file interface.
+/// We provide a registration method for read and write files so the appropriate
+/// type of file can be constructed based on a filename.
 class S3FileSystem : public FileSystem {
  public:
   explicit S3FileSystem(std::shared_ptr<const Config> config);
 
-  // Initialize the Aws::S3::S3Client from the input Config parameters.
-  void initializeClient();
-
   std::string name() const override;
 
-  std::unique_ptr<ReadFile> openFileForRead(std::string_view path) override;
+  std::unique_ptr<ReadFile> openFileForRead(
+      std::string_view path,
+      const FileOptions& options = {}) override;
 
-  std::unique_ptr<WriteFile> openFileForWrite(std::string_view path) override;
+  std::unique_ptr<WriteFile> openFileForWrite(
+      std::string_view path,
+      const FileOptions& options) override;
 
   void remove(std::string_view path) override {
     VELOX_UNSUPPORTED("remove for S3 not implemented");
@@ -71,6 +77,4 @@ class S3FileSystem : public FileSystem {
   std::shared_ptr<Impl> impl_;
 };
 
-// Register the S3 filesystem.
-void registerS3FileSystem();
 } // namespace facebook::velox::filesystems

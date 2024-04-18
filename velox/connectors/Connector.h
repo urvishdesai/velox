@@ -17,23 +17,25 @@
 
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/RuntimeMetrics.h"
+#include "velox/common/base/SpillConfig.h"
+#include "velox/common/base/SpillStats.h"
+#include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/common/future/VeloxPromise.h"
-#include "velox/core/Context.h"
+#include "velox/core/ExpressionEvaluator.h"
 #include "velox/vector/ComplexVector.h"
 
 #include <folly/Synchronized.h>
 
+namespace facebook::velox::wave {
+class WaveDataSource;
+}
 namespace facebook::velox::common {
 class Filter;
 }
 
-namespace facebook::velox::core {
-class ITypedExpr;
-} // namespace facebook::velox::core
-
-namespace facebook::velox::exec {
-class ExprSet;
+namespace facebook::velox {
+class Config;
 }
 
 namespace facebook::velox::connector {
@@ -44,11 +46,14 @@ class DataSource;
 // as a RowVectorPtr, potentially after processing pushdowns.
 struct ConnectorSplit {
   const std::string connectorId;
+  const int64_t splitWeight{0};
 
-  std::shared_ptr<AsyncSource<std::shared_ptr<DataSource>>> dataSource;
+  std::unique_ptr<AsyncSource<DataSource>> dataSource;
 
-  explicit ConnectorSplit(const std::string& _connectorId)
-      : connectorId(_connectorId) {}
+  explicit ConnectorSplit(
+      const std::string& _connectorId,
+      int64_t _splitWeight = 0)
+      : connectorId(_connectorId), splitWeight(_splitWeight) {}
 
   virtual ~ConnectorSplit() {}
 
@@ -57,32 +62,48 @@ struct ConnectorSplit {
   }
 };
 
-class ColumnHandle {
+class ColumnHandle : public ISerializable {
  public:
   virtual ~ColumnHandle() = default;
+
+  folly::dynamic serialize() const override;
+
+ protected:
+  static folly::dynamic serializeBase(std::string_view name);
 };
 
-class ConnectorTableHandle {
+using ColumnHandlePtr = std::shared_ptr<const ColumnHandle>;
+
+class ConnectorTableHandle : public ISerializable {
  public:
   explicit ConnectorTableHandle(std::string connectorId)
       : connectorId_(std::move(connectorId)) {}
 
   virtual ~ConnectorTableHandle() = default;
 
-  virtual std::string toString() const = 0;
+  virtual std::string toString() const {
+    VELOX_NYI();
+  }
 
   const std::string& connectorId() const {
     return connectorId_;
   }
 
+  virtual folly::dynamic serialize() const override;
+
+ protected:
+  folly::dynamic serializeBase(std::string_view name) const;
+
  private:
   const std::string connectorId_;
 };
 
+using ConnectorTableHandlePtr = std::shared_ptr<const ConnectorTableHandle>;
+
 /**
  * Represents a request for writing to connector
  */
-class ConnectorInsertTableHandle {
+class ConnectorInsertTableHandle : public ISerializable {
  public:
   virtual ~ConnectorInsertTableHandle() {}
 
@@ -90,6 +111,10 @@ class ConnectorInsertTableHandle {
   // this flag to determine number of drivers.
   virtual bool supportsMultiThreading() const {
     return false;
+  }
+
+  folly::dynamic serialize() const override {
+    VELOX_NYI();
   }
 };
 
@@ -102,20 +127,48 @@ enum class CommitStrategy {
 /// Return a string encoding of the given commit strategy.
 std::string commitStrategyToString(CommitStrategy commitStrategy);
 
+FOLLY_ALWAYS_INLINE std::ostream& operator<<(
+    std::ostream& os,
+    CommitStrategy strategy) {
+  os << commitStrategyToString(strategy);
+  return os;
+}
+
+/// Return a commit strategy of the given string encoding.
+CommitStrategy stringToCommitStrategy(const std::string& strategy);
+
+/// Writes data received from table writer operator into different partitions
+/// based on the specific table layout. The actual implementation doesn't need
+/// to be thread-safe.
 class DataSink {
  public:
+  struct Stats {
+    uint64_t numWrittenBytes{0};
+    uint32_t numWrittenFiles{0};
+    common::SpillStats spillStats;
+
+    bool empty() const;
+
+    std::string toString() const;
+  };
+
   virtual ~DataSink() = default;
 
   /// Add the next data (vector) to be written. This call is blocking.
-  // TODO maybe at some point we want to make it async.
+  /// TODO maybe at some point we want to make it async.
   virtual void appendData(RowVectorPtr input) = 0;
 
-  /// Called once after all data has been added via possibly multiple calls to
-  /// appendData(). Could return data in the string form that would be included
-  /// in the output. After calling this function, only close() could be called.
-  virtual std::vector<std::string> finish() const = 0;
+  /// Returns the stats of this data sink.
+  virtual Stats stats() const = 0;
 
-  virtual void close() = 0;
+  /// Called once after all data has been added via possibly multiple calls to
+  /// appendData(). The function returns the metadata of written data in string
+  /// form. We don't expect any appendData() calls on a closed data sink object.
+  virtual std::vector<std::string> close() = 0;
+
+  /// Called to abort this data sink object and we don't expect any appendData()
+  /// calls on an aborted data sink object.
+  virtual void abort() = 0;
 };
 
 class DataSource {
@@ -154,19 +207,18 @@ class DataSource {
 
   virtual std::unordered_map<std::string, RuntimeCounter> runtimeStats() = 0;
 
-  // Returns true if 'this' has initiated all the prefetch this will
-  // initiate. This means that the caller should schedule next splits
-  // to prefetch in the background. false if the source does not
-  // prefetch.
+  /// Returns true if 'this' has initiated all the prefetch this will initiate.
+  /// This means that the caller should schedule next splits to prefetch in the
+  /// background. false if the source does not prefetch.
   virtual bool allPrefetchIssued() const {
     return false;
   }
 
-  // Initializes this from 'source'. 'source' is effectively moved
-  // into 'this' Adaptation like dynamic filters stay in effect but
-  // the parts dealing with open files, prefetched data etc. are moved. 'source'
-  // is freed after the move.
-  virtual void setFromDataSource(std::shared_ptr<DataSource> /*source*/) {
+  /// Initializes this from 'source'. 'source' is effectively moved into 'this'
+  /// Adaptation like dynamic filters stay in effect but the parts dealing with
+  /// open files, prefetched data etc. are moved. 'source' is freed after the
+  /// move.
+  virtual void setFromDataSource(std::unique_ptr<DataSource> /*source*/) {
     VELOX_UNSUPPORTED("setFromDataSource");
   }
 
@@ -179,31 +231,16 @@ class DataSource {
   virtual int64_t estimatedRowSize() {
     return kUnknownRowSize;
   }
-};
 
-// Exposes expression evaluation functionality of the engine to the
-// connector.  Connector may use it, for example, to evaluate pushed
-// down filters. This is not thread safe and serializing operations is
-// the responsibility of the caller. This is self-contained and does
-// not reference objects from the thread which constructs
-// this. Passing this between threads is allowed as long as uses are
-// sequential. May reference query-level structures like QueryCtx.
-class ExpressionEvaluator {
- public:
-  virtual ~ExpressionEvaluator() = default;
-
-  // Compiles an expression. Returns an instance of exec::ExprSet that can be
-  // used to evaluate that expression on multiple vectors using evaluate method.
-  virtual std::unique_ptr<exec::ExprSet> compile(
-      const std::shared_ptr<const core::ITypedExpr>& expression) const = 0;
-
-  // Evaluates previously compiled expression on the specified rows.
-  // Re-uses result vector if it is not null.
-  virtual void evaluate(
-      exec::ExprSet* FOLLY_NONNULL exprSet,
-      const SelectivityVector& rows,
-      RowVectorPtr& input,
-      VectorPtr* FOLLY_NULLABLE result) const = 0;
+  /// Returns a Wave delegate that implements the Wave Operator
+  /// interface for a GPU table scan. This should be called after
+  /// construction and no other methods should be called on 'this'
+  /// after creating the delegate. Splits, dynamic filters etc.  will
+  /// be added to the WaveDataSource instead of 'this'. 'this' should
+  /// stay live until after the destruction of the delegate.
+  virtual std::shared_ptr<wave::WaveDataSource> toWaveDataSource() {
+    VELOX_UNSUPPORTED();
+  }
 };
 
 /// Collection of context data for use in a DataSource or DataSink. One instance
@@ -213,50 +250,57 @@ class ExpressionEvaluator {
 class ConnectorQueryCtx {
  public:
   ConnectorQueryCtx(
-      memory::MemoryPool* leafPool,
-      memory::MemoryPool* aggregatePool,
-      const Config* connectorConfig,
-      std::unique_ptr<ExpressionEvaluator> expressionEvaluator,
-      memory::MemoryAllocator* FOLLY_NONNULL allocator,
+      memory::MemoryPool* operatorPool,
+      memory::MemoryPool* connectorPool,
+      const Config* sessionProperties,
+      const common::SpillConfig* spillConfig,
+      std::unique_ptr<core::ExpressionEvaluator> expressionEvaluator,
+      cache::AsyncDataCache* cache,
+      const std::string& queryId,
       const std::string& taskId,
       const std::string& planNodeId,
       int driverId)
-      : leafPool_(leafPool),
-        aggregatePool_(aggregatePool),
-        config_(connectorConfig),
+      : operatorPool_(operatorPool),
+        connectorPool_(connectorPool),
+        sessionProperties_(sessionProperties),
+        spillConfig_(spillConfig),
         expressionEvaluator_(std::move(expressionEvaluator)),
-        allocator_(allocator),
+        cache_(cache),
         scanId_(fmt::format("{}.{}", taskId, planNodeId)),
+        queryId_(queryId),
         taskId_(taskId),
-        driverId_(driverId) {
-    VELOX_CHECK_NOT_NULL(leafPool_);
+        driverId_(driverId),
+        planNodeId_(planNodeId) {
+    VELOX_CHECK_NOT_NULL(sessionProperties);
   }
 
-  /// Returns the memory pool for memory allocation.
+  /// Returns the associated operator's memory pool which is a leaf kind of
+  /// memory pool, used for direct memory allocation use.
   memory::MemoryPool* memoryPool() const {
-    return leafPool_;
+    return operatorPool_;
   }
 
-  /// Returns the aggregate memory pool for the data sink that needs the
-  /// hierarchical memory pool management, such as HiveDataSink. This is set to
-  /// null for table scan.
-  memory::MemoryPool* aggregatePool() const {
-    VELOX_CHECK_NOT_NULL(aggregatePool_);
-    return aggregatePool_;
+  /// Returns the connector's memory pool which is an aggregate kind of memory
+  /// pool, used for the data sink for table write that needs the hierarchical
+  /// memory pool management, such as HiveDataSink.
+  memory::MemoryPool* connectorMemoryPool() const {
+    return connectorPool_;
   }
 
-  const Config* FOLLY_NONNULL config() const {
-    return config_;
+  const Config* sessionProperties() const {
+    return sessionProperties_;
   }
 
-  ExpressionEvaluator* FOLLY_NULLABLE expressionEvaluator() const {
+  const common::SpillConfig* spillConfig() const {
+    return spillConfig_;
+  }
+
+  core::ExpressionEvaluator* expressionEvaluator() const {
     return expressionEvaluator_.get();
   }
 
-  // MemoryAllocator for large allocations. Used for caching with
-  // CachedBufferedImput if this implements cache::AsyncDataCache.
-  memory::MemoryAllocator* FOLLY_NONNULL allocator() const {
-    return allocator_;
+  cache::AsyncDataCache* cache() const {
+    return cache_;
   }
 
   // This is a combination of task id and the scan's PlanNodeId. This is an id
@@ -267,6 +311,10 @@ class ConnectorQueryCtx {
     return scanId_;
   }
 
+  const std::string queryId() const {
+    return queryId_;
+  }
+
   const std::string& taskId() const {
     return taskId_;
   }
@@ -275,23 +323,27 @@ class ConnectorQueryCtx {
     return driverId_;
   }
 
+  const std::string& planNodeId() const {
+    return planNodeId_;
+  }
+
  private:
-  memory::MemoryPool* leafPool_;
-  memory::MemoryPool* aggregatePool_;
-  const Config* FOLLY_NONNULL config_;
-  std::unique_ptr<ExpressionEvaluator> expressionEvaluator_;
-  memory::MemoryAllocator* FOLLY_NONNULL allocator_;
+  memory::MemoryPool* const operatorPool_;
+  memory::MemoryPool* const connectorPool_;
+  const Config* const sessionProperties_;
+  const common::SpillConfig* const spillConfig_;
+  std::unique_ptr<core::ExpressionEvaluator> expressionEvaluator_;
+  cache::AsyncDataCache* cache_;
   const std::string scanId_;
+  const std::string queryId_;
   const std::string taskId_;
   const int driverId_;
+  const std::string planNodeId_;
 };
 
 class Connector {
  public:
-  explicit Connector(
-      const std::string& id,
-      std::shared_ptr<const Config> properties)
-      : id_(id), properties_(std::move(properties)) {}
+  explicit Connector(const std::string& id) : id_(id) {}
 
   virtual ~Connector() = default;
 
@@ -299,23 +351,23 @@ class Connector {
     return id_;
   }
 
-  const std::shared_ptr<const Config>& connectorProperties() const {
-    return properties_;
+  virtual const std::shared_ptr<const Config>& connectorConfig() const {
+    VELOX_NYI("connectorConfig is not supported yet");
   }
 
-  // Returns true if this connector would accept a filter dynamically generated
-  // during query execution.
+  /// Returns true if this connector would accept a filter dynamically generated
+  /// during query execution.
   virtual bool canAddDynamicFilter() const {
     return false;
   }
 
-  virtual std::shared_ptr<DataSource> createDataSource(
+  virtual std::unique_ptr<DataSource> createDataSource(
       const RowTypePtr& outputType,
-      const std::shared_ptr<connector::ConnectorTableHandle>& tableHandle,
+      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
       const std::unordered_map<
           std::string,
           std::shared_ptr<connector::ColumnHandle>>& columnHandles,
-      ConnectorQueryCtx* FOLLY_NONNULL connectorQueryCtx) = 0;
+      ConnectorQueryCtx* connectorQueryCtx) = 0;
 
   // Returns true if addSplit of DataSource can use 'dataSource' from
   // ConnectorSplit in addSplit(). If so, TableScan can preload splits
@@ -325,7 +377,7 @@ class Connector {
     return false;
   }
 
-  virtual std::shared_ptr<DataSink> createDataSink(
+  virtual std::unique_ptr<DataSink> createDataSink(
       RowTypePtr inputType,
       std::shared_ptr<ConnectorInsertTableHandle> connectorInsertTableHandle,
       ConnectorQueryCtx* connectorQueryCtx,
@@ -339,27 +391,28 @@ class Connector {
       const std::string& scanId,
       int32_t loadQuantum);
 
-  virtual folly::Executor* FOLLY_NULLABLE executor() const {
+  virtual folly::Executor* executor() const {
     return nullptr;
   }
 
  private:
-  static void unregisterTracker(cache::ScanTracker* FOLLY_NONNULL tracker);
+  static void unregisterTracker(cache::ScanTracker* tracker);
 
   const std::string id_;
 
   static folly::Synchronized<
       std::unordered_map<std::string_view, std::weak_ptr<cache::ScanTracker>>>
       trackers_;
-
-  const std::shared_ptr<const Config> properties_;
 };
 
 class ConnectorFactory {
  public:
-  explicit ConnectorFactory(const char* FOLLY_NONNULL name) : name_(name) {}
+  explicit ConnectorFactory(const char* name) : name_(name) {}
 
   virtual ~ConnectorFactory() = default;
+
+  // Initialize is called during the factory registration.
+  virtual void initialize() {}
 
   const std::string& connectorName() const {
     return name_;
@@ -367,8 +420,8 @@ class ConnectorFactory {
 
   virtual std::shared_ptr<Connector> newConnector(
       const std::string& id,
-      std::shared_ptr<const Config> properties,
-      folly::Executor* FOLLY_NULLABLE executor = nullptr) = 0;
+      std::shared_ptr<const Config> config,
+      folly::Executor* executor = nullptr) = 0;
 
  private:
   const std::string name_;

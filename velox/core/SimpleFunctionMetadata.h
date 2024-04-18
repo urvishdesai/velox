@@ -17,6 +17,7 @@
 
 #include <boost/algorithm/string.hpp>
 #include <folly/Likely.h>
+#include <optional>
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/core/CoreTypeSystem.h"
@@ -24,11 +25,9 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/expression/SignatureBinder.h"
+#include "velox/type/SimpleFunctionApi.h"
 #include "velox/type/Type.h"
 #include "velox/type/Variant.h"
-
-inline constexpr char kPrecisionVariable[] = "a_precision";
-inline constexpr char kScaleVariable[] = "a_scale";
 
 namespace facebook::velox::core {
 
@@ -66,6 +65,20 @@ struct udf_help<T, util::detail::void_t<decltype(T::help)>> {
   std::string operator()() {
     return T::help();
   }
+};
+
+// Canonical name of the function.
+template <class T, class = void>
+struct udf_canonical_name {
+  static constexpr exec::FunctionCanonicalName value =
+      exec::FunctionCanonicalName::kUnknown;
+};
+
+template <class T>
+struct udf_canonical_name<
+    T,
+    util::detail::void_t<decltype(T::canonical_name)>> {
+  static constexpr exec::FunctionCanonicalName value = T::canonical_name;
 };
 
 // Has the value true, unless a Variadic Type appears anywhere but at the end
@@ -156,11 +169,26 @@ struct TypeAnalysisResults {
     }
   } stats;
 
-  // String representaion of the type in the FunctionSignatureBuilder.
+  void addVariable(exec::SignatureVariable&& variable) {
+    if (!variablesInformation.count(variable.name())) {
+      variablesInformation.emplace(variable.name(), variable);
+    } else {
+      VELOX_CHECK(
+          variable == variablesInformation.at(variable.name()),
+          "Cant assign different properties to the same variable {}",
+          variable.name());
+    }
+  }
+
+  /// String representation of the type in the FunctionSignatureBuilder.
   std::ostringstream out;
 
-  // Set of generic variables used in the type.
-  std::set<std::string> variables;
+  /// Physical type, e.g. BIGINT() for Date and ARRAY(BIGINT()) for
+  // Array<Date>. UNKNOWN() if type is generic or opaque.
+  TypePtr physicalType;
+
+  /// Set of generic variables used in the type.
+  std::map<std::string, exec::SignatureVariable> variablesInformation;
 
   std::string typeAsString() {
     return out.str();
@@ -185,7 +213,7 @@ std::string strToLowerCopy(const std::string& str);
 } // namespace detail
 
 // A set of structs used to perform analysis on a static type to
-// collect information needed for signatrue construction.
+// collect information needed for signature construction.
 template <typename T>
 struct TypeAnalysis {
   void run(TypeAnalysisResults& results) {
@@ -194,28 +222,68 @@ struct TypeAnalysis {
         SimpleTypeTrait<T>::isPrimitiveType ||
         SimpleTypeTrait<T>::typeKind == TypeKind::OPAQUE);
     results.stats.concreteCount++;
-    if (isDecimalKind(SimpleTypeTrait<T>::typeKind)) {
-      results.out << detail::strToLowerCopy(
-                         std::string(SimpleTypeTrait<T>::name))
-                  << "(" << kPrecisionVariable << "," << kScaleVariable << ")";
+    results.out << detail::strToLowerCopy(
+        std::string(SimpleTypeTrait<T>::name));
+    if constexpr (
+        SimpleTypeTrait<T>::typeKind == TypeKind::OPAQUE ||
+        SimpleTypeTrait<T>::typeKind == TypeKind::UNKNOWN) {
+      results.physicalType = UNKNOWN();
     } else {
-      results.out << detail::strToLowerCopy(
-          std::string(SimpleTypeTrait<T>::name));
+      results.physicalType = createScalarType(SimpleTypeTrait<T>::typeKind);
     }
   }
 };
 
-template <typename T>
-struct TypeAnalysis<Generic<T>> {
+template <typename T, bool comparable, bool orderable>
+struct TypeAnalysis<Generic<T, comparable, orderable>> {
   void run(TypeAnalysisResults& results) {
     if constexpr (std::is_same_v<T, AnyType>) {
       results.out << "any";
     } else {
-      auto variableType = fmt::format("__user_T{}", T::getId());
-      results.out << variableType;
-      results.variables.insert(variableType);
+      auto typeVariableName = fmt::format("__user_T{}", T::getId());
+      results.out << typeVariableName;
+      results.addVariable(exec::SignatureVariable(
+          typeVariableName,
+          std::nullopt,
+          exec::ParameterType::kTypeParameter,
+          false,
+          orderable,
+          comparable));
     }
     results.stats.hasGeneric = true;
+    results.physicalType = UNKNOWN();
+  }
+};
+
+template <typename P, typename S>
+struct TypeAnalysis<ShortDecimal<P, S>> {
+  void run(TypeAnalysisResults& results) {
+    results.stats.concreteCount++;
+
+    const auto p = P::name();
+    const auto s = S::name();
+    results.out << fmt::format("decimal({},{})", p, s);
+    results.addVariable(exec::SignatureVariable(
+        p, std::nullopt, exec::ParameterType::kIntegerParameter));
+    results.addVariable(exec::SignatureVariable(
+        s, std::nullopt, exec::ParameterType::kIntegerParameter));
+    results.physicalType = BIGINT();
+  }
+};
+
+template <typename P, typename S>
+struct TypeAnalysis<LongDecimal<P, S>> {
+  void run(TypeAnalysisResults& results) {
+    results.stats.concreteCount++;
+
+    const auto p = P::name();
+    const auto s = S::name();
+    results.out << fmt::format("decimal({},{})", p, s);
+    results.addVariable(exec::SignatureVariable(
+        p, std::nullopt, exec::ParameterType::kIntegerParameter));
+    results.addVariable(exec::SignatureVariable(
+        s, std::nullopt, exec::ParameterType::kIntegerParameter));
+    results.physicalType = HUGEINT();
   }
 };
 
@@ -225,9 +293,12 @@ struct TypeAnalysis<Map<K, V>> {
     results.stats.concreteCount++;
     results.out << "map(";
     TypeAnalysis<K>().run(results);
+    auto keyType = results.physicalType;
     results.out << ", ";
     TypeAnalysis<V>().run(results);
+    auto valueType = results.physicalType;
     results.out << ")";
+    results.physicalType = MAP(keyType, valueType);
   }
 };
 
@@ -246,8 +317,11 @@ struct TypeAnalysis<Variadic<V>> {
         tmp.stats.hasGeneric || results.stats.hasVariadicOfGeneric;
 
     results.stats.concreteCount += tmp.stats.concreteCount;
-    results.variables.insert(tmp.variables.begin(), tmp.variables.end());
+    for (auto& [_, variable] : tmp.variablesInformation) {
+      results.addVariable(std::move(variable));
+    }
     results.out << tmp.typeAsString();
+    results.physicalType = tmp.physicalType;
   }
 };
 
@@ -258,6 +332,7 @@ struct TypeAnalysis<Array<V>> {
     results.out << "array(";
     TypeAnalysis<V>().run(results);
     results.out << ")";
+    results.physicalType = ARRAY(results.physicalType);
   }
 };
 
@@ -271,6 +346,7 @@ struct TypeAnalysis<Row<T...>> {
   void run(TypeAnalysisResults& results) {
     results.stats.concreteCount++;
     results.out << "row(";
+    std::vector<TypePtr> fieldTypes;
     // This expression applies the lambda for each row child type.
     bool first = true;
     (
@@ -280,9 +356,11 @@ struct TypeAnalysis<Row<T...>> {
           }
           first = false;
           TypeAnalysis<T>().run(results);
+          fieldTypes.push_back(results.physicalType);
         }(),
         ...);
     results.out << ")";
+    results.physicalType = ROW(std::move(fieldTypes));
   }
 };
 
@@ -291,20 +369,30 @@ struct TypeAnalysis<CustomType<T>> {
   void run(TypeAnalysisResults& results) {
     results.stats.concreteCount++;
     results.out << T::typeName;
+
+    TypeAnalysisResults tmp;
+    TypeAnalysis<typename T::type>().run(tmp);
+    results.physicalType = tmp.physicalType;
   }
 };
 
 class ISimpleFunctionMetadata {
  public:
+  virtual ~ISimpleFunctionMetadata() = default;
+
   // Return the return type of the function if its independent on the input
   // types, otherwise return null.
   virtual TypePtr tryResolveReturnType() const = 0;
   virtual std::string getName() const = 0;
   virtual bool isDeterministic() const = 0;
+  virtual bool defaultNullBehavior() const = 0;
   virtual uint32_t priority() const = 0;
   virtual const std::shared_ptr<exec::FunctionSignature> signature() const = 0;
+  virtual const TypePtr& resultPhysicalType() const = 0;
+  virtual const std::vector<TypePtr>& argPhysicalTypes() const = 0;
+  virtual bool physicalSignatureEquals(
+      const ISimpleFunctionMetadata& other) const = 0;
   virtual std::string helpMessage(const std::string& name) const = 0;
-  virtual ~ISimpleFunctionMetadata() = default;
 };
 
 template <typename T, typename = int32_t>
@@ -313,7 +401,11 @@ struct udf_has_name : std::false_type {};
 template <typename T>
 struct udf_has_name<T, decltype(&T::name, 0)> : std::true_type {};
 
-template <typename Fun, typename TReturn, typename... Args>
+template <
+    typename Fun,
+    typename TReturn,
+    typename ConstantChecker,
+    typename... Args>
 class SimpleFunctionMetadata : public ISimpleFunctionMetadata {
  public:
   using return_type = TReturn;
@@ -365,6 +457,10 @@ class SimpleFunctionMetadata : public ISimpleFunctionMetadata {
     return udf_is_deterministic<Fun>();
   }
 
+  bool defaultNullBehavior() const final {
+    return defaultNullBehavior_;
+  }
+
   static constexpr bool isVariadic() {
     if constexpr (num_args == 0) {
       return false;
@@ -373,16 +469,49 @@ class SimpleFunctionMetadata : public ISimpleFunctionMetadata {
     }
   }
 
-  explicit SimpleFunctionMetadata() {
-    auto analysis = analyzeSignatureTypes();
+  explicit SimpleFunctionMetadata(
+      bool defaultNullBehavior,
+      const std::vector<exec::SignatureVariable>& constraints)
+      : defaultNullBehavior_{defaultNullBehavior} {
+    auto analysis = analyzeSignatureTypes(constraints);
+
     buildSignature(analysis);
     priority_ = analysis.stats.computePriority();
+    resultPhysicalType_ = analysis.resultPhysicalType;
+    argPhysicalTypes_ = analysis.argPhysicalTypes;
   }
 
   ~SimpleFunctionMetadata() override = default;
 
   const exec::FunctionSignaturePtr signature() const override {
     return signature_;
+  }
+
+  const TypePtr& resultPhysicalType() const override {
+    return resultPhysicalType_;
+  }
+
+  const std::vector<TypePtr>& argPhysicalTypes() const override {
+    return argPhysicalTypes_;
+  }
+
+  bool physicalSignatureEquals(
+      const ISimpleFunctionMetadata& other) const override {
+    if (!resultPhysicalType_->kindEquals(other.resultPhysicalType())) {
+      return false;
+    }
+
+    if (argPhysicalTypes_.size() != other.argPhysicalTypes().size()) {
+      return false;
+    }
+
+    for (auto i = 0; i < argPhysicalTypes_.size(); ++i) {
+      if (!argPhysicalTypes_[i]->kindEquals(other.argPhysicalTypes()[i])) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   std::string helpMessage(const std::string& name) const final {
@@ -410,16 +539,21 @@ class SimpleFunctionMetadata : public ISimpleFunctionMetadata {
   struct SignatureTypesAnalysisResults {
     std::vector<std::string> argsTypes;
     std::string outputType;
-    std::set<std::string> variables;
+    std::map<std::string, exec::SignatureVariable> variables;
     TypeAnalysisResults::Stats stats;
+    TypePtr resultPhysicalType;
+    std::vector<TypePtr> argPhysicalTypes;
   };
 
-  SignatureTypesAnalysisResults analyzeSignatureTypes() {
+  SignatureTypesAnalysisResults analyzeSignatureTypes(
+      const std::vector<exec::SignatureVariable>& constraints) {
     std::vector<std::string> argsTypes;
 
     TypeAnalysisResults results;
     TypeAnalysis<return_type>().run(results);
     std::string outputType = results.typeAsString();
+    const auto resultPhysicalType = results.physicalType;
+    std::vector<TypePtr> argPhysicalTypes;
 
     (
         [&]() {
@@ -428,34 +562,44 @@ class SimpleFunctionMetadata : public ISimpleFunctionMetadata {
           results.resetTypeString();
           TypeAnalysis<Args>().run(results);
           argsTypes.push_back(results.typeAsString());
+          argPhysicalTypes.push_back(results.physicalType);
         }(),
         ...);
+
+    for (const auto& constraint : constraints) {
+      VELOX_CHECK(
+          !constraint.constraint().empty(),
+          "Constraint must be set for variable {}",
+          constraint.name());
+
+      results.variablesInformation.erase(constraint.name());
+      results.variablesInformation.emplace(constraint.name(), constraint);
+    }
 
     return SignatureTypesAnalysisResults{
         std::move(argsTypes),
         std::move(outputType),
-        std::move(results.variables),
-        std::move(results.stats)};
+        std::move(results.variablesInformation),
+        std::move(results.stats),
+        resultPhysicalType,
+        argPhysicalTypes};
   }
 
   void buildSignature(const SignatureTypesAnalysisResults& analysis) {
     auto builder = exec::FunctionSignatureBuilder();
 
     builder.returnType(analysis.outputType);
-
-    bool isDecimalArg = false;
+    int32_t position = 0;
     for (const auto& arg : analysis.argsTypes) {
-      builder.argumentType(arg);
-      isDecimalArg |= isDecimalTypeSignature(arg);
+      if (ConstantChecker::isConstant[position++]) {
+        builder.constantArgumentType(arg);
+      } else {
+        builder.argumentType(arg);
+      }
     }
 
-    if (isDecimalArg) {
-      builder.integerVariable(kPrecisionVariable);
-      builder.integerVariable(kScaleVariable);
-    }
-
-    for (const auto& variable : analysis.variables) {
-      builder.typeVariable(variable);
+    for (const auto& [_, variable] : analysis.variables) {
+      builder.variable(variable);
     }
 
     if (isVariadic()) {
@@ -464,20 +608,34 @@ class SimpleFunctionMetadata : public ISimpleFunctionMetadata {
     signature_ = builder.build();
   }
 
+  const bool defaultNullBehavior_;
   exec::FunctionSignaturePtr signature_;
   uint32_t priority_;
+  TypePtr resultPhysicalType_;
+  std::vector<TypePtr> argPhysicalTypes_;
 };
 
 // wraps a UDF object to provide the inheritance
 // this is basically just boilerplate-avoidance
-template <typename Fun, typename Exec, typename TReturn, typename... TArgs>
-class UDFHolder final
-    : public core::SimpleFunctionMetadata<Fun, TReturn, TArgs...> {
+template <
+    typename Fun,
+    typename Exec,
+    typename TReturn,
+    typename ConstantChecker,
+    typename... TArgs>
+class UDFHolder {
   Fun instance_;
 
  public:
+  using return_type = TReturn;
+  using arg_types = std::tuple<TArgs...>;
+  template <size_t N>
+  using type_at = typename std::tuple_element<N, arg_types>::type;
+  static constexpr int num_args = std::tuple_size<arg_types>::value;
+
   using udf_struct_t = Fun;
-  using Metadata = core::SimpleFunctionMetadata<Fun, TReturn, TArgs...>;
+  using Metadata =
+      core::SimpleFunctionMetadata<Fun, TReturn, ConstantChecker, TArgs...>;
 
   template <typename T>
   using exec_resolver = typename Exec::template resolver<T>;
@@ -609,12 +767,27 @@ class UDFHolder final
       Fun,
       initialize_method_resolver,
       void,
+      const std::vector<TypePtr>&,
+      const core::QueryConfig&,
+      const exec_arg_type<TArgs>*...>::value;
+
+  // TODO Remove
+  static constexpr bool udf_has_legacy_initialize = util::has_method<
+      Fun,
+      initialize_method_resolver,
+      void,
       const core::QueryConfig&,
       const exec_arg_type<TArgs>*...>::value;
 
   static_assert(
+      !udf_has_legacy_initialize,
+      "Legacy initialize method! Upgrade.");
+
+  static_assert(
       udf_has_call || udf_has_callNullable || udf_has_callNullFree,
-      "UDF must implement at least one of `call`, `callNullable`, or `callNullFree`");
+      "UDF must implement at least one of `call`, `callNullable`, or `callNullFree` functions.\n"
+      "This error happens also if the output and input types of the functions do not match the\n"
+      "ones used in registration.");
 
   static_assert(
       ValidateVariadicArgs<TArgs...>::value,
@@ -663,13 +836,30 @@ class UDFHolder final
   template <size_t N>
   using exec_type_at = typename std::tuple_element<N, exec_arg_types>::type;
 
-  explicit UDFHolder() : Metadata(), instance_{} {}
+  explicit UDFHolder() : instance_{} {}
+
+  exec::FunctionCanonicalName getCanonicalName() const {
+    return udf_canonical_name<Fun>::value;
+  }
+
+  bool isDeterministic() const {
+    return udf_is_deterministic<Fun>();
+  }
+
+  static constexpr bool isVariadic() {
+    if constexpr (num_args == 0) {
+      return false;
+    } else {
+      return isVariadicType<type_at<num_args - 1>>::value;
+    }
+  }
 
   FOLLY_ALWAYS_INLINE void initialize(
+      const std::vector<TypePtr>& inputTypes,
       const core::QueryConfig& config,
       const typename exec_resolver<TArgs>::in_type*... constantArgs) {
     if constexpr (udf_has_initialize) {
-      return instance_.initialize(config, constantArgs...);
+      return instance_.initialize(inputTypes, config, constantArgs...);
     }
   }
 

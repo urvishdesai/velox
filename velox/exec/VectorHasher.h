@@ -45,20 +45,6 @@ class UniqueValue {
     }
   }
 
-  explicit UniqueValue(Date value) {
-    // The number of valid bytes of Date stored in data_ is
-    // (int64_t)value.days().
-    size_ = sizeof(int64_t);
-    data_ = value.days();
-  }
-
-  explicit UniqueValue(IntervalDayTime value) {
-    // The number of valid bytes of IntervalDayTime stored in data_ is
-    // (int64_t)value.milliseconds().
-    size_ = sizeof(int64_t);
-    data_ = value.milliseconds();
-  }
-
   uint32_t size() const {
     return size_;
   }
@@ -179,6 +165,11 @@ class VectorHasher {
   // computeValueIds(). The decoded vector can be accessed via decodedVector()
   // getter.
   void decode(const BaseVector& vector, const SelectivityVector& rows) {
+    VELOX_CHECK(
+        type_->kindEquals(vector.type()),
+        "Type mismatch: {} vs. {}",
+        type_->toString(),
+        vector.type()->toString());
     decoded_.decode(vector, rows);
   }
 
@@ -236,14 +227,13 @@ class VectorHasher {
   // have a miss if any of the keys has a value that is not represented.
   //
   // This method can be called concurrently from multiple threads. To allow for
-  // that the caller must provide 'scratchMemory'. 'noNulls' means that the
-  // positions in 'rows' are not checked for null values.
+  // that the caller must provide 'scratchMemory'. Values in 'rows' are
+  // expected to have no nulls.
   void lookupValueIds(
       const BaseVector& values,
       SelectivityVector& rows,
       ScratchMemory& scratchMemory,
-      raw_vector<uint64_t>& result,
-      bool noNulls = true) const;
+      raw_vector<uint64_t>& result) const;
 
   // Returns true if either range or distinct values have not overflowed.
   bool mayUseValueIds() const {
@@ -303,8 +293,6 @@ class VectorHasher {
       case TypeKind::BIGINT:
       case TypeKind::VARCHAR:
       case TypeKind::VARBINARY:
-      case TypeKind::DATE:
-      case TypeKind::INTERVAL_DAY_TIME:
         return true;
       default:
         return false;
@@ -321,6 +309,10 @@ class VectorHasher {
   }
 
   std::string toString() const;
+
+  size_t numUniqueValues() const {
+    return uniqueValues_.size();
+  }
 
  private:
   static constexpr uint32_t kStringASRangeMaxSize = 7;
@@ -388,8 +380,7 @@ class VectorHasher {
       const DecodedVector& decoded,
       SelectivityVector& rows,
       raw_vector<uint64_t>& hashes,
-      uint64_t* result,
-      bool noNulls) const;
+      uint64_t* result) const;
 
   // Fast path for range mapping of int64/int32 keys.
   template <typename T>
@@ -426,7 +417,7 @@ class VectorHasher {
       unique.setId(uniqueValues_.size() + 1);
       if (uniqueValues_.insert(unique).second) {
         if (uniqueValues_.size() > kMaxDistinct) {
-          distinctOverflow_ = true;
+          setDistinctOverflow();
         }
       }
     }
@@ -526,6 +517,10 @@ class VectorHasher {
 
   void copyStringToLocal(const UniqueValue* unique);
 
+  void setDistinctOverflow();
+
+  void setRangeOverflow();
+
   static inline bool
   isNullAt(const char* group, int32_t nullByte, uint8_t nullMask) {
     return (group[nullByte] & nullMask) != 0;
@@ -581,16 +576,6 @@ class VectorHasher {
 };
 
 template <>
-inline int64_t VectorHasher::toInt64(Date value) const {
-  return value.days();
-}
-
-template <>
-inline int64_t VectorHasher::toInt64(IntervalDayTime value) const {
-  return value.milliseconds();
-}
-
-template <>
 bool VectorHasher::makeValueIdsForRows<TypeKind::VARCHAR>(
     char** groups,
     int32_t numGroups,
@@ -634,7 +619,7 @@ inline uint64_t VectorHasher::valueId(StringView value) {
   copyStringToLocal(&*pair.first);
   if (!rangeOverflow_) {
     if (size > kStringASRangeMaxSize) {
-      rangeOverflow_ = true;
+      setRangeOverflow();
     } else {
       updateRange(stringAsNumber(data, size));
     }
@@ -709,6 +694,11 @@ template <>
 bool VectorHasher::makeValueIdsDecoded<bool, false>(
     const SelectivityVector& rows,
     uint64_t* result);
+
+/// Creates VectorHasher instances for specified columns.
+std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
+    const RowTypePtr& rowType,
+    const std::vector<core::FieldAccessTypedExprPtr>& keys);
 
 } // namespace facebook::velox::exec
 

@@ -16,18 +16,29 @@
 #include "velox/functions/sparksql/RegisterCompare.h"
 
 #include "velox/functions/lib/RegistrationHelpers.h"
-#include "velox/functions/prestosql/Comparisons.h"
+#include "velox/functions/sparksql/Comparisons.h"
 
 namespace facebook::velox::functions::sparksql {
 
 void registerCompareFunctions(const std::string& prefix) {
-  registerBinaryScalar<EqFunction, bool>({prefix + "equalto"});
-  registerBinaryScalar<NeqFunction, bool>({prefix + "notequalto"});
-  registerBinaryScalar<LtFunction, bool>({prefix + "lessthan"});
-  registerBinaryScalar<GtFunction, bool>({prefix + "greaterthan"});
-  registerBinaryScalar<LteFunction, bool>({prefix + "lessthanorequal"});
-  registerBinaryScalar<GteFunction, bool>({prefix + "greaterthanorequal"});
-
+  exec::registerStatefulVectorFunction(
+      prefix + "equalto", comparisonSignatures(), makeEqualTo);
+  exec::registerStatefulVectorFunction(
+      prefix + "lessthan", comparisonSignatures(), makeLessThan);
+  exec::registerStatefulVectorFunction(
+      prefix + "greaterthan", comparisonSignatures(), makeGreaterThan);
+  exec::registerStatefulVectorFunction(
+      prefix + "lessthanorequal", comparisonSignatures(), makeLessThanOrEqual);
+  exec::registerStatefulVectorFunction(
+      prefix + "greaterthanorequal",
+      comparisonSignatures(),
+      makeGreaterThanOrEqual);
+  // Compare nullsafe functions.
+  exec::registerStatefulVectorFunction(
+      prefix + "equalnullsafe",
+      comparisonSignatures(),
+      makeEqualToNullSafe,
+      exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build());
   registerFunction<BetweenFunction, bool, int8_t, int8_t, int8_t>(
       {prefix + "between"});
   registerFunction<BetweenFunction, bool, int16_t, int16_t, int16_t>(
@@ -36,10 +47,23 @@ void registerCompareFunctions(const std::string& prefix) {
       {prefix + "between"});
   registerFunction<BetweenFunction, bool, int64_t, int64_t, int64_t>(
       {prefix + "between"});
-  registerFunction<BetweenFunction, bool, double, double, double>(
+  registerFunction<BetweenFunction, bool, int128_t, int128_t, int128_t>(
       {prefix + "between"});
   registerFunction<BetweenFunction, bool, float, float, float>(
       {prefix + "between"});
+  registerFunction<BetweenFunction, bool, double, double, double>(
+      {prefix + "between"});
+  // Decimal comapre functions.
+  VELOX_REGISTER_VECTOR_FUNCTION(
+      udf_decimal_gt, prefix + "decimal_greaterthan");
+  VELOX_REGISTER_VECTOR_FUNCTION(
+      udf_decimal_gte, prefix + "decimal_greaterthanorequal");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_decimal_lt, prefix + "decimal_lessthan");
+  VELOX_REGISTER_VECTOR_FUNCTION(
+      udf_decimal_lte, prefix + "decimal_lessthanorequal");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_decimal_eq, prefix + "decimal_equalto");
+  VELOX_REGISTER_VECTOR_FUNCTION(
+      udf_decimal_neq, prefix + "decimal_notequalto");
 }
 
 } // namespace facebook::velox::functions::sparksql

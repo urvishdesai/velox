@@ -27,9 +27,21 @@ struct HiveConnectorSplit : public connector::ConnectorSplit {
   dwio::common::FileFormat fileFormat;
   const uint64_t start;
   const uint64_t length;
+
+  /// Mapping from partition keys to values. Values are specified as strings
+  /// formatted the same way as CAST(x as VARCHAR). Null values are specified as
+  /// std::nullopt. Date values must be formatted using ISO 8601 as YYYY-MM-DD.
+  /// All scalar types and date type are supported.
   const std::unordered_map<std::string, std::optional<std::string>>
       partitionKeys;
   std::optional<int32_t> tableBucketNumber;
+  std::unordered_map<std::string, std::string> customSplitInfo;
+  std::shared_ptr<std::string> extraFileInfo;
+  std::unordered_map<std::string, std::string> serdeParameters;
+
+  /// These represent columns like $file_size, $file_modified_time that are
+  /// associated with the HiveSplit.
+  std::unordered_map<std::string, std::string> infoColumns;
 
   HiveConnectorSplit(
       const std::string& connectorId,
@@ -39,25 +51,39 @@ struct HiveConnectorSplit : public connector::ConnectorSplit {
       uint64_t _length = std::numeric_limits<uint64_t>::max(),
       const std::unordered_map<std::string, std::optional<std::string>>&
           _partitionKeys = {},
-      std::optional<int32_t> _tableBucketNumber = std::nullopt)
-      : ConnectorSplit(connectorId),
+      std::optional<int32_t> _tableBucketNumber = std::nullopt,
+      const std::unordered_map<std::string, std::string>& _customSplitInfo = {},
+      const std::shared_ptr<std::string>& _extraFileInfo = {},
+      const std::unordered_map<std::string, std::string>& _serdeParameters = {},
+      int64_t _splitWeight = 0,
+      const std::unordered_map<std::string, std::string>& _infoColumns = {})
+      : ConnectorSplit(connectorId, _splitWeight),
         filePath(_filePath),
         fileFormat(_fileFormat),
         start(_start),
         length(_length),
         partitionKeys(_partitionKeys),
-        tableBucketNumber(_tableBucketNumber) {}
+        tableBucketNumber(_tableBucketNumber),
+        customSplitInfo(_customSplitInfo),
+        extraFileInfo(_extraFileInfo),
+        serdeParameters(_serdeParameters),
+        infoColumns(_infoColumns) {}
 
   std::string toString() const override {
     if (tableBucketNumber.has_value()) {
       return fmt::format(
-          "[file {} {} - {} {}]",
+          "Hive: {} {} - {} {}",
           filePath,
           start,
           length,
           tableBucketNumber.value());
     }
-    return fmt::format("[file {} {} - {}]", filePath, start, length);
+    return fmt::format("Hive: {} {} - {}", filePath, start, length);
+  }
+
+  std::string getFileName() const {
+    auto i = filePath.rfind('/');
+    return i == std::string::npos ? filePath : filePath.substr(i + 1);
   }
 };
 

@@ -82,7 +82,8 @@ void applyListenersOnError(
   exprSetListeners().withRLock([&](auto& listeners) {
     if (!listeners.empty()) {
       for (auto& listener : listeners) {
-        listener->onError(*errorRows, *errors);
+        listener->onError(
+            *errorRows, *errors, context.execCtx()->queryCtx()->queryId());
       }
     }
   });
@@ -92,7 +93,7 @@ void applyListenersOnError(
 void TryExpr::nullOutErrors(
     const SelectivityVector& rows,
     EvalCtx& context,
-    VectorPtr& result) {
+    VectorPtr& result) const {
   auto errors = context.errors();
   if (errors) {
     applyListenersOnError(rows, context);
@@ -125,11 +126,28 @@ void TryExpr::nullOutErrors(
         result = BaseVector::wrapInDictionary(nulls, indices, size, result);
       }
     } else {
-      rows.applyToSelected([&](auto row) {
-        if (row < errors->size() && !errors->isNullAt(row)) {
-          result->setNull(row, true);
-        }
-      });
+      if (result.unique() && result->isNullsWritable()) {
+        rows.applyToSelected([&](auto row) {
+          if (row < errors->size() && !errors->isNullAt(row)) {
+            result->setNull(row, true);
+          }
+        });
+      } else {
+        auto nulls = allocateNulls(rows.end(), context.pool());
+        auto* rawNulls = nulls->asMutable<uint64_t>();
+        auto indices = allocateIndices(rows.end(), context.pool());
+        auto* rawIndices = indices->asMutable<vector_size_t>();
+
+        rows.applyToSelected([&](auto row) {
+          rawIndices[row] = row;
+          if (row < errors->size() && !errors->isNullAt(row)) {
+            bits::setNull(rawNulls, row, true);
+          }
+        });
+
+        result =
+            BaseVector::wrapInDictionary(nulls, indices, rows.end(), result);
+      }
     }
   }
 }
@@ -147,7 +165,8 @@ TypePtr TryCallToSpecialForm::resolveType(
 ExprPtr TryCallToSpecialForm::constructSpecialForm(
     const TypePtr& type,
     std::vector<ExprPtr>&& compiledChildren,
-    bool /* trackCpuUsage */) {
+    bool /* trackCpuUsage */,
+    const core::QueryConfig& /*config*/) {
   VELOX_CHECK_EQ(
       compiledChildren.size(),
       1,

@@ -15,8 +15,10 @@
  */
 #include "velox/common/base/Exceptions.h"
 #include "velox/expression/FunctionSignature.h"
+#include "velox/functions/lib/aggregates/SumAggregateBase.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
-#include "velox/functions/prestosql/aggregates/SumAggregate.h"
+
+using namespace facebook::velox::functions::aggregate;
 
 namespace facebook::velox::aggregate::prestosql {
 
@@ -30,15 +32,6 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
 
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(int64_t);
-  }
-
-  void initializeNewGroups(
-      char** groups,
-      folly::Range<const vector_size_t*> indices) override {
-    for (auto i : indices) {
-      // result of count is never null
-      *value<int64_t>(groups[i]) = (int64_t)0;
-    }
   }
 
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
@@ -138,6 +131,16 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
     addToGroup(group, count);
   }
 
+ protected:
+  void initializeNewGroupsInternal(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) override {
+    for (auto i : indices) {
+      // result of count is never null
+      *value<int64_t>(groups[i]) = (int64_t)0;
+    }
+  }
+
  private:
   inline void addToGroup(char* group, int64_t count) {
     *value<int64_t>(group) += count;
@@ -146,7 +149,12 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
   DecodedVector decodedIntermediate_;
 };
 
-bool registerCount(const std::string& name) {
+} // namespace
+
+void registerCountAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite) {
   std::vector<std::shared_ptr<exec::AggregateFunctionSignature>> signatures{
       exec::AggregateFunctionSignatureBuilder()
           .returnType("bigint")
@@ -160,25 +168,23 @@ bool registerCount(const std::string& name) {
           .build(),
   };
 
+  auto name = prefix + kCount;
   exec::registerAggregateFunction(
       name,
       std::move(signatures),
       [name](
           core::AggregationNode::Step step,
           const std::vector<TypePtr>& argTypes,
-          const TypePtr&
-          /*resultType*/) -> std::unique_ptr<exec::Aggregate> {
+          const TypePtr& /*resultType*/,
+          const core::QueryConfig& /*config*/)
+          -> std::unique_ptr<exec::Aggregate> {
         VELOX_CHECK_LE(
             argTypes.size(), 1, "{} takes at most one argument", name);
         return std::make_unique<CountAggregate>();
-      });
-  return true;
-}
-
-} // namespace
-
-void registerCountAggregate(const std::string& prefix) {
-  registerCount(prefix + kCount);
+      },
+      {false /*orderSensitive*/},
+      withCompanionFunctions,
+      overwrite);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

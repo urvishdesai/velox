@@ -16,8 +16,8 @@
 
 #include "velox/type/TimestampConversion.h"
 #include <gmock/gmock.h>
-#include <gtest/gtest.h>
 #include "velox/common/base/VeloxException.h"
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/external/date/tz.h"
 #include "velox/type/Timestamp.h"
 #include "velox/type/tz/TimeZoneMap.h"
@@ -26,35 +26,57 @@ namespace facebook::velox::util {
 namespace {
 
 TEST(DateTimeUtilTest, fromDate) {
-  EXPECT_EQ(0, daysSinceEpochFromDate(1970, 1, 1));
-  EXPECT_EQ(1, daysSinceEpochFromDate(1970, 1, 2));
-  EXPECT_EQ(365, daysSinceEpochFromDate(1971, 1, 1));
-  EXPECT_EQ(730, daysSinceEpochFromDate(1972, 1, 1)); // leap year.
-  EXPECT_EQ(1096, daysSinceEpochFromDate(1973, 1, 1));
+  auto testDaysSinceEpochFromDate =
+      [](int32_t year, int32_t month, int32_t day) {
+        int64_t daysSinceEpoch;
+        auto status =
+            util::daysSinceEpochFromDate(year, month, day, daysSinceEpoch);
+        EXPECT_TRUE(status.ok());
+        return daysSinceEpoch;
+      };
+  EXPECT_EQ(0, testDaysSinceEpochFromDate(1970, 1, 1));
+  EXPECT_EQ(1, testDaysSinceEpochFromDate(1970, 1, 2));
+  EXPECT_EQ(365, testDaysSinceEpochFromDate(1971, 1, 1));
+  EXPECT_EQ(730, testDaysSinceEpochFromDate(1972, 1, 1)); // leap year.
+  EXPECT_EQ(1096, testDaysSinceEpochFromDate(1973, 1, 1));
 
-  EXPECT_EQ(10957, daysSinceEpochFromDate(2000, 1, 1));
-  EXPECT_EQ(18474, daysSinceEpochFromDate(2020, 7, 31));
+  EXPECT_EQ(10957, testDaysSinceEpochFromDate(2000, 1, 1));
+  EXPECT_EQ(18474, testDaysSinceEpochFromDate(2020, 7, 31));
 
   // Before unix epoch.
-  EXPECT_EQ(-1, daysSinceEpochFromDate(1969, 12, 31));
-  EXPECT_EQ(-365, daysSinceEpochFromDate(1969, 1, 1));
-  EXPECT_EQ(-731, daysSinceEpochFromDate(1968, 1, 1)); // leap year.
-  EXPECT_EQ(-719528, daysSinceEpochFromDate(0, 1, 1));
+  EXPECT_EQ(-1, testDaysSinceEpochFromDate(1969, 12, 31));
+  EXPECT_EQ(-365, testDaysSinceEpochFromDate(1969, 1, 1));
+  EXPECT_EQ(-731, testDaysSinceEpochFromDate(1968, 1, 1)); // leap year.
+  EXPECT_EQ(-719528, testDaysSinceEpochFromDate(0, 1, 1));
 
   // Negative year - BC.
-  EXPECT_EQ(-719529, daysSinceEpochFromDate(-1, 12, 31));
-  EXPECT_EQ(-719893, daysSinceEpochFromDate(-1, 1, 1));
+  EXPECT_EQ(-719529, testDaysSinceEpochFromDate(-1, 12, 31));
+  EXPECT_EQ(-719893, testDaysSinceEpochFromDate(-1, 1, 1));
 }
 
 TEST(DateTimeUtilTest, fromDateInvalid) {
-  EXPECT_THROW(daysSinceEpochFromDate(1970, 1, -1), VeloxUserError);
-  EXPECT_THROW(daysSinceEpochFromDate(1970, -1, 1), VeloxUserError);
-  EXPECT_THROW(daysSinceEpochFromDate(1970, 0, 1), VeloxUserError);
-  EXPECT_THROW(daysSinceEpochFromDate(1970, 13, 1), VeloxUserError);
-  EXPECT_THROW(daysSinceEpochFromDate(1970, 1, 32), VeloxUserError);
-  EXPECT_THROW(
-      daysSinceEpochFromDate(1970, 2, 29), VeloxUserError); // non-leap.
-  EXPECT_THROW(daysSinceEpochFromDate(1970, 6, 31), VeloxUserError);
+  auto testDaysSinceEpochFromDateInvalid =
+      [](int32_t year, int32_t month, int32_t day, const std::string& error) {
+        int64_t daysSinceEpoch;
+        auto status =
+            util::daysSinceEpochFromDate(year, month, day, daysSinceEpoch);
+        EXPECT_TRUE(status.isUserError());
+        EXPECT_EQ(status.message(), error);
+      };
+  EXPECT_NO_THROW(testDaysSinceEpochFromDateInvalid(
+      1970, 1, -1, "Date out of range: 1970-1--1"));
+  EXPECT_NO_THROW(testDaysSinceEpochFromDateInvalid(
+      1970, -1, 1, "Date out of range: 1970--1-1"));
+  EXPECT_NO_THROW(testDaysSinceEpochFromDateInvalid(
+      1970, 0, 1, "Date out of range: 1970-0-1"));
+  EXPECT_NO_THROW(testDaysSinceEpochFromDateInvalid(
+      1970, 13, 1, "Date out of range: 1970-13-1"));
+  EXPECT_NO_THROW(testDaysSinceEpochFromDateInvalid(
+      1970, 1, 32, "Date out of range: 1970-1-32"));
+  EXPECT_NO_THROW(testDaysSinceEpochFromDateInvalid(
+      1970, 2, 29, "Date out of range: 1970-2-29")); // non-leap.
+  EXPECT_NO_THROW(testDaysSinceEpochFromDateInvalid(
+      1970, 6, 31, "Date out of range: 1970-6-31"));
 }
 
 TEST(DateTimeUtilTest, fromDateString) {
@@ -109,6 +131,102 @@ TEST(DateTimeUtilTest, fromDateStrInvalid) {
   EXPECT_THROW(fromDateString("-1000000"), VeloxUserError);
 }
 
+TEST(DateTimeUtilTest, castFromDateString) {
+  for (ParseMode mode :
+       {ParseMode::kStandardCast, ParseMode::kNonStandardCast}) {
+    EXPECT_EQ(0, castFromDateString("1970-01-01", mode));
+    EXPECT_EQ(3789742, castFromDateString("12345-12-18", mode));
+
+    EXPECT_EQ(1, castFromDateString("1970-1-2", mode));
+    EXPECT_EQ(1, castFromDateString("1970-01-2", mode));
+    EXPECT_EQ(1, castFromDateString("1970-1-02", mode));
+
+    EXPECT_EQ(1, castFromDateString("+1970-01-02", mode));
+    EXPECT_EQ(-719893, castFromDateString("-1-1-1", mode));
+
+    EXPECT_EQ(0, castFromDateString(" 1970-01-01", mode));
+  }
+
+  EXPECT_EQ(3789391, castFromDateString("12345", ParseMode::kNonStandardCast));
+  EXPECT_EQ(16436, castFromDateString("2015", ParseMode::kNonStandardCast));
+  EXPECT_EQ(16495, castFromDateString("2015-03", ParseMode::kNonStandardCast));
+  EXPECT_EQ(
+      16512, castFromDateString("2015-03-18T", ParseMode::kNonStandardCast));
+  EXPECT_EQ(
+      16512,
+      castFromDateString("2015-03-18T123123", ParseMode::kNonStandardCast));
+  EXPECT_EQ(
+      16512,
+      castFromDateString("2015-03-18 123142", ParseMode::kNonStandardCast));
+  EXPECT_EQ(
+      16512,
+      castFromDateString("2015-03-18 (BC)", ParseMode::kNonStandardCast));
+
+  EXPECT_EQ(0, castFromDateString("1970-01-01 ", ParseMode::kNonStandardCast));
+  EXPECT_EQ(0, castFromDateString(" 1970-01-01 ", ParseMode::kNonStandardCast));
+}
+
+TEST(DateTimeUtilTest, castFromDateStringInvalid) {
+  auto testCastFromDateStringInvalid = [&](const StringView& str,
+                                           ParseMode mode) {
+    if (mode == ParseMode::kStandardCast) {
+      VELOX_ASSERT_THROW(
+          castFromDateString(str, mode),
+          fmt::format(
+              "Unable to parse date value: \"{}\". "
+              "Valid date string pattern is (YYYY-MM-DD), "
+              "and can be prefixed with [+-]",
+              std::string(str.data(), str.size())));
+    } else if (mode == ParseMode::kNonStandardCast) {
+      VELOX_ASSERT_THROW(
+          castFromDateString(str, mode),
+          fmt::format(
+              "Unable to parse date value: \"{}\". "
+              "Valid date string patterns include "
+              "([y]y*, [y]y*-[m]m*, [y]y*-[m]m*-[d]d*, "
+              "[y]y*-[m]m*-[d]d* *, [y]y*-[m]m*-[d]d*T*), "
+              "and any pattern prefixed with [+-]",
+              std::string(str.data(), str.size())));
+    } else if (mode == ParseMode::kNonStandardNoTimeCast) {
+      VELOX_ASSERT_THROW(
+          castFromDateString(str, mode),
+          fmt::format(
+              "Unable to parse date value: \"{}\". "
+              "Valid date string patterns include "
+              "([y]y*, [y]y*-[m]m*, [y]y*-[m]m*-[d]d*, "
+              "[y]y*-[m]m*-[d]d* *), "
+              "and any pattern prefixed with [+-]",
+              std::string(str.data(), str.size())));
+    }
+  };
+
+  for (ParseMode mode :
+       {ParseMode::kStandardCast, ParseMode::kNonStandardCast}) {
+    testCastFromDateStringInvalid("2012-Oct-23", mode);
+    testCastFromDateStringInvalid("2012-Oct-23", mode);
+    testCastFromDateStringInvalid("2015-03-18X", mode);
+    testCastFromDateStringInvalid("2015/03/18", mode);
+    testCastFromDateStringInvalid("2015.03.18", mode);
+    testCastFromDateStringInvalid("20150318", mode);
+    testCastFromDateStringInvalid("2015-031-8", mode);
+  }
+
+  testCastFromDateStringInvalid("12345", ParseMode::kStrict);
+  testCastFromDateStringInvalid("2015", ParseMode::kStrict);
+  testCastFromDateStringInvalid("2015-03", ParseMode::kStrict);
+  testCastFromDateStringInvalid("2015-03-18 123412", ParseMode::kStrict);
+  testCastFromDateStringInvalid("2015-03-18T", ParseMode::kStrict);
+  testCastFromDateStringInvalid("2015-03-18T123412", ParseMode::kStrict);
+  testCastFromDateStringInvalid("2015-03-18 (BC)", ParseMode::kStrict);
+  testCastFromDateStringInvalid("1970-01-01 ", ParseMode::kStrict);
+  testCastFromDateStringInvalid(" 1970-01-01 ", ParseMode::kStrict);
+
+  testCastFromDateStringInvalid(
+      "1970-01-01T01:00:47", ParseMode::kNonStandardNoTimeCast);
+  testCastFromDateStringInvalid(
+      "1970-01-01T01:00:47.000", ParseMode::kNonStandardNoTimeCast);
+}
+
 TEST(DateTimeUtilTest, fromTimeString) {
   EXPECT_EQ(0, fromTimeString("00:00:00"));
   EXPECT_EQ(0, fromTimeString("00:00:00.00"));
@@ -134,17 +252,22 @@ TEST(DateTimeUtilTest, fromTimeString) {
 }
 
 TEST(DateTimeUtilTest, fromTimeStrInvalid) {
-  EXPECT_THROW(fromTimeString(""), VeloxUserError);
-  EXPECT_THROW(fromTimeString("00"), VeloxUserError);
-  EXPECT_THROW(fromTimeString("00:00"), VeloxUserError);
+  const std::string errorMsg = "Unable to parse time value: ";
+  VELOX_ASSERT_THROW(fromTimeString(""), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00"), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00:"), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00:00:"), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00:00:00."), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00:00-00"), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00/00:00"), errorMsg);
 
   // Invalid hour, minutes and seconds.
-  EXPECT_THROW(fromTimeString("24:00:00"), VeloxUserError);
-  EXPECT_THROW(fromTimeString("00:61:00"), VeloxUserError);
-  EXPECT_THROW(fromTimeString("00:00:61"), VeloxUserError);
+  VELOX_ASSERT_THROW(fromTimeString("24:00:00"), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00:61:00"), errorMsg);
+  VELOX_ASSERT_THROW(fromTimeString("00:00:61"), errorMsg);
 
   // Trailing characters.
-  EXPECT_THROW(fromTimeString("00:00:00   12"), VeloxUserError);
+  VELOX_ASSERT_THROW(fromTimeString("00:00:00   12"), errorMsg);
 }
 
 // bash command to verify:
@@ -154,7 +277,9 @@ TEST(DateTimeUtilTest, fromTimestampString) {
   EXPECT_EQ(Timestamp(0, 0), fromTimestampString("1970-01-01"));
   EXPECT_EQ(Timestamp(946684800, 0), fromTimestampString("2000-01-01"));
 
+  EXPECT_EQ(Timestamp(0, 0), fromTimestampString("1970-01-01 00:00"));
   EXPECT_EQ(Timestamp(0, 0), fromTimestampString("1970-01-01 00:00:00"));
+
   EXPECT_EQ(
       Timestamp(946729316, 0), fromTimestampString("2000-01-01 12:21:56"));
   EXPECT_EQ(
@@ -226,6 +351,19 @@ TEST(DateTimeUtilTest, toGMT) {
   ts = fromTimestampString("2021-03-14 08:00:00");
   ts.toGMT(*laZone);
   EXPECT_EQ(ts, fromTimestampString("2021-03-14 15:00:00"));
+
+  // Ambiguous time 2019-11-03 01:00:00.
+  // It could be 2019-11-03 01:00:00 PDT == 2019-11-03 08:00:00 UTC
+  // or 2019-11-03 01:00:00 PST == 2019-11-03 09:00:00 UTC.
+  ts = fromTimestampString("2019-11-03 01:00:00");
+  ts.toGMT(*laZone);
+  EXPECT_EQ(ts, fromTimestampString("2019-11-03 08:00:00"));
+
+  // Nonexistent time 2019-03-10 02:00:00.
+  // It is in a gap between 2019-03-10 02:00:00 PST and 2019-03-10 03:00:00 PDT
+  // which are both equivalent to 2019-03-10 10:00:00 UTC.
+  ts = fromTimestampString("2019-03-10 02:00:00");
+  EXPECT_THROW(ts.toGMT(*laZone), VeloxUserError);
 }
 
 TEST(DateTimeUtilTest, toTimezone) {

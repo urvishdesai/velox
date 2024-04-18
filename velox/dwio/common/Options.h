@@ -20,17 +20,21 @@
 #include <unordered_set>
 
 #include <folly/Executor.h>
+#include "velox/common/base/RandomUtil.h"
+#include "velox/common/base/SpillConfig.h"
+#include "velox/common/compression/Compression.h"
+#include "velox/common/io/Options.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/ColumnSelector.h"
 #include "velox/dwio/common/ErrorTolerance.h"
+#include "velox/dwio/common/FlatMapHelper.h"
+#include "velox/dwio/common/FlushPolicy.h"
 #include "velox/dwio/common/InputStream.h"
 #include "velox/dwio/common/ScanSpec.h"
+#include "velox/dwio/common/UnitLoader.h"
 #include "velox/dwio/common/encryption/Encryption.h"
 
-namespace facebook {
-namespace velox {
-namespace dwio {
-namespace common {
+namespace facebook::velox::dwio::common {
 
 enum class FileFormat {
   UNKNOWN = 0,
@@ -47,6 +51,13 @@ enum class FileFormat {
 
 FileFormat toFileFormat(std::string s);
 std::string toString(FileFormat fmt);
+
+FOLLY_ALWAYS_INLINE std::ostream& operator<<(
+    std::ostream& output,
+    const FileFormat& fmt) {
+  output << toString(fmt);
+  return output;
+}
 
 /**
  * Formatting options for serialization.
@@ -65,6 +76,10 @@ class SerDeOptions {
   uint8_t escapeChar;
   bool isEscaped;
 
+  inline static const std::string kFieldDelim{"field.delim"};
+  inline static const std::string kCollectionDelim{"collection.delim"};
+  inline static const std::string kMapKeyDelim{"mapkey.delim"};
+
   explicit SerDeOptions(
       uint8_t fieldDelim = '\1',
       uint8_t collectionDelim = '\2',
@@ -77,6 +92,19 @@ class SerDeOptions {
         escapeChar(escape),
         isEscaped(isEscapedFlag) {}
   ~SerDeOptions() = default;
+};
+
+struct TableParameter {
+  /// If present in the table parameters, the option is passed to the row reader
+  /// to instruct it to skip the number of rows from the current position. Used
+  /// to skip the column header row(s).
+  static constexpr const char* kSkipHeaderLineCount = "skip.header.line.count";
+  /// If present in the table parameters, the option overrides the default value
+  /// of the SerDeOptions::nullString. It causes any field read from the file
+  /// (usually of the TEXT format) to be considered NULL if it is equal to this
+  /// string.
+  static constexpr const char* kSerializationNullFormat =
+      "serialization.null.format";
 };
 
 /**
@@ -100,24 +128,27 @@ class RowReaderOptions {
   // 'ioExecutor' enables parallelism when performing file system read
   // operations.
   std::shared_ptr<folly::Executor> decodingExecutor_;
-  std::shared_ptr<folly::Executor> ioExecutor_;
+  size_t decodingParallelismFactor_{0};
   bool appendRowNumberColumn_ = false;
+  // Function to populate metrics related to feature projection stats
+  // in Koski. This gets fired in FlatMapColumnReader.
+  // This is a bit of a hack as there is (by design) no good way
+  // To propogate information from column reader to Koski
+  std::function<void(
+      facebook::velox::dwio::common::flatmap::FlatMapKeySelectionStats)>
+      keySelectionCallback_;
+
+  // Function to track how much time we spend waiting on IO before reading rows
+  // (in dwrf row reader). todo: encapsulate this and keySelectionCallBack_ in a
+  // struct
+  std::function<void(uint64_t)> blockedOnIoCallback_;
+  std::function<void(uint64_t)> decodingTimeUsCallback_;
+  std::function<void(uint16_t)> stripeCountCallback_;
+  bool eagerFirstStripeLoad = true;
+  uint64_t skipRows_ = 0;
+  std::shared_ptr<UnitLoaderFactory> unitLoaderFactory_;
 
  public:
-  RowReaderOptions(const RowReaderOptions& other) {
-    dataStart = other.dataStart;
-    dataLength = other.dataLength;
-    preloadStripe = other.preloadStripe;
-    projectSelectedType = other.projectSelectedType;
-    errorTolerance_ = other.errorTolerance_;
-    selector_ = other.selector_;
-    scanSpec_ = other.scanSpec_;
-    metadataFilter_ = other.metadataFilter_;
-    returnFlatVector_ = other.returnFlatVector_;
-    flatmapNodeIdAsStruct_ = other.flatmapNodeIdAsStruct_;
-    appendRowNumberColumn_ = other.appendRowNumberColumn_;
-  }
-
   RowReaderOptions() noexcept
       : dataStart(0),
         dataLength(std::numeric_limits<uint64_t>::max()),
@@ -194,6 +225,24 @@ class RowReaderOptions {
    */
   bool getPreloadStripe() const {
     return preloadStripe;
+  }
+
+  /*
+   * Will load the first stripe on RowReader creation, if true.
+   * This behavior is already happening in DWRF, but isn't desired for some use
+   * cases. So this flag allows us to turn it off.
+   */
+  void setEagerFirstStripeLoad(bool load) {
+    eagerFirstStripeLoad = load;
+  }
+
+  /*
+   * Will load the first stripe on RowReader creation, if true.
+   * This behavior is already happening in DWRF, but isn't desired for some use
+   * cases. So this flag allows us to turn it off.
+   */
+  bool getEagerFirstStripeLoad() const {
+    return eagerFirstStripeLoad;
   }
 
   // For flat map, return flat vector representation
@@ -273,13 +322,15 @@ class RowReaderOptions {
     decodingExecutor_ = executor;
   }
 
-  void setIOExecutor(std::shared_ptr<folly::Executor> executor) {
-    ioExecutor_ = executor;
+  void setDecodingParallelismFactor(size_t factor) {
+    decodingParallelismFactor_ = factor;
   }
 
   /*
    * Set to true, if you want to add a new column to the results containing the
-   * row numbers.
+   * row numbers.  These row numbers are relative to the beginning of file (0 as
+   * first row) and does not affected by filtering or deletion during the read
+   * (it always counts all rows in the file).
    */
   void setAppendRowNumberColumn(bool value) {
     appendRowNumberColumn_ = value;
@@ -289,111 +340,128 @@ class RowReaderOptions {
     return appendRowNumberColumn_;
   }
 
+  void setKeySelectionCallback(
+      std::function<void(
+          facebook::velox::dwio::common::flatmap::FlatMapKeySelectionStats)>
+          keySelectionCallback) {
+    keySelectionCallback_ = std::move(keySelectionCallback);
+  }
+
+  const std::function<
+      void(facebook::velox::dwio::common::flatmap::FlatMapKeySelectionStats)>
+  getKeySelectionCallback() const {
+    return keySelectionCallback_;
+  }
+
+  void setBlockedOnIoCallback(
+      std::function<void(int64_t)> blockedOnIoCallback) {
+    blockedOnIoCallback_ = std::move(blockedOnIoCallback);
+  }
+
+  const std::function<void(int64_t)> getBlockedOnIoCallback() const {
+    return blockedOnIoCallback_;
+  }
+
+  void setDecodingTimeUsCallback(std::function<void(int64_t)> decodingTimeUs) {
+    decodingTimeUsCallback_ = std::move(decodingTimeUs);
+  }
+
+  std::function<void(int64_t)> getDecodingTimeUsCallback() const {
+    return decodingTimeUsCallback_;
+  }
+
+  void setStripeCountCallback(
+      std::function<void(uint16_t)> stripeCountCallback) {
+    stripeCountCallback_ = std::move(stripeCountCallback);
+  }
+
+  std::function<void(uint16_t)> getStripeCountCallback() const {
+    return stripeCountCallback_;
+  }
+
+  void setSkipRows(uint64_t skipRows) {
+    skipRows_ = skipRows;
+  }
+
+  uint64_t getSkipRows() const {
+    return skipRows_;
+  }
+
+  void setUnitLoaderFactory(
+      std::shared_ptr<UnitLoaderFactory> unitLoaderFactory) {
+    unitLoaderFactory_ = std::move(unitLoaderFactory);
+  }
+
+  const std::shared_ptr<UnitLoaderFactory>& getUnitLoaderFactory() const {
+    return unitLoaderFactory_;
+  }
+
   const std::shared_ptr<folly::Executor>& getDecodingExecutor() const {
     return decodingExecutor_;
   }
 
-  const std::shared_ptr<folly::Executor>& getIOExecutor() const {
-    return ioExecutor_;
+  size_t getDecodingParallelismFactor() const {
+    return decodingParallelismFactor_;
   }
-};
-
-/**
- * Mode for prefetching data.
- *
- * This mode may be ignored for a reader, such as DWRF, where it does not
- * make sense.
- *
- * To enable single-buffered reading, using the default autoPreloadLength:
- *         ReaderOptions readerOpts;
- *         readerOpts.setPrefetchMode(PrefetchMode::PRELOAD);
- * To enable double-buffered reading, using the default autoPreloadLength:
- *         ReaderOptions readerOpts;
- *         readerOpts.setPrefetchMode(PrefetchMode::PREFETCH);
- * To select unbuffered reading:
- *         ReaderOptions readerOpts;
- *         readerOpts.setPrefetchMode(PrefetchMode::NOT_SET);
- *
- * Single-buffered reading (as in dwio::PreloadableInputStream)
- * reads ahead into a buffer.   Double-buffered reading additionally reads
- * asynchronously into a second buffer, swaps the buffers when the
- * first is fully consumed and the second has been filled, and then starts
- * a new parallel read.  For clients with a slow network connection to
- * Warm Storage, enabling PREFETCH reduces elapsed time by 10% or more,
- * at the cost of a second buffer.   The relative improvment would be greater
- * for cases where the network throughput is higher.
- */
-enum class PrefetchMode {
-  NOT_SET = 0,
-  PRELOAD = 1, // read a buffer of autoPreloadLength bytes on a read beyond the
-               // current buffer, if any.
-  PREFETCH = 2, // read a second buffer of autoPreloadLength bytes ahead of
-                // actual reads.
 };
 
 /**
  * Options for creating a Reader.
  */
-class ReaderOptions {
+class ReaderOptions : public io::ReaderOptions {
  private:
   uint64_t tailLocation;
-  velox::memory::MemoryPool* memoryPool;
   FileFormat fileFormat;
   RowTypePtr fileSchema;
-  uint64_t autoPreloadLength;
-  PrefetchMode prefetchMode;
-  int32_t loadQuantum_{kDefaultLoadQuantum};
-  int32_t maxCoalesceDistance_{kDefaultCoalesceDistance};
   SerDeOptions serDeOptions;
   std::shared_ptr<encryption::DecrypterFactory> decrypterFactory_;
-  uint64_t directorySizeGuess{kDefaultDirectorySizeGuess};
+  uint64_t footerEstimatedSize{kDefaultFooterEstimatedSize};
   uint64_t filePreloadThreshold{kDefaultFilePreloadThreshold};
+  bool fileColumnNamesReadAsLowerCase{false};
+  bool useColumnNamesForColumnMapping_{false};
+  std::shared_ptr<folly::Executor> ioExecutor_;
+  std::shared_ptr<random::RandomSkipTracker> randomSkip_;
 
  public:
-  static constexpr int32_t kDefaultLoadQuantum = 8 << 20; // 8MB
-  static constexpr int32_t kDefaultCoalesceDistance = 512 << 10; // 512K
-  static constexpr uint64_t kDefaultDirectorySizeGuess = 1024 * 1024; // 1MB
+  static constexpr uint64_t kDefaultFooterEstimatedSize = 1024 * 1024; // 1MB
   static constexpr uint64_t kDefaultFilePreloadThreshold =
       1024 * 1024 * 8; // 8MB
 
-  ReaderOptions(velox::memory::MemoryPool* pool)
-      : tailLocation(std::numeric_limits<uint64_t>::max()),
-        memoryPool(pool),
+  explicit ReaderOptions(velox::memory::MemoryPool* pool)
+      : io::ReaderOptions(pool),
+        tailLocation(std::numeric_limits<uint64_t>::max()),
         fileFormat(FileFormat::UNKNOWN),
-        fileSchema(nullptr),
-        autoPreloadLength(DEFAULT_AUTO_PRELOAD_SIZE),
-        prefetchMode(PrefetchMode::PREFETCH) {
-    // PASS
-  }
+        fileSchema(nullptr) {}
 
   ReaderOptions& operator=(const ReaderOptions& other) {
+    io::ReaderOptions::operator=(other);
     tailLocation = other.tailLocation;
-    memoryPool = other.memoryPool;
     fileFormat = other.fileFormat;
     if (other.fileSchema != nullptr) {
       fileSchema = other.getFileSchema();
     } else {
       fileSchema = nullptr;
     }
-    autoPreloadLength = other.autoPreloadLength;
-    prefetchMode = other.prefetchMode;
     serDeOptions = other.serDeOptions;
     decrypterFactory_ = other.decrypterFactory_;
-    directorySizeGuess = other.directorySizeGuess;
+    footerEstimatedSize = other.footerEstimatedSize;
     filePreloadThreshold = other.filePreloadThreshold;
+    fileColumnNamesReadAsLowerCase = other.fileColumnNamesReadAsLowerCase;
+    useColumnNamesForColumnMapping_ = other.useColumnNamesForColumnMapping_;
     return *this;
   }
 
-  ReaderOptions(const ReaderOptions& other) {
-    *this = other;
-  }
-
-  /**
-   * Set the memory allocator.
-   */
-  ReaderOptions& setMemoryPool(velox::memory::MemoryPool& pool) {
-    memoryPool = &pool;
-    return *this;
+  ReaderOptions(const ReaderOptions& other)
+      : io::ReaderOptions(other),
+        tailLocation(other.tailLocation),
+        fileFormat(other.fileFormat),
+        fileSchema(other.fileSchema),
+        serDeOptions(other.serDeOptions),
+        decrypterFactory_(other.decrypterFactory_),
+        footerEstimatedSize(other.footerEstimatedSize),
+        filePreloadThreshold(other.filePreloadThreshold),
+        fileColumnNamesReadAsLowerCase(other.fileColumnNamesReadAsLowerCase),
+        useColumnNamesForColumnMapping_(other.useColumnNamesForColumnMapping_) {
   }
 
   /**
@@ -410,13 +478,8 @@ class ReaderOptions {
    * For "dwrf" format, a default schema is derived from the file.
    * For "rc" format, there is no default schema.
    */
-  ReaderOptions& setFileSchema(
-      const std::shared_ptr<const velox::RowType>& schema) {
-    if (schema != nullptr) {
-      fileSchema = schema;
-    } else {
-      fileSchema = nullptr;
-    }
+  ReaderOptions& setFileSchema(const RowTypePtr& schema) {
+    fileSchema = schema;
     return *this;
   }
 
@@ -426,37 +489,6 @@ class ReaderOptions {
    */
   ReaderOptions& setTailLocation(uint64_t offset) {
     tailLocation = offset;
-    return *this;
-  }
-
-  /**
-   * Modify the autoPreloadLength
-   */
-  ReaderOptions& setAutoPreloadLength(uint64_t len) {
-    autoPreloadLength = len;
-    return *this;
-  }
-
-  /**
-   * Modify the prefetch mode.
-   */
-  ReaderOptions& setPrefetchMode(PrefetchMode mode) {
-    prefetchMode = mode;
-    return *this;
-  }
-
-  /**
-   * Modify the load quantum.
-   */
-  ReaderOptions& setLoadQuantum(int32_t quantum) {
-    loadQuantum_ = quantum;
-    return *this;
-  }
-  /**
-   * Modify the maximum load coalesce distance.
-   */
-  ReaderOptions& setMaxCoalesceDistance(int32_t distance) {
-    maxCoalesceDistance_ = distance;
     return *this;
   }
 
@@ -474,13 +506,28 @@ class ReaderOptions {
     return *this;
   }
 
-  ReaderOptions& setDirectorySizeGuess(uint64_t size) {
-    directorySizeGuess = size;
+  ReaderOptions& setFooterEstimatedSize(uint64_t size) {
+    footerEstimatedSize = size;
     return *this;
   }
 
   ReaderOptions& setFilePreloadThreshold(uint64_t threshold) {
     filePreloadThreshold = threshold;
+    return *this;
+  }
+
+  ReaderOptions& setFileColumnNamesReadAsLowerCase(bool flag) {
+    fileColumnNamesReadAsLowerCase = flag;
+    return *this;
+  }
+
+  ReaderOptions& setUseColumnNamesForColumnMapping(bool flag) {
+    useColumnNamesForColumnMapping_ = flag;
+    return *this;
+  }
+
+  ReaderOptions& setIOExecutor(std::shared_ptr<folly::Executor> executor) {
+    ioExecutor_ = std::move(executor);
     return *this;
   }
 
@@ -490,13 +537,6 @@ class ReaderOptions {
    */
   uint64_t getTailLocation() const {
     return tailLocation;
-  }
-
-  /**
-   * Get the memory allocator.
-   */
-  velox::memory::MemoryPool& getMemoryPool() const {
-    return *memoryPool;
   }
 
   /**
@@ -513,22 +553,6 @@ class ReaderOptions {
     return fileSchema;
   }
 
-  uint64_t getAutoPreloadLength() const {
-    return autoPreloadLength;
-  }
-
-  PrefetchMode getPrefetchMode() const {
-    return prefetchMode;
-  }
-
-  int32_t loadQuantum() const {
-    return loadQuantum_;
-  }
-
-  int32_t maxCoalesceDistance() const {
-    return maxCoalesceDistance_;
-  }
-
   SerDeOptions& getSerDeOptions() {
     return serDeOptions;
   }
@@ -542,16 +566,45 @@ class ReaderOptions {
     return decrypterFactory_;
   }
 
-  uint64_t getDirectorySizeGuess() const {
-    return directorySizeGuess;
+  uint64_t getFooterEstimatedSize() const {
+    return footerEstimatedSize;
   }
 
   uint64_t getFilePreloadThreshold() const {
     return filePreloadThreshold;
   }
+
+  const std::shared_ptr<folly::Executor>& getIOExecutor() const {
+    return ioExecutor_;
+  }
+
+  bool isFileColumnNamesReadAsLowerCase() const {
+    return fileColumnNamesReadAsLowerCase;
+  }
+
+  bool isUseColumnNamesForColumnMapping() const {
+    return useColumnNamesForColumnMapping_;
+  }
+
+  const std::shared_ptr<random::RandomSkipTracker>& randomSkip() const {
+    return randomSkip_;
+  }
+
+  void setRandomSkip(std::shared_ptr<random::RandomSkipTracker> randomSkip) {
+    randomSkip_ = randomSkip;
+  }
 };
 
-} // namespace common
-} // namespace dwio
-} // namespace velox
-} // namespace facebook
+struct WriterOptions {
+  TypePtr schema;
+  velox::memory::MemoryPool* memoryPool;
+  const velox::common::SpillConfig* spillConfig{nullptr};
+  tsan_atomic<bool>* nonReclaimableSection{nullptr};
+  std::optional<velox::common::CompressionKind> compressionKind;
+  std::optional<uint64_t> maxStripeSize{std::nullopt};
+  std::optional<uint64_t> maxDictionaryMemory{std::nullopt};
+  std::map<std::string, std::string> serdeParameters;
+  std::optional<uint8_t> parquetWriteTimestampUnit;
+};
+
+} // namespace facebook::velox::dwio::common

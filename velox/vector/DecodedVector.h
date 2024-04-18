@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/type/HugeInt.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/SelectivityVector.h"
 
@@ -143,9 +144,10 @@ class DecodedVector {
   ///
   ///  nulls() ? bits::isBitNull(nulls(), i) : false
   ///
-  /// returns the null flag for top-level row 'i' given that 'i' is one of the
-  /// rows specified for decoding.
-  const uint64_t* nulls();
+  /// Only bit positions for decoded rows are valid. If 'rows' were
+  /// specified with decode(), the same rows have to be specified
+  /// here.
+  const uint64_t* nulls(const SelectivityVector* rows = nullptr);
 
   /// Returns true if wrappings may have added nulls.
   bool hasExtraNulls() const {
@@ -227,6 +229,9 @@ class DecodedVector {
   bool isConstantMapping() const {
     return isConstantMapping_;
   }
+
+  /// Returns string representation of the value in the specified row.
+  std::string toString(vector_size_t idx) const;
 
   /////////////////////////////////////////////////////////////////
   /// BEGIN: Members that must only be used by PeeledEncoding class.
@@ -323,9 +328,6 @@ class DecodedVector {
 
   void setFlatNulls(const BaseVector& vector, const SelectivityVector* rows);
 
-  template <TypeKind kind>
-  void decodeBiased(const BaseVector& vector, const SelectivityVector* rows);
-
   void makeIndicesMutable();
 
   void combineWrappers(
@@ -337,10 +339,6 @@ class DecodedVector {
       const BaseVector& dictionaryVector,
       const SelectivityVector* rows);
 
-  void applySequenceWrapper(
-      const BaseVector& sequenceVector,
-      const SelectivityVector* rows);
-
   void copyNulls(vector_size_t size);
 
   void fillInIndices();
@@ -348,10 +346,6 @@ class DecodedVector {
   void setBaseData(const BaseVector& vector, const SelectivityVector* rows);
 
   void setBaseDataForConstant(
-      const BaseVector& vector,
-      const SelectivityVector* rows);
-
-  void setBaseDataForBias(
       const BaseVector& vector,
       const SelectivityVector* rows);
 
@@ -398,8 +392,7 @@ class DecodedVector {
   std::optional<const uint64_t*> allNulls_ = nullptr;
 
   // The base vector of 'vector' given to decode(). This is the data
-  // after sequence, constant and dictionary vectors have been peeled
-  // off.
+  // after constant and dictionary vectors have been peeled off.
   const BaseVector* baseVector_ = nullptr;
 
   // True if either the leaf vector has nulls or if nulls were added
@@ -415,14 +408,14 @@ class DecodedVector {
 
   bool loadLazy_ = false;
 
+  // True if decode() was called with rows != nullptr. If so, nulls() must also
+  // be called with the same 'rows'.
+  bool partialRowsDecoded_{true};
+
   // Index of an element of the baseVector_ that points to a constant value of
   // complex type. Applies only when isConstantMapping_ is true and baseVector_
   // is of complex type (array, map, row).
   vector_size_t constantIndex_{0};
-
-  // Holds data that needs to be copied out from the base vector,
-  // e.g. exploded BiasVector values.
-  std::vector<uint64_t> tempSpace_;
 
   // Holds indices if an array of indices needs to be materialized,
   // e.g. when combining nested dictionaries.
@@ -442,10 +435,10 @@ inline bool DecodedVector::valueAt(vector_size_t idx) const {
 }
 
 template <>
-inline UnscaledLongDecimal DecodedVector::valueAt(vector_size_t idx) const {
-  auto valuePosition = reinterpret_cast<const char*>(data_) +
-      sizeof(UnscaledLongDecimal) * index(idx);
-  return UnscaledLongDecimal::deserialize(valuePosition);
+inline int128_t DecodedVector::valueAt(vector_size_t idx) const {
+  auto valuePosition =
+      reinterpret_cast<const char*>(data_) + sizeof(int128_t) * index(idx);
+  return HugeInt::deserialize(valuePosition);
 }
 
 } // namespace facebook::velox

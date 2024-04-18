@@ -22,34 +22,37 @@ using namespace facebook::velox;
 class VectorPrepareForReuseTest : public testing::Test,
                                   public test::VectorTestBase {
  protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   VectorPrepareForReuseTest() = default;
 };
 
 class MemoryAllocationChecker {
  public:
   explicit MemoryAllocationChecker(memory::MemoryPool* pool)
-      : tracker_{pool->getMemoryUsageTracker().get()},
-        numAllocations_{tracker_->numAllocs()} {}
+      : pool_{pool}, numAllocations_{pool_->stats().numAllocs} {}
 
   bool assertOne() {
-    bool ok = numAllocations_ + 1 == tracker_->numAllocs();
-    numAllocations_ = tracker_->numAllocs();
+    bool ok = numAllocations_ + 1 == pool_->stats().numAllocs;
+    numAllocations_ = pool_->stats().numAllocs;
     return ok;
   }
 
   bool assertAtLeastOne() {
-    bool ok = numAllocations_ < tracker_->numAllocs();
-    numAllocations_ = tracker_->numAllocs();
+    bool ok = numAllocations_ < pool_->stats().numAllocs;
+    numAllocations_ = pool_->stats().numAllocs;
     return ok;
   }
 
   ~MemoryAllocationChecker() {
-    EXPECT_EQ(numAllocations_, tracker_->numAllocs());
+    EXPECT_EQ(numAllocations_, pool_->stats().numAllocs);
   }
 
  private:
-  memory::MemoryUsageTracker* tracker_;
-  int64_t numAllocations_;
+  memory::MemoryPool* const pool_;
+  uint64_t numAllocations_;
 };
 
 TEST_F(VectorPrepareForReuseTest, strings) {
@@ -222,6 +225,40 @@ TEST_F(VectorPrepareForReuseTest, arrays) {
   }
 
   vector->copy(otherVector.get(), 0, 0, 1'000);
+  ASSERT_EQ(originalSize, vector->retainedSize());
+}
+
+TEST_F(VectorPrepareForReuseTest, arrayOfStrings) {
+  VectorPtr vector = makeArrayVector<std::string>(
+      1'000,
+      [](auto /*row*/) { return 1; },
+      [](auto row, auto index) {
+        return std::string(20 + index, 'a' + row % 5);
+      });
+  auto originalSize = vector->retainedSize();
+  BaseVector* originalVector = vector.get();
+
+  MemoryAllocationChecker allocationChecker(pool());
+  BaseVector::prepareForReuse(vector, vector->size());
+  ASSERT_EQ(originalVector, vector.get());
+  ASSERT_EQ(originalSize, vector->retainedSize());
+
+  auto* arrayVector = vector->as<ArrayVector>();
+  for (auto i = 0; i < 1'000; i++) {
+    ASSERT_EQ(0, arrayVector->sizeAt(i));
+    ASSERT_EQ(0, arrayVector->offsetAt(i));
+  }
+
+  // Cannot use BaseVector::copy because it is too smart and acquired string
+  // buffers instead of copying the strings.
+  auto* elementsVector = arrayVector->elements()->as<FlatVector<StringView>>();
+  elementsVector->resize(1'000);
+  for (auto i = 0; i < 1'000; i++) {
+    arrayVector->setOffsetAndSize(i, i, 1);
+    std::string newValue(21, 'b' + i % 7);
+    elementsVector->set(i, StringView(newValue));
+  }
+
   ASSERT_EQ(originalSize, vector->retainedSize());
 }
 

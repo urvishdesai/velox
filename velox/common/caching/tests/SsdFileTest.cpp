@@ -16,6 +16,7 @@
 
 #include "velox/common/caching/FileIds.h"
 #include "velox/common/caching/SsdCache.h"
+#include "velox/common/memory/Memory.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 
 #include <folly/executors/QueuedImmediateExecutor.h>
@@ -41,25 +42,36 @@ class SsdFileTest : public testing::Test {
  protected:
   static constexpr int64_t kMB = 1 << 20;
 
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+
   void TearDown() override {
     if (ssdFile_) {
       ssdFile_->deleteFile();
     }
+    if (cache_) {
+      cache_->shutdown();
+    }
   }
 
-  void initializeCache(int64_t maxBytes, int64_t ssdBytes = 0) {
+  void initializeCache(
+      int64_t maxBytes,
+      int64_t ssdBytes = 0,
+      bool setNoCowFlag = false) {
     // tmpfs does not support O_DIRECT, so turn this off for testing.
     FLAGS_ssd_odirect = false;
-    cache_ = std::make_shared<AsyncDataCache>(
-        MemoryAllocator::createDefaultInstance(), maxBytes);
+    cache_ = AsyncDataCache::create(memory::memoryManager()->allocator());
 
     fileName_ = StringIdLease(fileIds(), "fileInStorage");
 
     tempDirectory_ = exec::test::TempDirectoryPath::create();
     ssdFile_ = std::make_unique<SsdFile>(
-        fmt::format("{}/ssdtest", tempDirectory_->path),
-        0,
-        bits::roundUp(ssdBytes, SsdFile::kRegionSize) / SsdFile::kRegionSize);
+        fmt::format("{}/ssdtest", tempDirectory_->getPath()),
+        0, // shardId
+        bits::roundUp(ssdBytes, SsdFile::kRegionSize) / SsdFile::kRegionSize,
+        0, // checkpointInternalBytes
+        setNoCowFlag);
   }
 
   static void initializeContents(int64_t sequence, memory::Allocation& alloc) {
@@ -106,12 +118,12 @@ class SsdFileTest : public testing::Test {
     }
   }
 
-  // Gets consecutive entries from file 'fileId' starting at 'startOffset'  with
+  // Gets consecutive entries from file 'fileId' starting at 'startOffset' with
   // sizes between 'minSize' and 'maxSize'. Sizes start at 'minSize' and double
   // each time and go back to 'minSize' after exceeding 'maxSize'. This stops
   // after the total size has exceeded 'totalSize'. The entries are returned as
   // pins. The pins are exclusive for newly created entries and shared for
-  // existing ones. New entries are deterministically  initialized from 'fileId'
+  // existing ones. New entries are deterministically initialized from 'fileId'
   // and the entry's offset.
   std::vector<CachePin> makePins(
       uint64_t fileId,
@@ -268,7 +280,7 @@ TEST_F(SsdFileTest, writeAndRead) {
     }
   }
 
-  // We check howmany entries are found. The earliest writes will have been
+  // We check how many entries are found. The earliest writes will have been
   // evicted. We read back the found entries and check their contents.
   int32_t numFound = 0;
   for (auto& entry : allEntries) {
@@ -290,4 +302,29 @@ TEST_F(SsdFileTest, writeAndRead) {
       }
     }
   }
+
+  // Test cache writes with different iobufs sizes.
+  for (int numPins : {0, 1, IOV_MAX - 1, IOV_MAX, IOV_MAX + 1}) {
+    SCOPED_TRACE(fmt::format("numPins: {}", numPins));
+    auto pins = makePins(fileName_.id(), 0, 4096, 4096, 4096 * numPins);
+    EXPECT_EQ(pins.size(), numPins);
+    ssdFile_->write(pins);
+    readAndCheckPins(pins);
+    pins.clear();
+  }
 }
+
+#ifdef VELOX_SSD_FILE_TEST_SET_NO_COW_FLAG
+TEST_F(SsdFileTest, disabledCow) {
+  LOG(ERROR) << "here";
+  constexpr int64_t kSsdSize = 16 * SsdFile::kRegionSize;
+  initializeCache(128 * kMB, kSsdSize, true);
+  EXPECT_TRUE(ssdFile_->testingIsCowDisabled());
+}
+
+TEST_F(SsdFileTest, notDisabledCow) {
+  constexpr int64_t kSsdSize = 16 * SsdFile::kRegionSize;
+  initializeCache(128 * kMB, kSsdSize, false);
+  EXPECT_FALSE(ssdFile_->testingIsCowDisabled());
+}
+#endif // VELOX_SSD_FILE_TEST_SET_NO_COW_FLAG

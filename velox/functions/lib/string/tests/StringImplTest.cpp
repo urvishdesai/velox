@@ -15,6 +15,7 @@
  */
 
 #include "velox/functions/lib/string/StringImpl.h"
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/core/CoreTypeSystem.h"
 #include "velox/type/StringView.h"
 
@@ -176,6 +177,119 @@ TEST_F(StringImplTest, length) {
   }
 }
 
+TEST_F(StringImplTest, cappedLength) {
+  auto input = std::string("abcd");
+  ASSERT_EQ(cappedLength</*isAscii*/ true>(input, 1), 1);
+  ASSERT_EQ(cappedLength</*isAscii*/ true>(input, 2), 2);
+  ASSERT_EQ(cappedLength</*isAscii*/ true>(input, 3), 3);
+  ASSERT_EQ(cappedLength</*isAscii*/ true>(input, 4), 4);
+  ASSERT_EQ(cappedLength</*isAscii*/ true>(input, 5), 4);
+  ASSERT_EQ(cappedLength</*isAscii*/ true>(input, 6), 4);
+
+  input = std::string("你好a世界");
+  ASSERT_EQ(cappedLength</*isAscii*/ false>(input, 1), 1);
+  ASSERT_EQ(cappedLength</*isAscii*/ false>(input, 2), 2);
+  ASSERT_EQ(cappedLength</*isAscii*/ false>(input, 3), 3);
+  ASSERT_EQ(cappedLength</*isAscii*/ false>(input, 4), 4);
+  ASSERT_EQ(cappedLength</*isAscii*/ false>(input, 5), 5);
+  ASSERT_EQ(cappedLength</*isAscii*/ false>(input, 6), 5);
+  ASSERT_EQ(cappedLength</*isAscii*/ false>(input, 7), 5);
+}
+
+TEST_F(StringImplTest, cappedUnicodeBytes) {
+  // Test functions use case for indexing
+  // UTF strings.
+  std::string stringInput = "\xF4\x90\x80\x80Hello";
+  ASSERT_EQ('H', stringInput[cappedByteLength<false>(stringInput, 2) - 1]);
+  ASSERT_EQ('e', stringInput[cappedByteLength<false>(stringInput, 3) - 1]);
+  ASSERT_EQ('l', stringInput[cappedByteLength<false>(stringInput, 4) - 1]);
+  ASSERT_EQ('l', stringInput[cappedByteLength<false>(stringInput, 5) - 1]);
+  ASSERT_EQ('o', stringInput[cappedByteLength<false>(stringInput, 6) - 1]);
+  ASSERT_EQ('o', stringInput[cappedByteLength<false>(stringInput, 7) - 1]);
+
+  // Multi-byte chars
+  stringInput = "♫¡Singing is fun!♫";
+  auto sPos = cappedByteLength<false>(stringInput, 2);
+  auto exPos = cappedByteLength<false>(stringInput, 17);
+  ASSERT_EQ("Singing is fun!♫", stringInput.substr(sPos));
+  ASSERT_EQ("♫¡Singing is fun!", stringInput.substr(0, exPos));
+  ASSERT_EQ("Singing is fun!", stringInput.substr(sPos, exPos - sPos));
+
+  stringInput = std::string("abcd");
+  auto stringViewInput = std::string_view(stringInput);
+  ASSERT_EQ(cappedByteLength<true>(stringInput, 1), 1);
+  ASSERT_EQ(cappedByteLength<true>(stringInput, 2), 2);
+  ASSERT_EQ(cappedByteLength<true>(stringInput, 3), 3);
+  ASSERT_EQ(cappedByteLength<true>(stringInput, 4), 4);
+  ASSERT_EQ(cappedByteLength<true>(stringInput, 5), 4);
+  ASSERT_EQ(cappedByteLength<true>(stringInput, 6), 4);
+
+  ASSERT_EQ(cappedByteLength<true>(stringViewInput, 1), 1);
+  ASSERT_EQ(cappedByteLength<true>(stringViewInput, 2), 2);
+  ASSERT_EQ(cappedByteLength<true>(stringViewInput, 3), 3);
+  ASSERT_EQ(cappedByteLength<true>(stringViewInput, 4), 4);
+  ASSERT_EQ(cappedByteLength<true>(stringViewInput, 5), 4);
+  ASSERT_EQ(cappedByteLength<true>(stringViewInput, 6), 4);
+
+  stringInput = std::string("你好a世界");
+  stringViewInput = std::string_view(stringInput);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 1), 3);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 2), 6);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 3), 7);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 4), 10);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 5), 13);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 6), 13);
+
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 1), 3);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 2), 6);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 3), 7);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 4), 10);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 5), 13);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 6), 13);
+
+  stringInput = std::string("\x80");
+  stringViewInput = std::string_view(stringInput);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 1), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 2), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 3), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 4), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 5), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 6), 1);
+
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 1), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 2), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 3), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 4), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 5), 1);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 6), 1);
+
+  stringInput.resize(2);
+  // Create corrupt data below.
+  char16_t c = u'\u04FF';
+  stringInput[0] = (char)c;
+  stringInput[1] = (char)c;
+
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 1), 1);
+
+  stringInput.resize(4);
+  c = u'\u04F4';
+  char16_t c2 = u'\u048F';
+  char16_t c3 = u'\u04BF';
+  stringInput[0] = (char)c;
+  stringInput[1] = (char)c2;
+  stringInput[2] = (char)c3;
+  stringInput[3] = (char)c3;
+
+  stringViewInput = std::string_view(stringInput);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 1), 4);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 2), 4);
+  ASSERT_EQ(cappedByteLength<false>(stringInput, 3), 4);
+
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 1), 4);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 2), 4);
+  ASSERT_EQ(cappedByteLength<false>(stringViewInput, 3), 4);
+}
+
 TEST_F(StringImplTest, badUnicodeLength) {
   ASSERT_EQ(0, length</*isAscii*/ false>(std::string("")));
   ASSERT_EQ(2, length</*isAscii*/ false>(std::string("ab")));
@@ -246,6 +360,88 @@ TEST_F(StringImplTest, charToCodePoint) {
   testExpectDeath("hello");
   testExpectDeath("\u666E\u5217\u65AF\u6258");
   testExpectDeath("");
+}
+
+TEST_F(StringImplTest, stringToCodePoints) {
+  auto testStringToCodePoints =
+      [](const std::string& charString,
+         const std::vector<int32_t>& expectedCodePoints) {
+        std::vector<int32_t> codePoints = stringToCodePoints(charString);
+        ASSERT_EQ(codePoints.size(), expectedCodePoints.size());
+        for (int i = 0; i < codePoints.size(); i++) {
+          ASSERT_EQ(codePoints.at(i), expectedCodePoints.at(i));
+        }
+      };
+
+  testStringToCodePoints("", {});
+  testStringToCodePoints("h", {0x0068});
+  testStringToCodePoints("hello", {0x0068, 0x0065, 0x006C, 0x006C, 0x006F});
+
+  testStringToCodePoints("hïllo", {0x0068, 0x00EF, 0x006C, 0x006C, 0x006F});
+  testStringToCodePoints("hüóOO", {0x0068, 0x00FC, 0x00F3, 0x004F, 0x004F});
+  testStringToCodePoints("\u840C", {0x840C});
+
+  VELOX_ASSERT_THROW(
+      testStringToCodePoints("\xA9", {}),
+      "Invalid UTF-8 encoding in characters");
+  VELOX_ASSERT_THROW(
+      testStringToCodePoints("ü\xA9", {}),
+      "Invalid UTF-8 encoding in characters");
+  VELOX_ASSERT_THROW(
+      testStringToCodePoints("ü\xA9hello wooooorld", {}),
+      "Invalid UTF-8 encoding in characters");
+  VELOX_ASSERT_THROW(
+      testStringToCodePoints("ü\xA9hello wooooooooorrrrrld", {}),
+      "Invalid UTF-8 encoding in characters");
+}
+
+TEST_F(StringImplTest, overlappedStringPosition) {
+  auto testValidInputAsciiLpos = [](const std::string& string,
+                                    const std::string& substr,
+                                    const int64_t instance,
+                                    const int64_t expectedPosition) {
+    auto result = stringPosition</*isAscii*/ true, true>(
+        StringView(string), StringView(substr), instance);
+    ASSERT_EQ(result, expectedPosition);
+  };
+  auto testValidInputAsciiRpos = [](const std::string& string,
+                                    const std::string& substr,
+                                    const int64_t instance,
+                                    const int64_t expectedPosition) {
+    auto result = stringPosition</*isAscii*/ true, false>(
+        StringView(string), StringView(substr), instance);
+    ASSERT_EQ(result, expectedPosition);
+  };
+
+  auto testValidInputUnicodeLpos = [](const std::string& string,
+                                      const std::string& substr,
+                                      const int64_t instance,
+                                      const int64_t expectedPosition) {
+    auto result = stringPosition</*isAscii*/ false, true>(
+        StringView(string), StringView(substr), instance);
+    ASSERT_EQ(result, expectedPosition);
+  };
+
+  auto testValidInputUnicodeRpos = [](const std::string& string,
+                                      const std::string& substr,
+                                      const int64_t instance,
+                                      const int64_t expectedPosition) {
+    auto result = stringPosition</*isAscii*/ false, false>(
+        StringView(string), StringView(substr), instance);
+    ASSERT_EQ(result, expectedPosition);
+  };
+
+  testValidInputAsciiLpos("aaa", "aa", 2, 2L);
+  testValidInputAsciiRpos("aaa", "aa", 2, 1L);
+
+  testValidInputAsciiLpos("|||", "||", 2, 2L);
+  testValidInputAsciiRpos("|||", "||", 2, 1L);
+
+  testValidInputUnicodeLpos("😋😋😋", "😋😋", 2, 2L);
+  testValidInputUnicodeRpos("😋😋😋", "😋😋", 2, 1L);
+
+  testValidInputUnicodeLpos("你你你", "你你", 2, 2L);
+  testValidInputUnicodeRpos("你你你", "你你", 2, 1L);
 }
 
 TEST_F(StringImplTest, stringPosition) {
@@ -397,6 +593,20 @@ TEST_F(StringImplTest, getByteRange) {
     EXPECT_EQ(expectedStartByteIndex, range.first);
     EXPECT_EQ(expectedEndByteIndex, range.second);
   }
+
+  // Test bad unicode strings.
+
+  // This exercises bad unicode byte in determining startByteIndex.
+  std::string badUnicode = "aa\xff  ";
+  auto range = getByteRange<false>(badUnicode.data(), 4, 3);
+  EXPECT_EQ(range.first, 3);
+  EXPECT_EQ(range.second, 6);
+
+  // This exercises bad unicode byte in determining endByteIndex.
+  badUnicode = "\xff aa";
+  range = getByteRange<false>(badUnicode.data(), 1, 3);
+  EXPECT_EQ(range.first, 0);
+  EXPECT_EQ(range.second, 3);
 }
 
 TEST_F(StringImplTest, pad) {
@@ -495,4 +705,54 @@ TEST_F(StringImplTest, pad) {
   runTestUserError("text", -1, "a");
   runTestUserError(
       "text", ((int64_t)std::numeric_limits<int32_t>::max()) + 1, "a");
+  // Additional tests with bad unicode bytes.
+  runTest("abcd\xff \xff ef", 6, "0", "abcd\xff ", "abcd\xff ");
+  runTest(
+      "abcd\xff \xff ef", 11, "0", "0abcd\xff \xff ef", "abcd\xff \xff ef0");
+  runTest("abcd\xff ef", 6, "0", "abcd\xff ", "abcd\xff ");
+}
+
+// Make sure that utf8proc_codepoint returns invalid codepoint (-1) for
+// incomplete character of length>1.
+TEST_F(StringImplTest, utf8proc_codepoint) {
+  int size;
+
+  std::string twoBytesChar = "\xdd\x81";
+  EXPECT_EQ(
+      utf8proc_codepoint(twoBytesChar.data(), twoBytesChar.data() + 1, size),
+      -1);
+  EXPECT_NE(
+      utf8proc_codepoint(twoBytesChar.data(), twoBytesChar.data() + 2, size),
+      -1);
+  EXPECT_EQ(size, 2);
+
+  std::string threeBytesChar = "\xe0\xa4\x86";
+  for (int i = 1; i <= 2; i++) {
+    EXPECT_EQ(
+        utf8proc_codepoint(
+            threeBytesChar.data(), threeBytesChar.data() + i, size),
+        -1);
+  }
+
+  EXPECT_NE(
+      utf8proc_codepoint(
+          threeBytesChar.data(), threeBytesChar.data() + 3, size),
+      -1);
+  EXPECT_EQ(size, 3);
+
+  std::string fourBytesChar = "\xf0\x92\x80\x85";
+  for (int i = 1; i <= 3; i++) {
+    EXPECT_EQ(
+        utf8proc_codepoint(
+            fourBytesChar.data(), fourBytesChar.data() + i, size),
+        -1);
+  }
+  EXPECT_NE(
+      utf8proc_codepoint(fourBytesChar.data(), fourBytesChar.data() + 4, size),
+      -1);
+  EXPECT_EQ(size, 4);
+}
+
+TEST_F(StringImplTest, isUnicodeWhiteSpace) {
+  EXPECT_FALSE(isUnicodeWhiteSpace(-1));
 }

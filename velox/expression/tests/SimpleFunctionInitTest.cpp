@@ -37,6 +37,7 @@ struct NonDefaultWithArrayInitFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
   void initialize(
+      const std::vector<TypePtr>& /*inputTypes*/,
       const core::QueryConfig& /*config*/,
       const arg_type<int32_t>* /*first*/,
       const arg_type<velox::Array<int32_t>>* second) {
@@ -131,6 +132,7 @@ struct NonDefaultWithMapInitFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
   void initialize(
+      const std::vector<TypePtr>& /*inputTypes*/,
       const core::QueryConfig& /*config*/,
       const arg_type<int32_t>* /*first*/,
       const arg_type<velox::Map<int32_t, int64_t>>* second) {
@@ -200,9 +202,10 @@ struct InitAlwaysThrowsFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 
   void initialize(
+      const std::vector<TypePtr>& /*inputTypes*/,
       const core::QueryConfig& /*config*/,
       const arg_type<int32_t>* /*first*/) {
-    VELOX_FAIL("Unconditional throw!");
+    VELOX_USER_FAIL("Unconditional throw!");
   }
 
   void call(out_type<int64_t>& out, const arg_type<int32_t>& first) {
@@ -219,7 +222,7 @@ TEST_F(SimpleFunctionInitTest, initException) {
 
   // Ensure this will normally throw if there are active rows.
   auto rowVector = makeRowVector({makeNullableFlatVector<int32_t>({1, 2, 3})});
-  EXPECT_THROW(evaluate("init_throws(c0)", rowVector), VeloxRuntimeError);
+  EXPECT_THROW(evaluate("init_throws(c0)", rowVector), VeloxUserError);
 
   // Shouldn't throw if the input is a Null constant.
   rowVector = makeRowVector({makeNullConstant(TypeKind::INTEGER, 3)});

@@ -127,40 +127,37 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
 
   // Parse measures and get the aggregate expressions.
   // Each measure represents one aggregate expression.
-  std::vector<core::CallTypedExprPtr> aggExprs;
-  aggExprs.reserve(aggRel.measures().size());
-  std::vector<core::FieldAccessTypedExprPtr> aggregateMasks;
-  aggregateMasks.reserve(aggRel.measures().size());
+  std::vector<core::AggregationNode::Aggregate> aggregates;
+  aggregates.reserve(aggRel.measures().size());
 
   for (const auto& measure : aggRel.measures()) {
-    core::FieldAccessTypedExprPtr aggregateMask;
+    core::FieldAccessTypedExprPtr mask;
     ::substrait::Expression substraitAggMask = measure.filter();
     // Get Aggregation Masks.
     if (measure.has_filter()) {
-      if (substraitAggMask.ByteSizeLong() == 0) {
-        aggregateMask = {};
-      } else {
-        aggregateMask =
-            std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
-                exprConverter_->toVeloxExpr(substraitAggMask, inputType));
+      if (substraitAggMask.ByteSizeLong() > 0) {
+        mask = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
+            exprConverter_->toVeloxExpr(substraitAggMask, inputType));
       }
-      aggregateMasks.push_back(aggregateMask);
     }
 
     const auto& aggFunction = measure.measure();
     auto funcName = substraitParser_->findVeloxFunction(
         functionMap_, aggFunction.function_reference());
+
     std::vector<core::TypedExprPtr> aggParams;
     aggParams.reserve(aggFunction.arguments().size());
     for (const auto& arg : aggFunction.arguments()) {
       aggParams.emplace_back(
           exprConverter_->toVeloxExpr(arg.value(), inputType));
     }
-    auto aggVeloxType = toVeloxType(
-        substraitParser_->parseType(aggFunction.output_type())->type);
+    auto aggVeloxType = substraitParser_->parseType(aggFunction.output_type());
     auto aggExpr = std::make_shared<const core::CallTypedExpr>(
         aggVeloxType, std::move(aggParams), funcName);
-    aggExprs.emplace_back(aggExpr);
+    std::vector<TypePtr> rawInputTypes = SubstraitParser::getInputTypes(
+        findFunction(aggFunction.function_reference()));
+    aggregates.emplace_back(
+        core::AggregationNode::Aggregate{aggExpr, rawInputTypes, mask, {}, {}});
   }
 
   bool ignoreNullKeys = false;
@@ -181,8 +178,7 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
       veloxGroupingExprs,
       preGroupingExprs,
       aggOutNames,
-      aggExprs,
-      aggregateMasks,
+      aggregates,
       ignoreNullKeys,
       childNode);
 
@@ -375,11 +371,7 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
     for (const auto& name : baseSchema.names()) {
       colNameList.emplace_back(name);
     }
-    auto substraitTypeList = substraitParser_->parseNamedStruct(baseSchema);
-    veloxTypeList.reserve(substraitTypeList.size());
-    for (const auto& substraitType : substraitTypeList) {
-      veloxTypeList.emplace_back(toVeloxType(substraitType->type));
-    }
+    veloxTypeList = substraitParser_->parseNamedStruct(baseSchema);
   }
 
   // Parse local files
@@ -421,6 +413,7 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
         "hive_table",
         filterPushdownEnabled,
         connector::hive::SubfieldFilters{},
+        nullptr,
         nullptr);
   } else {
     connector::hive::SubfieldFilters filters =
@@ -430,6 +423,7 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
         "hive_table",
         filterPushdownEnabled,
         std::move(filters),
+        nullptr,
         nullptr);
   }
 
@@ -443,6 +437,7 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
     assignments[outName] = std::make_shared<connector::hive::HiveColumnHandle>(
         colNameList[idx],
         connector::hive::HiveColumnHandle::ColumnType::kRegular,
+        veloxTypeList[idx],
         veloxTypeList[idx]);
     outNames.emplace_back(outName);
   }

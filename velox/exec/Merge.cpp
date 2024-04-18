@@ -37,7 +37,7 @@ Merge::Merge(
           operatorId,
           planNodeId,
           operatorType),
-      outputBatchSize_{driverCtx->queryConfig().preferredOutputBatchSize()} {
+      outputBatchSize_{outputBatchRows()} {
   auto numKeys = sortingKeys.size();
   sortingKeys_.reserve(numKeys);
   for (int i = 0; i < numKeys; ++i) {
@@ -74,9 +74,18 @@ void Merge::initializeTreeOfLosers() {
 }
 
 BlockingReason Merge::isBlocked(ContinueFuture* future) {
+  TestValue::adjust("facebook::velox::exec::Merge::isBlocked", this);
+
   auto reason = addMergeSources(future);
   if (reason != BlockingReason::kNotBlocked) {
     return reason;
+  }
+
+  // NOTE: the task might terminate early which leaves empty sources. Once it
+  // happens, we shall simply mark the merge operator as finished.
+  if (sources_.empty()) {
+    finished_ = true;
+    return BlockingReason::kNotBlocked;
   }
 
   // No merging is needed if there is only one source.
@@ -93,7 +102,7 @@ BlockingReason Merge::isBlocked(ContinueFuture* future) {
   if (!sourceBlockingFutures_.empty()) {
     *future = std::move(sourceBlockingFutures_.back());
     sourceBlockingFutures_.pop_back();
-    return BlockingReason::kWaitForExchange;
+    return BlockingReason::kWaitForProducer;
   }
 
   return BlockingReason::kNotBlocked;
@@ -183,8 +192,7 @@ bool SourceStream::operator<(const MergeStream& other) const {
   for (auto i = 0; i < sortingKeys_.size(); ++i) {
     const auto& [_, compareFlags] = sortingKeys_[i];
     VELOX_DCHECK(
-        !compareFlags.stopAtNull,
-        "stopAtNull not supported for merge compare flags");
+        compareFlags.nullAsValue(), "not supported null handling mode");
     if (auto result = keyColumns_[i]
                           ->compare(
                               otherCursor.keyColumns_[i],
@@ -316,20 +324,38 @@ BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
         auto remoteSplit = std::dynamic_pointer_cast<RemoteConnectorSplit>(
             split.connectorSplit);
         VELOX_CHECK(remoteSplit, "Wrong type of split");
-        auto* pool = operatorCtx_->task()->addMergeSourcePool(
-            operatorCtx_->planNodeId(),
-            operatorCtx_->driverCtx()->pipelineId,
-            numSplits_);
-        sources_.emplace_back(MergeSource::createMergeExchangeSource(
-            this,
-            remoteSplit->taskId,
-            operatorCtx_->task()->destination(),
-            pool));
-        ++numSplits_;
+        remoteSourceTaskIds_.push_back(remoteSplit->taskId);
       } else {
         noMoreSplits_ = true;
+        if (!remoteSourceTaskIds_.empty()) {
+          const auto maxMergeExchangeBufferSize =
+              operatorCtx_->driverCtx()
+                  ->queryConfig()
+                  .maxMergeExchangeBufferSize();
+          const auto maxQueuedBytesPerSource = std::min<int64_t>(
+              std::max<int64_t>(
+                  maxMergeExchangeBufferSize / remoteSourceTaskIds_.size(),
+                  MergeSource::kMaxQueuedBytesLowerLimit),
+              MergeSource::kMaxQueuedBytesUpperLimit);
+          for (uint32_t remoteSourceIndex = 0;
+               remoteSourceIndex < remoteSourceTaskIds_.size();
+               ++remoteSourceIndex) {
+            auto* pool = operatorCtx_->task()->addMergeSourcePool(
+                operatorCtx_->planNodeId(),
+                operatorCtx_->driverCtx()->pipelineId,
+                remoteSourceIndex);
+            sources_.emplace_back(MergeSource::createMergeExchangeSource(
+                this,
+                remoteSourceTaskIds_[remoteSourceIndex],
+                operatorCtx_->task()->destination(),
+                maxQueuedBytesPerSource,
+                pool,
+                operatorCtx_->task()->queryCtx()->executor()));
+          }
+        }
         // TODO Delay this call until all input data has been processed.
-        operatorCtx_->task()->multipleSplitsFinished(numSplits_);
+        operatorCtx_->task()->multipleSplitsFinished(
+            false, remoteSourceTaskIds_.size(), 0);
         return BlockingReason::kNotBlocked;
       }
     } else {

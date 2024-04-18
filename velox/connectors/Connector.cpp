@@ -31,7 +31,20 @@ std::unordered_map<std::string, std::shared_ptr<Connector>>& connectors() {
 }
 } // namespace
 
+bool DataSink::Stats::empty() const {
+  return numWrittenBytes == 0 && numWrittenFiles == 0 && spillStats.empty();
+}
+
+std::string DataSink::Stats::toString() const {
+  return fmt::format(
+      "numWrittenBytes {} numWrittenFiles {} {}",
+      succinctBytes(numWrittenBytes),
+      numWrittenFiles,
+      spillStats.toString());
+}
+
 bool registerConnectorFactory(std::shared_ptr<ConnectorFactory> factory) {
+  factory->initialize();
   bool ok =
       connectorFactories().insert({factory->connectorName(), factory}).second;
   VELOX_CHECK(
@@ -116,8 +129,40 @@ std::string commitStrategyToString(CommitStrategy commitStrategy) {
     case CommitStrategy::kTaskCommit:
       return "TASK_COMMIT";
     default:
-      VELOX_UNREACHABLE();
+      VELOX_UNREACHABLE(
+          "UNKOWN COMMIT STRATEGY: {}", static_cast<int>(commitStrategy));
   }
 }
 
+CommitStrategy stringToCommitStrategy(const std::string& strategy) {
+  if (strategy == "NO_COMMIT") {
+    return CommitStrategy::kNoCommit;
+  } else if (strategy == "TASK_COMMIT") {
+    return CommitStrategy::kTaskCommit;
+  } else {
+    VELOX_UNREACHABLE("UNKOWN COMMIT STRATEGY: {}", strategy);
+  }
+}
+
+folly::dynamic ColumnHandle::serializeBase(std::string_view name) {
+  folly::dynamic obj = folly::dynamic::object;
+  obj["name"] = name;
+  return obj;
+}
+
+folly::dynamic ColumnHandle::serialize() const {
+  return serializeBase("ColumnHandle");
+}
+
+folly::dynamic ConnectorTableHandle::serializeBase(
+    std::string_view name) const {
+  folly::dynamic obj = folly::dynamic::object;
+  obj["name"] = name;
+  obj["connectorId"] = connectorId_;
+  return obj;
+}
+
+folly::dynamic ConnectorTableHandle::serialize() const {
+  return serializeBase("ConnectorTableHandle");
+}
 } // namespace facebook::velox::connector

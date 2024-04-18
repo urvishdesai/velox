@@ -12,55 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 include(GoogleTest)
+
 add_executable(
   velox_memory_test
+  AllocationPoolTest.cpp
   AllocationTest.cpp
   ByteStreamTest.cpp
   CompactDoubleListTest.cpp
   HashStringAllocatorTest.cpp
   MemoryAllocatorTest.cpp
+  MemoryArbitratorTest.cpp
+  MemoryCapExceededTest.cpp
   MemoryManagerTest.cpp
   MemoryPoolTest.cpp
-  MemoryUsageTest.cpp
-  MemoryUsageTrackerTest.cpp)
+  MockSharedArbitratorTest.cpp
+  SharedArbitratorTest.cpp
+  StreamArenaTest.cpp)
 
 target_link_libraries(
   velox_memory_test
-  velox_memory
-  velox_caching
-  velox_exception
-  velox_test_util
-  gtest
-  gtest_main
-  gflags::gflags
-  ${FOLLY_WITH_DEPENDENCIES}
-  gmock
-  glog::glog)
+  PRIVATE velox_caching
+          velox_common_base
+          velox_exception
+          velox_exec
+          velox_exec_test_lib
+          velox_memory
+          velox_temp_path
+          velox_test_util
+          velox_vector_fuzzer
+          Folly::folly
+          fmt::fmt
+          gflags::gflags
+          glog::glog
+          gmock
+          gtest
+          gtest_main
+          re2::re2)
 
 gtest_add_tests(velox_memory_test "" AUTO)
 
 add_executable(velox_fragmentation_benchmark FragmentationBenchmark.cpp)
 
 target_link_libraries(
-  velox_fragmentation_benchmark
-  velox_memory
-  glog::glog
-  gtest
-  gtest_main
-  gflags::gflags
-  ${FOLLY_WITH_DEPENDENCIES}
-  pthread)
+  velox_fragmentation_benchmark PRIVATE velox_memory Folly::folly
+                                        gflags::gflags glog::glog)
 
 add_executable(velox_concurrent_allocation_benchmark
                ConcurrentAllocationBenchmark.cpp)
 
-target_link_libraries(
-  velox_concurrent_allocation_benchmark
-  velox_memory
-  glog::glog
-  gtest
-  gtest_main
-  gflags::gflags
-  ${FOLLY_WITH_DEPENDENCIES}
-  fmt::fmt
-  pthread)
+target_link_libraries(velox_concurrent_allocation_benchmark PRIVATE velox_memory
+                                                                    velox_time)

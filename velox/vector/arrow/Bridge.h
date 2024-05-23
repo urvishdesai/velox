@@ -36,7 +36,7 @@ struct ArrowOptions {
   bool flattenDictionary{false};
   bool flattenConstant{false};
   TimestampUnit timestampUnit = TimestampUnit::kNano;
-  bool exportToView = false;
+  bool exportToStringView = false;
 };
 
 namespace facebook::velox {
